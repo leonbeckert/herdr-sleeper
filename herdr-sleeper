@@ -201,6 +201,8 @@ DEFAULTS = {
     "notify": True,
     "wake_on_focus": True,
     "dry_run": False,            # the watcher logs "would sleep" instead of sleeping
+    "max_live": 0,               # more live sessions than this: the longest-idle ones sleep early (0 = no cap)
+    "pressure_idle_hours": 0.5,  # the shorter window for early sleep (over max_live, or memory pressure)
     "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
 }
 
@@ -548,6 +550,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
         for k, v in raw.items():
             if k == "idle":
                 values["idle_hours"], source["idle_hours"] = parse_duration(v), str(CONFIG_FILE)
+            elif k == "pressure_idle":
+                values["pressure_idle_hours"], source["pressure_idle_hours"] = parse_duration(v), str(CONFIG_FILE)
             elif k in DEFAULTS:
                 values[k], source[k] = v, str(CONFIG_FILE)
             else:
@@ -583,16 +587,22 @@ def load_config() -> tuple[dict, dict[str, str]]:
                                   f"{legacy['exclude']!r}; merge it into {CONFIG_FILE} (or set `exclude = []`) "
                                   "and delete the old file")
     # validation: a bad config must never mean "no excludes" or "sleep everything"
-    for key in ("idle_hours", "poll_seconds"):
+    for key in ("idle_hours", "poll_seconds", "max_live", "pressure_idle_hours"):
         if isinstance(values[key], bool):  # TOML `false` would otherwise become 0.0 = sleep everything
             raise ConfigError(f"{key} must be a number, not a boolean")
     try:
         values["idle_hours"] = float(values["idle_hours"])
         values["poll_seconds"] = float(values["poll_seconds"])
+        values["pressure_idle_hours"] = float(values["pressure_idle_hours"])
     except (TypeError, ValueError) as exc:
-        raise ConfigError(f"idle_hours/poll_seconds must be numbers: {exc}")
+        raise ConfigError(f"idle_hours/poll_seconds/pressure_idle_hours must be numbers: {exc}")
     if not math.isfinite(values["idle_hours"]) or values["idle_hours"] < 0:
         raise ConfigError(f"idle_hours must be a finite number >= 0, got {values['idle_hours']!r}")
+    if not math.isfinite(values["pressure_idle_hours"]) or values["pressure_idle_hours"] <= 0:
+        raise ConfigError("pressure_idle must be a finite duration > 0")
+    values["pressure_idle_hours"] = min(values["pressure_idle_hours"], values["idle_hours"])  # never later than idle
+    if not isinstance(values["max_live"], int) or values["max_live"] < 0:
+        raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
     for key in ("exclude", "agents"):
@@ -2217,6 +2227,42 @@ def persist_clocks(clocks: dict[str, dict]) -> None:
         say(f"WARN could not persist idle clocks: {exc}")
 
 
+PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
+
+
+def memory_pressure() -> int:
+    """macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical; 1 when unknown."""
+    try:
+        out = subprocess.run([shutil.which("sysctl", path=SYSTEM_PATH) or "sysctl", "-n",
+                              "kern.memorystatus_vm_pressure_level"], capture_output=True, text=True, timeout=5).stdout
+        return int(out.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 1
+
+
+def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict], config: dict,
+                   now: float) -> tuple[list[dict], str]:
+    """Panes to sleep before their window: longest idle first, each idle >= pressure_idle.
+
+    Over max_live, as many as bring the live count back to the cap; under memory pressure
+    (warn or critical), one per tick, so the next tick sees what that freed.
+    """
+    window = config["pressure_idle_hours"] * 3600
+    live = sum(1 for a in agents if a.get("agent") in config["agents"])
+    over = max(0, live - config["max_live"] - len(due)) if config["max_live"] else 0
+    level = memory_pressure()
+    want = max(over, 1 if level > 1 else 0)
+    if not want:
+        return [], ""
+    taken = {a["pane_id"] for a in due}
+    ready = sorted((a for a in agents if a["pane_id"] in clocks and a["pane_id"] not in taken
+                    and now - clocks[a["pane_id"]]["since"] >= window),
+                   key=lambda a: clocks[a["pane_id"]]["since"])
+    why = (f"{live} live > max_live {config['max_live']}" if over else "") + \
+          (f"{'; ' if over else ''}memory pressure {PRESSURE_NAMES.get(level, level)}" if level > 1 else "")
+    return ready[:want], why
+
+
 def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     """One pass over `agent list`: advance idle clocks, sleep what is due, reconcile the journal.
 
@@ -2268,21 +2314,25 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
         if json.dumps(clocks, sort_keys=True) != before:
             persist_clocks(clocks)
             before = json.dumps(clocks, sort_keys=True)
+        early, why_early = early_sleepers(agents, clocks, due, config, now)
+        if early:
+            say(f"early sleep ({why_early}): {', '.join(a['pane_id'] for a in early)}")
         # 2. sleep what is due; one pane failing in any way costs that pane, not the tick
-        for agent in due:
+        for agent in due + early:
             if STOP["requested"]:
                 break  # a stopping watcher starts no new transaction
             pane, kind = agent["pane_id"], agent.get("agent")
             since = clocks[pane]["since"]
+            window = config["idle_hours"] if agent in due else config["pressure_idle_hours"]
             try:
                 # the gate sleep_agent assumes: no session, no transcript, open elsewhere ... -> skip, never raise
-                ok, reason, _ = assess(agent, agents, config["idle_hours"], journal, exclude, idle_since=since)
+                ok, reason, _ = assess(agent, agents, window, journal, exclude, idle_since=since)
                 if not ok:
                     if not reason.startswith(QUIET_OUTCOMES):
                         note_skip(pane, reason)
                     continue
                 uuid = (agent.get("agent_session") or {}).get("value")  # capture before sleep mutates the pane
-                did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=config["dry_run"],
+                did, outcome = sleep_agent(agent, window, exclude, dry_run=config["dry_run"],
                                            idle_since=since, notify_enabled=config["notify"])
             except SleeperError as exc:  # one flaky pane must not starve the rest of the tick
                 did, outcome = False, f"error: {exc}"

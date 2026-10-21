@@ -100,7 +100,10 @@ Config: `<plugin config dir>/config.toml` — Herdr's
 `~/.config/herdr/plugins/config/djbclark.herdr-sleeper/config.toml` (run
 `herdr plugin list` to see it) — `idle` (duration), `agents` (list),
 `exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`,
-`dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
+`max_live` (more live sessions than this: the longest-idle ones sleep
+early, 0 = no cap), `pressure_idle` (the shorter window for that early
+sleep, default `30m`, never later than `idle`; under macOS memory pressure
+warn/critical one session per tick sleeps early too), `dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one);
@@ -230,7 +233,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 186 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 189 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

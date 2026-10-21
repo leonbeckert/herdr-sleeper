@@ -231,6 +231,7 @@ def fake(state: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHerdr:
     monkeypatch.setattr(sleeper, "EXIT_WAIT_SECONDS", 2)
     monkeypatch.setattr(sleeper.os, "kill", f.kill)
     monkeypatch.setattr(sleeper, "process_table", f.process_table)
+    monkeypatch.setattr(sleeper, "memory_pressure", lambda: 1)
     transcript(state, UUID, 30)
     return f
 
@@ -364,7 +365,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
-                      "watcher": "plugin"}
+                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -1137,6 +1138,54 @@ def test_watch_tick_sleeps_only_after_window(fake: FakeHerdr, state: Path,
     clock["t"] += 3700
     sleeper.watch_tick(clocks, config)
     assert journal()["w1:p1"]["phase"] == "asleep"                # now a full quiet hour has passed
+
+
+def _three_idle_agents(fake: FakeHerdr, state: Path) -> dict[str, Any]:
+    uuids = {"w1:p1": UUID, "w2:p1": "u2-session", "w3:p1": "u3-session"}
+    fake.agents = [{**agent(pane=p, uuid=u, name=f"n{i}", terminal=f"term-{i}"), "pid_hint": 101 + i}
+                   for i, (p, u) in enumerate(uuids.items())]
+    for u in uuids.values():
+        transcript(state, u, 30)
+    now = 1_000_000.0
+    # idle 3 h, 2 h, 10 min; none has reached the 12 h window
+    return {p: {**sleeper.clock_key(a), "since": now - age}
+            for (p, a), age in zip(((a["pane_id"], a) for a in fake.agents), (3 * 3600, 2 * 3600, 600))}
+
+
+def test_watch_tick_sleeps_longest_idle_over_the_cap(fake: FakeHerdr, state: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    clocks = _three_idle_agents(fake, state)
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "max_live": 2})
+    assert list(journal()) == ["w1:p1"]                                  # one over the cap: the longest idle
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "max_live": 0})
+    assert list(journal()) == ["w1:p1"]                                  # no cap, no pressure: windows only
+
+
+def test_watch_tick_sleeps_one_per_tick_under_pressure(fake: FakeHerdr, state: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    clocks = _three_idle_agents(fake, state)
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    monkeypatch.setattr(sleeper, "memory_pressure", lambda: 2)
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert list(journal()) == ["w1:p1"]
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert sorted(journal()) == ["w1:p1", "w2:p1"]
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert "w3:p1" not in journal()                                      # 10 min idle: under pressure_idle
+
+
+def test_pressure_idle_must_fit_inside_idle(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = state / "config.toml"; monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    cfg.write_text('idle = "90m"\npressure_idle = "20m"\nmax_live = 8\n')
+    values, _ = sleeper.load_config()
+    assert values["pressure_idle_hours"] == pytest.approx(1 / 3) and values["max_live"] == 8
+    cfg.write_text('idle = "1h"\npressure_idle = "2h"\n')
+    assert sleeper.load_config()[0]["pressure_idle_hours"] == 1.0         # clamped: never later than idle
+    for bad in ('pressure_idle = "0m"\n', "max_live = -1\n", "max_live = 2.5\n"):
+        cfg.write_text(bad)
+        with pytest.raises(sleeper.ConfigError):
+            sleeper.load_config()
 
 
 def test_watch_tick_honors_excludes_and_kinds(fake: FakeHerdr, state: Path,
