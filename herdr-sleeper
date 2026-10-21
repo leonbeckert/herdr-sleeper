@@ -1389,6 +1389,10 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, "no session uuid (cannot resume)", None
     if not valid_session_id(uuid):
         return False, "session id has an unexpected shape (refusing to use it in a glob or argv)", None
+    # A restarted claude pane loses its Herdr name; the Claude session name and the title it sets survive.
+    if exclude and kind == "claude" and (agent.get("terminal_title_stripped") in exclude
+                                         or claude_session_name(transcript_for(uuid)) in exclude):
+        return False, "excluded", None
     if not allow_focused and agent.get("focused") is not False:  # missing/None must not read as "not focused"
         return False, "pane is focused (or focus unknown)", None
     status = agent.get("agent_status")

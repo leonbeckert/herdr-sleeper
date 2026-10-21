@@ -100,7 +100,8 @@ herdr plugin action invoke djbclark.herdr-sleeper.log
 Config: `<plugin config dir>/config.toml` — Herdr's
 `~/.config/herdr/plugins/config/djbclark.herdr-sleeper/config.toml` (run
 `herdr plugin list` to see it) — `idle` (duration), `agents` (list),
-`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`,
+`exclude` (panes or names: the Herdr agent name, and for claude also the
+Claude session name and the pane title, which survive a restart), `poll_seconds`, `notify`, `wake_on_focus`,
 `max_live` (more live sessions than this: the longest-idle ones sleep
 early, 0 = no cap), `pressure_idle` (the shorter window for that early
 sleep, default `30m`, never later than `idle`; under macOS memory pressure

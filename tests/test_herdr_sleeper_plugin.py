@@ -477,6 +477,12 @@ def test_assess_scan_rows_and_gates(state: Path) -> None:
     assert "w2:p1" in sleeper.assess(a, [a, b], 12, {})[1]
     assert sleeper.assess(a, [a], 12, {}, {"a"})[1] == "excluded"
     assert sleeper.assess(a, [a], 12, {}, {"w1:p1"})[1] == "excluded"
+    unnamed = agent(pane="w1:p1", name=None)
+    assert sleeper.assess(unnamed, [unnamed], 12, {}, {"Title"})[1] == "excluded"
+    transcript(state, UUID, 30).write_text(json.dumps({"type": "agent-name", "agentName": "keeper"}) + "\n")
+    assert sleeper.assess(unnamed, [unnamed], 12, {}, {"keeper"})[1] == "excluded"
+    assert sleeper.assess(unnamed, [unnamed], 12, {}, {"other"})[1] != "excluded"
+    transcript(state, UUID, 30)
     assert "journal" in sleeper.assess(a, [a], 12, {"w1:p1": {"phase": "asleep"}})[1]
     assert "no transcript" in sleeper.assess(agent(uuid="other"), [agent(uuid="other")], 12, {})[1]
 
