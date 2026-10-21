@@ -1053,6 +1053,76 @@ def test_mail_files_are_private(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch
     assert path.stat().st_mode & 0o777 == 0o600 and path.parent.stat().st_mode & 0o777 == 0o700
 
 
+def named_transcript(state: Path, uuid: str, name: str) -> None:
+    transcript(state, uuid, 30).write_text(json.dumps({"type": "agent-name", "agentName": "old-name"}) + "\n"
+                                           + json.dumps({"type": "agent-name", "agentName": name}) + "\n")
+
+
+def test_sleep_records_the_claude_session_name(fake: FakeHerdr, state: Path) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    assert slept_entry(fake)["claude_name"] == "ts-api-worker"
+
+
+def test_presence_lists_live_and_sleeping(fake: FakeHerdr, state: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    fake.agents.append({**agent(pane="w2:p1", uuid="u2-session", name="orc", terminal="t2"), "pid_hint": 102})
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True)) == 0
+    rows = json.loads(capsys.readouterr().out)
+    by_state = {r["state"]: r for r in rows}
+    assert by_state["asleep"]["claude_name"] == "ts-api-worker" and by_state["asleep"]["session"] == UUID
+    assert by_state["idle"]["name"] == "orc"
+    assert all("argv" not in r for r in rows)
+
+
+def run_hook(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], payload: dict) -> dict | None:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(json.dumps(payload)))
+    capsys.readouterr()
+    assert sleeper.cmd_claude_hook(types.SimpleNamespace()) == 0
+    out = capsys.readouterr().out.strip()
+    return json.loads(out) if out else None
+
+
+def test_hook_adds_sleepers_to_list_agents(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"}) is None
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    out = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    assert "ts-api-worker" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_routes_send_message_to_a_sleeper(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    sender_log = state / "sender.jsonl"
+    sender_log.write_text(json.dumps({"type": "agent-name", "agentName": "orchestrator"}) + "\n")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: spawned.append(argv))
+    out = run_hook(monkeypatch, capsys, {
+        "hook_event_name": "PreToolUse", "tool_name": "SendMessage", "transcript_path": str(sender_log),
+        "tool_input": {"to": "ts-api-worker [3fa9c1]", "message": "please rebase"}})
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny" and "queued as msg" in hso["permissionDecisionReason"]
+    assert len(sleeper.pending_mail(UUID)) == 1
+    assert spawned and spawned[0][-4:] == ["deliver-pending", UUID, "--from", "orchestrator"]
+    # the spawned process: wake, then type the message in with the envelope
+    assert sleeper.cmd_deliver_pending(types.SimpleNamespace(uuid=UUID, sender="orchestrator")) == 0
+    assert prompts(fake)[-1][3].startswith("[relayed from orchestrator via herdr-sleeper")
+    assert sleeper.pending_mail(UUID) == []
+
+
+def test_hook_leaves_live_peers_and_errors_alone(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "SendMessage",
+               "tool_input": {"to": "a", "message": "hi"}}
+    assert run_hook(monkeypatch, capsys, payload) is None             # live agent: SendMessage handles it
+    monkeypatch.setattr(sleeper, "read_json", lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert run_hook(monkeypatch, capsys, payload) is None             # fails open
+
+
 # ------------------------------------------------------------------ stub
 
 def test_stub_wakes_by_exec_after_enter(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,

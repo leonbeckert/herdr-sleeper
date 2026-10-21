@@ -169,6 +169,26 @@ that read untrusted content). Exit codes: 0 delivered, 3 queued, 1 refused,
 2 bad input. Any local process running as the same user can send. The
 sender name is self-declared, so the audit trail is only as good as that.
 
+`presence [--json]` lists every live agent and every sleeper (state, Herdr
+name, Claude session name, pane, kind, cwd, session id, slept since), with
+no argv, for agents looking for a peer.
+
+**Claude Code hooks.** `claude-hook` is a hook command for two built-in
+tools. Register it in `~/.claude/settings.json` as a `PostToolUse` hook with
+matcher `ListAgents` and a `PreToolUse` hook with matcher `SendMessage`:
+
+- after `ListAgents`, it adds the sleeping sessions (by their Claude session
+  names, which the plugin reads from each transcript's `agent-name`
+  records) as extra context;
+- before `SendMessage` to one of those names, it queues the message, starts
+  a detached `deliver-pending` that wakes the session and types the message
+  in, and denies the tool call with a reason saying so. The sender
+  therefore does not resend, and the reply comes back to the sender's
+  session name through the normal cross-session path.
+
+Live peers are left to `SendMessage`. Any error lets the tool run as if the
+plugin were absent.
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -265,7 +285,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 196 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 201 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

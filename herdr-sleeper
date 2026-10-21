@@ -30,6 +30,8 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper scan                    one watcher tick, on demand
   herdr-sleeper stop / start            stop the watcher and keep it stopped / undo that
   herdr-sleeper deliver TARGET --from SENDER   message on stdin to a live or sleeping agent (wakes it)
+  herdr-sleeper presence [--json]       live and sleeping agents, for agents looking for peers
+  herdr-sleeper claude-hook             Claude Code hook: ListAgents shows sleepers, SendMessage wakes them
   herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
 
 Fail-closed rules, inherited from the standalone script and its three review
@@ -628,6 +630,30 @@ def load_config() -> tuple[dict, dict[str, str]]:
 
 
 # ---------------------------------------------------------------- inspection
+
+NAME_TAIL_BYTES = 256 * 1024
+
+
+def claude_session_name(transcript: Path | None) -> str | None:
+    """The name Claude Code lists this session under (ListAgents, SendMessage `to`): the last
+    `agent-name` record of its transcript. None when there is none or it cannot be read."""
+    if transcript is None:
+        return None
+    try:
+        with transcript.open("rb") as fh:
+            fh.seek(max(0, transcript.stat().st_size - NAME_TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        if b'"agent-name"' not in line:
+            continue
+        with contextlib.suppress(ValueError):
+            rec = json.loads(line)
+            if isinstance(rec, dict) and rec.get("type") == "agent-name" and isinstance(rec.get("agentName"), str):
+                return rec["agentName"]
+    return None
+
 
 def transcript_for(uuid: str) -> Path | None:
     """The transcript for a claude session; when several match, the most recently written one."""
@@ -1425,6 +1451,7 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         "cwd": agent.get("cwd"), "uuid": uuid, "kind": kind,
         "argv": replay or None, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
         "status": agent.get("agent_status"), "phase": "exit-requested",
+        "claude_name": claude_session_name(transcript_for(uuid)) if kind == "claude" else None,
     }
     name = wake_name(entry)
 
@@ -2086,7 +2113,8 @@ def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str,
     if live:
         return "live", live[0], None
     hits = [(k, e) for k, e in journal.items()
-            if valid_entry(e) and target in (k, e["uuid"], e.get("name") or None, wake_name(e))]
+            if valid_entry(e) and target in (k, e["uuid"], e.get("name") or None, wake_name(e),
+                                             e.get("claude_name") or None)]
     if len(hits) > 1:
         raise SleeperError(f"{target!r} matches {len(hits)} sleeping agents ({', '.join(k for k, _ in hits)}); "
                            "name the pane id instead")
@@ -2148,39 +2176,169 @@ def cmd_deliver(args: argparse.Namespace) -> int:
             return 0
         event("deliver-queued", id=msg["id"], sender=sender, from_pane=from_pane, to=name, uuid=uuid,
               target_state=state, bytes=len(body.encode()))
-        woke = False
-        if state == "asleep":
-            if sender in config["wake_refuse_from"] or (from_pane and from_pane in config["wake_refuse_from"]):
-                event("deliver-held", id=msg["id"], sender=sender, to=name, reason="sender may not wake")
-                print(f"queued msg {msg['id']} for {name}: {sender} may not wake sleepers; "
-                      "it is typed in when the agent next runs")
+        code, text = finish_delivery(state, hit, key, msg["id"], sender, from_pane, config)
+    print(text)
+    return code
+
+
+def finish_delivery(state: str, hit: dict, key: str | None, msg_id: str, sender: str, from_pane: str | None,
+                    config: dict) -> tuple[int, str]:
+    """Wake the target if it sleeps, wait until it is idle, type its queued mail in.
+    Returns (exit code, one line for the sender). Caller holds the target's mailbox lock."""
+    uuid = (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
+    name = (hit.get("name") or hit["pane_id"]) if state == "live" else wake_name(hit)
+    woke = False
+    if state == "asleep":
+        if sender in config["wake_refuse_from"] or (from_pane and from_pane in config["wake_refuse_from"]):
+            event("deliver-held", id=msg_id, sender=sender, to=name, reason="sender may not wake")
+            return 3, (f"queued msg {msg_id} for {name}: {sender} may not wake sleepers; "
+                       "it is typed in when the agent next runs")
+        with locked():
+            outcome = wake_entry(hit, via=f"deliver:{sender}", key=key)
+        if outcome == DELEGATED:
+            outcome = await_stub_wake(hit)
+        if not outcome:
+            event("deliver-held", id=msg_id, sender=sender, to=name, reason="wake refused or failed")
+            return 3, (f"queued msg {msg_id} for {name}: the wake was refused or failed (see `log`); "
+                       "it is typed in when the agent next runs")
+        woke = True
+    target = None
+    for _ in range(DELIVER_READY_SECONDS if woke else 1):
+        target = live_agent(uuid)
+        if target:
+            break
+        time.sleep(1)
+    if not target:
+        return 3, f"queued msg {msg_id} for {name}: not idle yet; typed in when it is"
+    try:
+        type_mail(target["pane_id"], uuid, name)
+    except SleeperError as exc:
+        event("deliver-held", id=msg_id, sender=sender, to=name, reason=f"prompt failed: {exc}")
+        return 3, f"queued msg {msg_id} for {name}: typing it in failed ({exc}); the watcher retries"
+    return 0, f"delivered msg {msg_id} to {name}" + (" (woke it)" if woke else "")
+
+
+def cmd_deliver_pending(args: argparse.Namespace) -> int:
+    """Internal (spawned by claude-hook): wake the sleeper holding mail for UUID and type it in."""
+    config, _src = load_config()
+    with locked():
+        journal = read_json(JOURNAL)
+    hit = next(((k, e) for k, e in journal.items() if valid_entry(e) and e["uuid"] == args.uuid), None)
+    with mailbox_lock(args.uuid):
+        if not pending_mail(args.uuid):
+            return 0
+        if hit is None:
+            agent = live_agent(args.uuid, ready=False)
+            if agent is None:
+                say(f"deliver-pending {args.uuid}: neither asleep nor live; mail stays queued")
                 return 3
+            code, text = finish_delivery("live", agent, None, "(queued)", args.sender, None, config)
+        else:
+            code, text = finish_delivery("asleep", hit[1], hit[0], "(queued)", args.sender, None, config)
+    say(f"deliver-pending: {text}")
+    return code
+
+
+# --------------------------------------------------------------- presence
+
+def presence_rows() -> list[dict]:
+    """Every live agent and every sleeping one: who can be messaged, and how. No argv."""
+    rows: list[dict] = []
+    for a in list_agents():
+        if not a.get("agent") or a.get("agent") == CLAIM_AGENT:
+            continue
+        rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name"), "pane": a["pane_id"],
+                     "kind": a.get("agent"), "cwd": a.get("cwd"),
+                     "session": (a.get("agent_session") or {}).get("value"), "slept_at": None})
+    for key, e in sorted(read_json(JOURNAL).items()):
+        if not valid_entry(e):
+            continue
+        phase = "orphaned" if is_orphan(key, e) else e.get("phase", "asleep")
+        claude_name = e.get("claude_name")
+        if claude_name is None and e.get("kind") == "claude":
+            claude_name = claude_session_name(transcript_for(e["uuid"]))
+        rows.append({"state": "asleep" if phase == "asleep" else phase, "name": wake_name(e),
+                     "claude_name": claude_name, "pane": key, "kind": e.get("kind"), "cwd": e.get("cwd"),
+                     "session": e["uuid"], "slept_at": e.get("slept_at")})
+    return rows
+
+
+def cmd_presence(args: argparse.Namespace) -> int:
+    rows = presence_rows()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for r in rows:
+        alias = f" ({r['claude_name']})" if r.get("claude_name") and r["claude_name"] != r["name"] else ""
+        since = f" since {r['slept_at']}" if r.get("slept_at") else ""
+        print(f"{r['state']:14} {str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
+              f"{r['cwd'] or ''}{since}")
+    print("message any of them: echo TEXT | herdr-sleeper deliver <name> --from <you>  (wakes a sleeper)")
+    return 0
+
+
+# ------------------------------------------------------------ claude hook
+
+REF_SUFFIX = re.compile(r"\s*\[[0-9a-f]{4,12}\]$")
+
+
+def hook_sender(payload: dict) -> str:
+    """The sending session's address, so the recipient's reply reaches it: its Claude name, else
+    its Herdr pane, else a generic label."""
+    path = payload.get("transcript_path")
+    name = claude_session_name(Path(path)) if isinstance(path, str) and path else None
+    name = name or os.environ.get("HERDR_PANE_ID") or "claude-session"
+    return name if SENDER_RE.fullmatch(name) else re.sub(r"[^A-Za-z0-9_.:@-]", "-", name)[:64].strip("-") or "claude"
+
+
+def cmd_claude_hook(_args: argparse.Namespace) -> int:
+    """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook. Fails open: on any error
+    it prints nothing and the tool behaves as without the plugin."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
+        if hook_event == "PostToolUse" and tool == "ListAgents":
+            asleep = [r for r in presence_rows() if r["state"] == "asleep"]
+            if not asleep:
+                return 0
+            lines = [f"- {r.get('claude_name') or r['name']} · {r['cwd'] or '?'} · asleep since {r['slept_at'] or '?'}"
+                     for r in asleep]
+            context = ("Sleeping sessions on this machine (unloaded by herdr-sleeper to save memory; not in the "
+                       "list above). SendMessage to one of these names wakes it and delivers the message:\n"
+                       + "\n".join(lines))
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
+            return 0
+        if hook_event == "PreToolUse" and tool == "SendMessage":
+            tool_input = payload.get("tool_input") or {}
+            to = REF_SUFFIX.sub("", str(tool_input.get("to") or "")).strip()
+            body = str(tool_input.get("message") or "")
+            if not to or not body.strip() or len(body.encode()) > DELIVER_MAX_BYTES:
+                return 0
             with locked():
-                outcome = wake_entry(hit, via=f"deliver:{sender}", key=key)
-            if outcome == DELEGATED:
-                outcome = await_stub_wake(hit)
-            if not outcome:
-                event("deliver-held", id=msg["id"], sender=sender, to=name, reason="wake refused or failed")
-                print(f"queued msg {msg['id']} for {name}: the wake was refused or failed (see `log`); "
-                      "it is typed in when the agent next runs")
-                return 3
-            woke = True
-        target = None
-        for _ in range(DELIVER_READY_SECONDS if woke else 1):
-            target = live_agent(uuid)
-            if target:
-                break
-            time.sleep(1)
-        if not target:
-            print(f"queued msg {msg['id']} for {name}: not idle yet; typed in when it is")
-            return 3
-        try:
-            type_mail(target["pane_id"], uuid, name)
-        except SleeperError as exc:
-            event("deliver-held", id=msg["id"], sender=sender, to=name, reason=f"prompt failed: {exc}")
-            print(f"queued msg {msg['id']} for {name}: typing it in failed ({exc}); the watcher retries")
-            return 3
-    print(f"delivered msg {msg['id']} to {name}" + (" (woke it)" if woke else ""))
+                journal = read_json(JOURNAL)
+            try:
+                state, hit, _key = resolve_target(to, [], journal)  # only sleepers: live peers keep SendMessage
+            except SleeperError:
+                return 0
+            if state != "asleep" or is_orphan(_key or "", hit) or hit.get("phase") != "asleep":
+                return 0
+            sender = hook_sender(payload)
+            with mailbox_lock(hit["uuid"]):
+                msg, _new = queue_message(hit["uuid"], sender, body, None)
+            event("deliver-queued", id=msg["id"], sender=sender, from_pane=os.environ.get("HERDR_PANE_ID"),
+                  to=wake_name(hit), uuid=hit["uuid"], target_state="asleep", bytes=len(body.encode()), via="hook")
+            subprocess.Popen([sys.executable, str(SELF), "deliver-pending", hit["uuid"], "--from", sender],
+                             start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            reason = (f"{to} was asleep (unloaded by herdr-sleeper). Your message is queued as msg {msg['id']}; "
+                      "the session is being woken and will get it in about a minute, with a note that you relayed "
+                      f"it. Its reply comes back to you as {sender}. Do not resend.")
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                     "permissionDecisionReason": reason}}))
+            return 0
+    except Exception as exc:  # the hook must never break the tool it watches
+        with contextlib.suppress(Exception):
+            say(f"claude-hook: {type(exc).__name__}: {exc}")
     return 0
 
 
@@ -3014,6 +3172,15 @@ def main(argv: list[str] | None = None) -> int:
     dp.add_argument("--from", dest="sender", help="who sends it (default: the calling pane's agent name)")
     dp.add_argument("--id", help="message id for deduplication (default: generated)")
     dp.set_defaults(fn=cmd_deliver)
+    dpp = sub.add_parser("deliver-pending", help="wake a sleeper and type its queued mail (internal)")
+    dpp.add_argument("uuid")
+    dpp.add_argument("--from", dest="sender", default="herdr-sleeper")
+    dpp.set_defaults(fn=cmd_deliver_pending)
+    pp = sub.add_parser("presence", help="live and sleeping agents")
+    pp.add_argument("--json", action="store_true")
+    pp.set_defaults(fn=cmd_presence)
+    sub.add_parser("claude-hook", help="Claude Code hook for ListAgents/SendMessage (stdin)").set_defaults(
+        fn=cmd_claude_hook)
     sub.add_parser("stop", help="stop the watcher and keep it stopped").set_defaults(fn=cmd_stop)
     sub.add_parser("start", help="undo `stop`").set_defaults(fn=cmd_start)
     sub.add_parser("uninstall", help="stop, wake everything, report what is left").set_defaults(fn=cmd_uninstall)
