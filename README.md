@@ -41,8 +41,7 @@ herdr plugin link <checkout>
 
 After an agent has been idle for a user-chosen window (`idle = "12h"` —
 default 12 h), it exits the agent process (SIGTERM for claude and opencode:
-both shut down cleanly and a composer draft is discarded, never submitted),
-keeps the pane, reports a `sleeper` placeholder so the sidebar keeps its
+both shut down cleanly), keeps the pane, reports a `sleeper` placeholder so the sidebar keeps its
 row, leaves a wake stub in the pane ("press Enter to resume"), prefixes the
 pane label with 💤, and posts a notification with the freed MB.
 
@@ -142,8 +141,16 @@ introduces are marked.
    unreadable process-info is unknown, not gone. *Delta:* the exit is a
    SIGTERM to the pane's identified agent process (refused when the pid
    cannot be identified) — a signal cannot append to a composer draft the
-   way a typed `/exit` could, which is what the old positive-empty-composer
-   check guarded against. That check still guards kinds exited by typing.
+   way a typed `/exit` could. It would discard the draft, though, so for
+   claude the last look also requires: an empty composer (Claude's dim prompt
+   suggestion is not a draft; text on the prompt line or above the box's
+   lower rule is), no background work in the footer (`N shells`,
+   `N monitors`, running subagents — patterns from
+   [netresearch/herdr-bg-activity](https://github.com/netresearch/herdr-bg-activity)),
+   no shell process below the agent (a background Bash task), and no pending
+   `ScheduleWakeup` or session cron job in the transcript tail. The screen is
+   read with `--format ansi` for that. The positive-empty-composer check
+   still guards kinds exited by typing.
 3. The record is written *before* the exit. If the agent is still there
    after the wait it stays `exit-requested`; the next tick reconciles
    (dropped only after two *consecutive* sightings with a real process, or
@@ -212,7 +219,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 175 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 182 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

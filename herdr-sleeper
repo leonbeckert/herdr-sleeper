@@ -171,7 +171,9 @@ SLEEP_MARK = "💤 "
 # would reach the shell's line editor as keystrokes.
 MODE_RESET_PRINTF = r"\033[?1049l\033[?1000l\033[?1002l\033[?1006l\033[?25h"
 PROMPT_GLYPHS = ("❯",)  # Claude Code's composer glyph; a bare ">" is too generic to vouch for
-FOOTER_PREFIXES = ("◤ graft", "▸ ctx", "⏵⏵", "? for shortcuts")
+TRANSCRIPT_TAIL_BYTES = 4_000_000  # how much of a transcript the scheduled-work check reads
+WAKEUP_HORIZON_SECONDS = 2 * 3600  # a ScheduleWakeup fires within an hour; older ones are spent
+CRON_HORIZON_SECONDS = 7 * 86400   # session cron jobs expire after a week
 HERDR_TIMEOUT = 30.0
 EXIT_WAIT_SECONDS = 25
 WAKE_TIMEOUT_MS = 60_000
@@ -213,8 +215,11 @@ class DamagedState(SleeperError):
 # pane, which is only safe with the composer-empty check (recheck applies it).
 # argv_after_binary: replay the pane's original argv on wake (claude only —
 # for the others the resume flags carry everything we can vouch for).
+# idle_guards: before sleeping, also require an empty composer (a draft is unsent work: a signal
+# would discard it) and no background work (footer counts, shell children, scheduled wakeups or
+# session crons in the transcript). Claude-shaped, so claude only.
 PROFILES: dict[str, dict] = {
-    "claude": {"exit": "signal", "argv_after_binary": True},
+    "claude": {"exit": "signal", "argv_after_binary": True, "idle_guards": True},
     "opencode": {"exit": "signal", "argv_after_binary": False},
     # codex is deliberately absent: its TUI does not restore the terminal's keyboard protocol on
     # any signal, so it would need the typed-command exit, and our composer-empty check is
@@ -407,9 +412,11 @@ def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dic
 
 
 def herdr_screen(pane: str) -> str | None:
-    """The pane's screen as plain text, or None when it could not be read."""
+    """The pane's screen with its SGR styling (composer_state tells a dim suggestion from a
+    draft by it), or None when it could not be read."""
     try:
-        proc = subprocess.run([HERDR_BIN, "pane", "read", pane], capture_output=True, text=True, timeout=HERDR_TIMEOUT)
+        proc = subprocess.run([HERDR_BIN, "pane", "read", pane, "--format", "ansi"], capture_output=True, text=True,
+                              timeout=HERDR_TIMEOUT)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
     if proc.returncode != 0 or proc.stdout.lstrip().startswith('{"error"'):
@@ -814,33 +821,189 @@ def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
+ANSI_SGR = re.compile(r"\x1b\[([0-9;]*)m")
+ANSI_ANY = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+
+
+def strip_ansi(line: str) -> str:
+    return ANSI_ANY.sub("", line)
+
+
+def typed_text(line: str) -> str:
+    """The characters of a screen line not rendered dim. Claude Code shows a prompt suggestion in
+    an empty composer as dim (SGR 2) text; that is not a draft. Plain-text input has no styling,
+    so everything in it counts as typed."""
+    out: list[str] = []
+    dim, i = False, 0
+    while i < len(line):
+        m = ANSI_SGR.match(line, i)
+        if m:
+            for code in (m.group(1) or "0").split(";"):
+                if code in ("", "0", "22"):
+                    dim = False
+                elif code == "2":
+                    dim = True
+            i = m.end()
+            continue
+        m = ANSI_ANY.match(line, i)
+        if m:
+            i = m.end()
+            continue
+        if not dim:
+            out.append(line[i])
+        i += 1
+    return "".join(out)
+
+
+def is_rule(line: str) -> bool:
+    text = line.strip()
+    return len(text) >= 3 and set(text) <= {"─"}
+
+
 def composer_state(screen: str | None) -> tuple[str, str]:
     """('empty' | 'draft' | 'unknown', detail) judged from the pane screen, failing closed.
 
-    Only consulted for kinds exited by typing into the composer (a signal exit
-    discards drafts instead of submitting them). The composer is the last line
-    starting with a prompt glyph; text after it, or any non-footer line below
-    it, is a draft. No glyph at all, or no screen, is unknown — refuse.
+    The composer is the last line starting with a prompt glyph. Text on it that is not dim, or
+    any such text on the lines between it and the next horizontal rule (a multi-line draft), is a
+    draft. Below that rule is the footer (status line, mode, hints), whatever it says. No glyph,
+    no rule below it, or no screen at all is unknown: refuse.
     """
     if screen is None:
         return "unknown", "screen unreadable"
-    lines = [ln.rstrip() for ln in screen.splitlines() if ln.strip()]
+    raw = [ln.rstrip() for ln in screen.splitlines() if strip_ansi(ln).strip()]
+    lines = [strip_ansi(ln) for ln in raw]
     for idx in range(len(lines) - 1, -1, -1):
         stripped = lines[idx].lstrip()
         if stripped.startswith(PROMPT_GLYPHS):
             # the detail is logged: say where the draft is, never what it says
-            if stripped[1:].strip():
+            typed = typed_text(raw[idx]).strip()
+            if typed.startswith(PROMPT_GLYPHS):
+                typed = typed[1:].strip()
+            if typed:
                 return "draft", "text in the composer"
-            rest = [ln.strip() for ln in lines[idx + 1:]]
-            below = [ln for ln in rest if not (ln.startswith(FOOTER_PREFIXES) or set(ln) <= {"─"})]
-            if below:
+            rest = lines[idx + 1:]
+            rule = next((j for j, ln in enumerate(rest) if is_rule(ln)), None)
+            if rule is None:  # a bare glyph with no box under it is not a composer we can vouch for
+                return "unknown", "no rule below the prompt"
+            if any(typed_text(ln).strip() for ln in raw[idx + 1:idx + 1 + rule]):
                 return "draft", "text below the composer line"
-            if not rest:  # a bare glyph with nothing rendered under it is not a composer we can vouch for
-                return "unknown", "no footer below the prompt"
             return "empty", ""
         if stripped.startswith(("⏺", "✻", "⎿")):
             return "unknown", "composer not visible below transcript"
     return "unknown", "no prompt glyph on screen"
+
+
+BG_ITEM = re.compile(r"^(\d+) (monitor|shell)s?$")
+SUBAGENT_LINE = re.compile(r"^\S \S+ {2,}.* · ↓ [\d.]+[kM]? tokens$")
+
+
+def background_work(screen: str | None) -> str | None:
+    """What Claude Code's footer says still runs ("1 monitor", "2 shells", subagent rows), or None.
+
+    Only lines below the last horizontal rule count, so transcript text cannot match. Patterns
+    from netresearch/herdr-bg-activity (MIT): Herdr reports such a pane as idle (herdr#1217).
+    """
+    if screen is None:
+        return None
+    lines = [strip_ansi(ln).strip() for ln in screen.splitlines()]
+    rules = [i for i, ln in enumerate(lines) if is_rule(ln)]
+    if not rules:
+        return None
+    found: list[str] = []
+    for line in lines[rules[-1] + 1:]:
+        if SUBAGENT_LINE.match(line):
+            found.append("a subagent")
+            continue
+        for piece in re.split(r"[·,]", line):
+            m = BG_ITEM.match(piece.strip())
+            if m:
+                found.append(f"{m.group(1)} {m.group(2)}{'s' if m.group(1) != '1' else ''}")
+    return ", ".join(found) or None
+
+
+def _age_seconds(stamp: object, now: float) -> float:
+    """Age of a transcript ISO timestamp; 0 (fresh) when it cannot be parsed — fail closed."""
+    try:
+        return now - dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def scheduled_work(uuid: str) -> str | None:
+    """A ScheduleWakeup still pending, or session cron jobs still scheduled, per the transcript tail.
+
+    A wakeup is pending when the last one (not `stop`) came after the last human prompt and is
+    younger than WAKEUP_HORIZON_SECONDS; crons count CronCreate minus CronDelete over the last
+    CRON_HORIZON_SECONDS. Sleeping such a session would cancel the timer silently.
+    """
+    path = transcript_for(uuid)
+    if path is None:
+        return None  # assess refuses a claude pane without a transcript before this is asked
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - TRANSCRIPT_TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return "transcript unreadable (cannot rule out scheduled work)"
+    now = time.time()
+    last_prompt = -1
+    wakeup: tuple[int, object] | None = None
+    crons = 0
+    for idx, line in enumerate(tail.splitlines()):
+        if b'"user"' not in line and b'"Cron' not in line and b'"ScheduleWakeup"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue  # the first line of the tail is usually cut
+        if not isinstance(rec, dict) or rec.get("isSidechain"):
+            continue
+        content = (rec.get("message") or {}).get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if rec.get("type") == "user" and not rec.get("isMeta"):
+            if isinstance(content, str) or (blocks and not any(b.get("type") == "tool_result" for b in blocks)):
+                last_prompt = idx
+        elif rec.get("type") == "assistant":
+            for b in blocks:
+                if b.get("type") != "tool_use":
+                    continue
+                name, args = b.get("name"), b.get("input") if isinstance(b.get("input"), dict) else {}
+                if name == "ScheduleWakeup":
+                    wakeup = None if args.get("stop") else (idx, rec.get("timestamp"))
+                elif name in ("CronCreate", "CronDelete") and _age_seconds(rec.get("timestamp"), now) < CRON_HORIZON_SECONDS:
+                    crons = crons + 1 if name == "CronCreate" else max(0, crons - 1)
+    if crons:
+        return f"{crons} session cron job(s) scheduled"
+    if wakeup and wakeup[0] > last_prompt and _age_seconds(wakeup[1], now) < WAKEUP_HORIZON_SECONDS:
+        return "a scheduled wakeup is pending"
+    return None
+
+
+def busy_reason(agent: dict) -> str | None:
+    """Why an idle-looking pane must not sleep yet (profiles with idle_guards), or None.
+
+    Herdr's `idle` only means the turn ended: a draft may sit in the composer, and monitors,
+    background shells, subagents, or a scheduled wakeup may still run.
+    """
+    pane, kind = agent["pane_id"], agent.get("agent")
+    screen = herdr_screen(pane)
+    state, detail = composer_state(screen)
+    if state != "empty":
+        return f"composer {state}: {detail}"
+    bg = background_work(screen)
+    if bg:
+        return f"background work running ({bg})"
+    present, _argv, pid = agent_process(pane, str(kind))
+    if present is not True or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return "agent process not identifiable (cannot check its children)"
+    table = process_table()
+    if pid not in table:
+        return "process table unreadable (cannot check the agent's children)"
+    shells = [c for c in descendants(table, pid).values() if c.lstrip("-") in SHELLS]
+    if shells:
+        return f"{len(shells)} shell process(es) still run under the agent (background task)"
+    uuid = (agent.get("agent_session") or {}).get("value")
+    return scheduled_work(uuid) if kind == "claude" and uuid else None
 
 
 def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | None = None) -> str | None:
@@ -1129,7 +1292,12 @@ def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
     ok, reason, _ = assess(now, list(fresh.values()), idle_hours, journal, exclude, idle_since, allow_focused)
     if not ok:
         return reason, now
-    if PROFILES.get(now.get("agent"), {}).get("exit") == "prompt":
+    profile = PROFILES.get(now.get("agent"), {})
+    if profile.get("idle_guards"):
+        busy = busy_reason(now)
+        if busy:
+            return busy, now
+    elif profile.get("exit") == "prompt":
         state, detail = composer_state(herdr_screen(agent["pane_id"]))
         if state != "empty":
             return f"composer {state}: {detail}", now

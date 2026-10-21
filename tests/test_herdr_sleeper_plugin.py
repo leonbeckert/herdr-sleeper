@@ -496,12 +496,77 @@ def test_sleep_happy_path_signals_and_leaves_stub(fake: FakeHerdr) -> None:
     assert events() == ["slept"]
 
 
-def test_sleep_discards_draft_via_signal(fake: FakeHerdr) -> None:
-    """A draft no longer blocks sleeping: SIGTERM discards it instead of the old
-    /exit-appends-to-draft hazard. (The composer check still guards prompt-exit kinds.)"""
+def test_sleep_keeps_a_draft(fake: FakeHerdr) -> None:
+    """SIGTERM would discard a draft: unsent work. Claude panes with one stay awake."""
     fake.screen = CLAUDE_SCREEN.format(composer="unsent")
     slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
-    assert slept and outcome == "slept" and journal()["w1:p1"]["phase"] == "asleep"
+    assert not slept and "composer draft" in outcome and fake.signals == []
+    assert "w1:p1" not in journal()
+
+
+def test_sleep_ignores_the_dim_prompt_suggestion(fake: FakeHerdr) -> None:
+    # Claude Code 2.1.306 as Herdr renders it with --format ansi: the suggestion is SGR 2
+    fake.screen = ("⏺ done\n❯\xa0\x1b[0m\x1b[2mcommit the status file\x1b[0m\n" + "─" * 40
+                   + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · install gh for PR status\n")
+    assert sleeper.composer_state(fake.screen)[0] == "empty"
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+
+
+@pytest.mark.parametrize("footer, needle", [
+    ("  ⏵⏵ bypass permissions on · 1 shell", "1 shell"),
+    ("  ⏵⏵ bypass permissions on · 2 monitors, 1 shell", "2 monitors, 1 shell"),
+    ("  ◯ general-purpose  Reading files  18s · ↓ 140.1k tokens", "subagent"),
+])
+def test_sleep_waits_for_background_work(fake: FakeHerdr, footer: str, needle: str) -> None:
+    fake.screen = "⏺ started\n❯ \n" + "─" * 40 + "\n" + footer + "\n"
+    slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert not slept and needle in outcome and fake.signals == []
+
+
+def test_background_counts_only_below_the_last_rule() -> None:
+    screen = "⏺ 1 shell\n❯ 2 monitors\n" + "─" * 20 + "\n  ⏵⏵ bypass permissions on\n"
+    assert sleeper.background_work(screen) is None
+
+
+def test_sleep_waits_while_a_shell_runs_under_the_agent(fake: FakeHerdr) -> None:
+    fake.helpers = {300: "zsh", 301: "python"}   # a run_in_background Bash task, an MCP server
+    slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert not slept and "shell process" in outcome and fake.signals == []
+
+
+def _line(**rec: Any) -> str:
+    return json.dumps(rec) + "\n"
+
+
+def _tool(name: str, at: str, **inp: Any) -> str:
+    return _line(type="assistant", timestamp=at,
+                 message={"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": inp}]})
+
+
+def _prompt(at: str) -> str:
+    return _line(type="user", timestamp=at, message={"role": "user", "content": "go on"})
+
+
+def _iso(seconds_ago: float) -> str:
+    return sleeper.dt.datetime.fromtimestamp(time.time() - seconds_ago, sleeper.dt.timezone.utc).isoformat()
+
+
+def test_scheduled_work_from_the_transcript(fake: FakeHerdr, state: Path) -> None:
+    path = transcript(state, UUID, 0)
+    path.write_text(_prompt(_iso(900)) + _tool("ScheduleWakeup", _iso(600), delaySeconds=1200))
+    assert sleeper.scheduled_work(UUID) == "a scheduled wakeup is pending"
+    slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert not slept and "wakeup is pending" in outcome
+    path.write_text(_tool("ScheduleWakeup", _iso(600), delaySeconds=60) + _prompt(_iso(500)))
+    assert sleeper.scheduled_work(UUID) is None                          # it fired; the loop did not re-arm
+    path.write_text(_tool("ScheduleWakeup", _iso(900), delaySeconds=60) + _tool("ScheduleWakeup", _iso(600), stop=True))
+    assert sleeper.scheduled_work(UUID) is None                          # stopped
+    path.write_text(_tool("ScheduleWakeup", _iso(3 * 3600), delaySeconds=60))
+    assert sleeper.scheduled_work(UUID) is None                          # spent long ago
+    path.write_text(_tool("CronCreate", _iso(3600)) + _tool("CronCreate", _iso(3000)) + _tool("CronDelete", _iso(60)))
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"
+    path.write_text(_tool("CronCreate", _iso(8 * 86400)))
+    assert sleeper.scheduled_work(UUID) is None                          # expired
 
 
 def test_sleep_refuses_when_state_moved_since_scan(fake: FakeHerdr) -> None:
