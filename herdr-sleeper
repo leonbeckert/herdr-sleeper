@@ -124,6 +124,7 @@ import tempfile
 import termios
 import time
 import traceback
+from collections.abc import Iterator
 from pathlib import Path
 
 try:
@@ -292,13 +293,27 @@ def open_private(path: Path, flags: int) -> int:
     return fd
 
 
+@contextlib.contextmanager
+def flocked(path: Path, wait: bool = True) -> Iterator[bool]:
+    """An exclusive flock on a private lock file; yields False when wait=False and it is taken."""
+    with os.fdopen(open_private(path, os.O_RDWR), "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except OSError:
+            yield False
+            return
+        yield True  # closing the file releases the lock
+
+
 def append_private(path: Path, line: str) -> None:
-    """Append one line to a 0600 file, rotating it to <name>.1 once it outgrows LOG_MAX_BYTES."""
-    with contextlib.suppress(OSError):
-        if path.stat().st_size > LOG_MAX_BYTES:
-            os.replace(path, path.with_name(path.name + ".1"))
-    with os.fdopen(open_private(path, os.O_WRONLY | os.O_APPEND), "a") as fh:
-        fh.write(line + "\n")
+    """Append one line to a 0600 file, rotating it to <name>.1 once it outgrows LOG_MAX_BYTES.
+    Under a lock: two writers rotating at once would replace the fresh .1 with an empty file."""
+    with flocked(path.with_name(path.name + ".lock")):
+        with contextlib.suppress(OSError):
+            if path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+        with os.fdopen(open_private(path, os.O_WRONLY | os.O_APPEND), "a") as fh:
+            fh.write(line + "\n")
 
 
 def say(msg: str) -> None:
@@ -874,12 +889,31 @@ def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
-ANSI_SGR = re.compile(r"\x1b\[([0-9;]*)m")
-ANSI_ANY = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+ANSI_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+ANSI_ANY = re.compile(r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+SGR_COLOR_ARGS = {"5": 1, "2": 3}  # after 38/48/58: `5;n` (palette) or `2;r;g;b` (truecolour)
 
 
 def strip_ansi(line: str) -> str:
     return ANSI_ANY.sub("", line)
+
+
+def sgr_dim(params: str, dim: bool) -> bool:
+    """Whether text is dim after one SGR sequence. Colour arguments are skipped, not read as
+    attributes: the `2` in `38;2;r;g;b` is truecolour, not dim."""
+    codes = (params or "0").split(";")
+    i = 0
+    while i < len(codes):
+        code = codes[i].split(":", 1)[0]  # `38:2::r:g:b` carries its arguments in one parameter
+        if code in ("38", "48", "58") and ":" not in codes[i]:
+            i += 1 + (1 + SGR_COLOR_ARGS[codes[i + 1]] if i + 1 < len(codes) and codes[i + 1] in SGR_COLOR_ARGS else 0)
+            continue
+        if code in ("", "0", "22"):
+            dim = False
+        elif code == "2":
+            dim = True
+        i += 1
+    return dim
 
 
 def typed_text(line: str) -> str:
@@ -891,11 +925,7 @@ def typed_text(line: str) -> str:
     while i < len(line):
         m = ANSI_SGR.match(line, i)
         if m:
-            for code in (m.group(1) or "0").split(";"):
-                if code in ("", "0", "22"):
-                    dim = False
-                elif code == "2":
-                    dim = True
+            dim = sgr_dim(m.group(1), dim)
             i = m.end()
             continue
         m = ANSI_ANY.match(line, i)
@@ -982,6 +1012,53 @@ def _age_seconds(stamp: object, now: float) -> float:
         return 0.0
 
 
+CRON_SCAN: dict[str, dict] = {}  # transcript path -> {ino, offset, events}: what cron_jobs has read
+
+
+def cron_jobs(path: Path, now: float) -> int:
+    """Session cron jobs still scheduled: CronCreate minus CronDelete over the whole transcript,
+    within CRON_HORIZON_SECONDS. A cron made long before the tail would otherwise be missed;
+    the watcher keeps its read offset, so each tick reads only what was appended."""
+    st = path.stat()
+    rec = CRON_SCAN.get(str(path))
+    with path.open("rb") as fh:
+        if rec is not None and rec["ino"] == st.st_ino and st.st_size >= rec["offset"]:
+            fh.seek(max(0, rec["offset"] - len(rec["mark"])))
+            if fh.read(len(rec["mark"])) != rec["mark"]:
+                rec = None  # rewritten in place, not appended to: read it again
+        if rec is None or rec["ino"] != st.st_ino or st.st_size < rec["offset"]:
+            rec = {"ino": st.st_ino, "offset": 0, "events": [], "mark": b""}
+        fh.seek(rec["offset"])
+        pos = rec["offset"]
+        for line in fh:
+            if not line.endswith(b"\n"):
+                break  # a line still being written: read it whole next time
+            pos += len(line)
+            if b'"Cron' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("type") != "assistant":
+                continue
+            content = (entry.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in ("CronCreate", "CronDelete"):
+                    # an unparseable stamp ages from now: fail closed, the job counts for the whole horizon
+                    stamp = now - _age_seconds(entry.get("timestamp"), now) if entry.get("timestamp") else now
+                    rec["events"].append((stamp, 1 if b["name"] == "CronCreate" else -1))
+        fh.seek(max(0, pos - 64))
+        rec["mark"] = fh.read(pos - max(0, pos - 64))  # the bytes before the offset: proof of an append
+    rec["offset"] = pos
+    rec["events"] = [(t, d) for t, d in rec["events"] if now - t < CRON_HORIZON_SECONDS]
+    CRON_SCAN[str(path)] = rec
+    count = 0
+    for _t, d in rec["events"]:
+        count = max(0, count + d)
+    return count
+
+
 def scheduled_work(uuid: str) -> str | None:
     """A ScheduleWakeup still pending, or session cron jobs still scheduled, per the transcript tail.
 
@@ -992,18 +1069,18 @@ def scheduled_work(uuid: str) -> str | None:
     path = transcript_for(uuid)
     if path is None:
         return None  # assess refuses a claude pane without a transcript before this is asked
+    now = time.time()
     try:
+        crons = cron_jobs(path, now)
         with path.open("rb") as fh:
             fh.seek(max(0, path.stat().st_size - TRANSCRIPT_TAIL_BYTES))
             tail = fh.read()
     except OSError:
         return "transcript unreadable (cannot rule out scheduled work)"
-    now = time.time()
     last_prompt = -1
     wakeup: tuple[int, object] | None = None
-    crons = 0
     for idx, line in enumerate(tail.splitlines()):
-        if b'"user"' not in line and b'"Cron' not in line and b'"ScheduleWakeup"' not in line:
+        if b'"user"' not in line and b'"ScheduleWakeup"' not in line:
             continue
         try:
             rec = json.loads(line)
@@ -1023,8 +1100,6 @@ def scheduled_work(uuid: str) -> str | None:
                 name, args = b.get("name"), b.get("input") if isinstance(b.get("input"), dict) else {}
                 if name == "ScheduleWakeup":
                     wakeup = None if args.get("stop") else (idx, rec.get("timestamp"))
-                elif name in ("CronCreate", "CronDelete") and _age_seconds(rec.get("timestamp"), now) < CRON_HORIZON_SECONDS:
-                    crons = crons + 1 if name == "CronCreate" else max(0, crons - 1)
     if crons:
         return f"{crons} session cron job(s) scheduled"
     if wakeup and wakeup[0] > last_prompt and _age_seconds(wakeup[1], now) < WAKEUP_HORIZON_SECONDS:
@@ -1288,6 +1363,7 @@ def wake_name(entry: dict) -> str:
 # --------------------------------------------------------------- assessment
 
 SLEEPABLE_STATUSES = {"idle", "done"}
+DRY_RUN_OUTCOME = "would sleep (dry run)"
 
 
 def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict,
@@ -1438,8 +1514,23 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         stop, _ = recheck(agent, idle_hours, journal, exclude, idle_since, allow_focused)
         if stop:
             return False, f"refused: {stop}"
-        return False, "would sleep (dry run)"
+        return False, DRY_RUN_OUTCOME
+    # A `deliver` holds the session's mailbox lock while it types into the agent, and takes the
+    # global lock after it (to wake): waiting here, under the global lock, could deadlock. Held
+    # until the stub is in place, so mail is never typed into a pane mid-exit; pending mail is
+    # re-checked under it (recheck -> assess).
+    with mailbox_lock(uuid, wait=False) as free:
+        if not free:
+            return False, "refused: a message to this session is being delivered"
+        return _sleep_transaction(agent, profile, replay, idle_hours, exclude, idle_since, allow_focused,
+                                  notify_enabled)
 
+
+def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours: float, exclude: set[str],
+                       idle_since: float | None, allow_focused: bool, notify_enabled: bool) -> tuple[bool, str]:
+    """sleep_agent past its checks: journal, last recheck, exit, stub. Caller holds both locks."""
+    pane, kind = agent["pane_id"], agent.get("agent")
+    uuid = agent["agent_session"]["value"]
     pane_info = herdr("pane", "get", pane).get("pane", {})
     label = pane_info.get("label") or None
     if label and label.startswith(SLEEP_MARK):
@@ -1487,7 +1578,9 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
             write_json(JOURNAL, journal)
             event("refused", pane=pane, name=name, uuid=uuid, reason=why)
             return False, f"refused: {why}"
-        helpers = descendants(table, int(pid))  # reparented to init once the agent exits; reaped below
+        # direct children only: they are reparented to init once the agent exits (reaped below);
+        # grandchildren keep their own parent, which the reap stops or leaves to its own shutdown
+        helpers = {child: comm for child, (parent, comm) in table.items() if parent == int(pid)}
         freed_mb = freed_mb or rss_mb(pane)
         try:
             os.kill(int(pid), signal.SIGTERM)
@@ -1682,6 +1775,14 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
 DELEGATED = "delegated"  # wake_entry: Enter went to the pane's own stub; the caller confirms outside the lock
 
 
+def drop_row(journal: dict, pane: str, uuid: str) -> None:
+    """Remove the pane's row once its session is live again — only if it still names that session:
+    the caller's entry may be older than the journal (a pane slept again under another session)."""
+    if isinstance(journal.get(pane), dict) and journal[pane].get("uuid") == uuid:
+        journal.pop(pane)
+        write_json(JOURNAL, journal)
+
+
 def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> bool | str:
     """Wake one journaled pane via `agent start`. Caller holds the lock; the entry is persisted.
 
@@ -1739,9 +1840,7 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
                 return False
             say(f"{name}: session {uuid} is already running in {pane}; clearing journal entry")
             restore_label(pane, entry, pane_info.get("label"))
-            journal = read_json(JOURNAL)
-            journal.pop(pane, None)
-            write_json(JOURNAL, journal)
+            drop_row(read_json(JOURNAL), pane, uuid)
             return True
         if running and running != uuid and ident != "same" and not (entry.get("wake_got") or entry.get("wake_pending")):
             journal = read_json(JOURNAL)
@@ -1848,8 +1947,7 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
         event("wake-mismatch", pane=pane, name=name, uuid=uuid, got=got)
         return False
     restore_label(pane, entry, pane_info.get("label"))
-    journal.pop(pane, None)
-    write_json(JOURNAL, journal)
+    drop_row(journal, pane, uuid)
     say(f"woke {name} in {pane} uuid={got} (via {via})")
     event("woke", pane=pane, name=name, uuid=got, via=via, slept_at=entry.get("slept_at"))
     return True
@@ -2050,28 +2148,79 @@ def recently_delivered() -> dict:
         return {}
 
 
-def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tuple[dict, bool]:
-    """Write the message into the session's mailbox (0600). Returns (message, is_new): an id that
-    is already queued or was delivered recently is not queued twice."""
+def mark_delivered(msg_id: str) -> None:
+    """Record a delivery. Deliveries to different sessions run under different mailbox locks, so
+    the shared file has its own."""
+    with flocked(DELIVERED.with_name(DELIVERED.name + ".lock")):
+        done = recently_delivered()
+        done[msg_id] = dt.datetime.now().isoformat(timespec="seconds")
+        write_json(DELIVERED, dict(sorted(done.items(), key=lambda kv: kv[1])[-DELIVERED_KEEP:]))
+
+
+# C0 controls but tab and newline, DEL, and C1: a CR would submit early, an ESC drives the TUI.
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def body_problem(body: str) -> str | None:
+    """Why a message body cannot be relayed, or None."""
+    if not body.strip():
+        return "empty message"
+    if len(body.encode()) > DELIVER_MAX_BYTES:
+        return f"message over {DELIVER_MAX_BYTES} bytes; send a file path instead"
+    if CONTROL_CHARS.search(body):
+        return "message contains control characters (only newlines and tabs are typed in)"
+    return None
+
+
+def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tuple[dict, str]:
+    """Write the message into the session's mailbox (0600). Returns (message, status): "new", or
+    "pending" / "delivered" for an id already queued or delivered recently (never queued twice).
+    Caller holds the mailbox lock."""
     if msg_id is None:
         msg_id = hashlib.sha256(f"{sender}\0{uuid}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
     if msg_id in recently_delivered():
-        return {"id": msg_id}, False
+        return {"id": msg_id}, "delivered"
     for path in pending_mail(uuid):
         if path.stem.split("-", 1)[-1] == msg_id:
-            return {"id": msg_id}, False
+            return {"id": msg_id}, "pending"
     msg = {"id": msg_id, "from": sender, "to": uuid, "at": dt.datetime.now().isoformat(timespec="seconds"),
            "body": body}
     path = MAILBOX / uuid / f"{time.time_ns()}-{msg_id}.json"
     fd = open_private(path, os.O_WRONLY | os.O_EXCL)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(msg) + "\n")
-    return msg, True
+    return msg, "new"
 
 
-def type_mail(pane: str, uuid: str, name: str) -> int:
-    """Type every queued message for uuid into its live agent, oldest first; each file is removed
-    only after `agent prompt` succeeded (at least once). Caller holds the mailbox lock."""
+def mail_refusal(pane: str, uuid: str) -> str | None:
+    """Why nothing may be typed into pane for uuid right now, from fresh state; None when it may.
+
+    The pane must run that session, idle or done, with no sleep row on it (a `waking` row whose
+    session is back is the one exception) and, for kinds we can read, an empty composer: `agent
+    prompt` into a draft would send the draft with it.
+    """
+    agent = next((a for a in list_agents() if a["pane_id"] == pane), None)
+    if not agent or agent.get("agent") in (None, CLAIM_AGENT):
+        return "no live agent in the pane"
+    if (agent.get("agent_session") or {}).get("value") != uuid:
+        return "the pane runs another session"
+    if agent.get("agent_status") not in SLEEPABLE_STATUSES:
+        return f"status {agent.get('agent_status')}"
+    row = read_json(JOURNAL).get(pane)
+    if isinstance(row, dict) and not (row.get("phase") == "waking" and row.get("uuid") == uuid):
+        return f"the pane is in the sleep journal ({row.get('phase', 'asleep')})"
+    profile = PROFILES.get(agent.get("agent"), {})
+    if profile.get("idle_guards") or profile.get("exit") == "prompt":
+        state, detail = composer_state(herdr_screen(pane))
+        if state != "empty":
+            return f"composer {state}: {detail}"
+    return None
+
+
+def type_mail(pane: str, uuid: str, name: str) -> tuple[int, str | None]:
+    """Type queued messages for uuid into its agent, oldest first, each only after a fresh
+    mail_refusal check passes; a file is removed only after `agent prompt` succeeded (at least
+    once). Returns (sent, why it stopped early or None). Caller holds the mailbox lock."""
     sent = 0
     for path in pending_mail(uuid):
         try:
@@ -2082,16 +2231,21 @@ def type_mail(pane: str, uuid: str, name: str) -> int:
                 os.replace(path, aside)
             say(f"WARN mailbox file {path.name} unreadable; moved aside to {aside.name}")
             continue
-        herdr("agent", "prompt", pane, envelope(msg))
+        refusal = mail_refusal(pane, uuid)
+        if refusal:
+            return sent, refusal
+        try:
+            herdr("agent", "prompt", pane, envelope(msg))
+        except SleeperError:
+            # Herdr's error detail may quote what it was asked to type: the message stays out of the log
+            raise SleeperError("herdr agent prompt failed") from None
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
-        done = recently_delivered()
-        done[msg["id"]] = dt.datetime.now().isoformat(timespec="seconds")
-        write_json(DELIVERED, dict(sorted(done.items(), key=lambda kv: kv[1])[-DELIVERED_KEEP:]))
+        mark_delivered(msg["id"])
         event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
               bytes=len(str(msg.get("body", "")).encode()))
         sent += 1
-    return sent
+    return sent, None
 
 
 def live_agent(uuid: str, ready: bool = True) -> dict | None:
@@ -2101,6 +2255,20 @@ def live_agent(uuid: str, ready: bool = True) -> dict | None:
             if not ready or a.get("agent_status") in SLEEPABLE_STATUSES:
                 return a
     return None
+
+
+def session_state(uuid: str) -> tuple[str, dict, str | None] | None:
+    """Where the session is now: ('asleep', entry, journal key), ('live', agent, None), or None.
+    A `waking` row whose agent is already back counts as live."""
+    journal = read_json(JOURNAL)  # written by atomic replace: a lock-free read sees a whole file
+    hit = next(((k, e) for k, e in sorted(journal.items())
+                if valid_entry(e) and e["uuid"] == uuid and not is_orphan(k, e)), None)
+    if hit and hit[1].get("phase") != "waking":
+        return "asleep", hit[1], hit[0]
+    agent = live_agent(uuid, ready=False)
+    if agent:
+        return "live", agent, None
+    return ("asleep", hit[1], hit[0]) if hit else None
 
 
 def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str, dict, str | None]:
@@ -2137,11 +2305,9 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     """Deliver a message (stdin) to a live or sleeping agent. Exit 0 delivered, 3 queued (it is
     typed in once the target is live and idle), 1 refused, 2 bad input."""
     body = sys.stdin.read(DELIVER_MAX_BYTES + 1)
-    if not body.strip():
-        print("deliver: empty message on stdin", file=sys.stderr)
-        return 2
-    if len(body.encode()) > DELIVER_MAX_BYTES:
-        print(f"deliver: message over {DELIVER_MAX_BYTES} bytes; send a file path instead", file=sys.stderr)
+    problem = body_problem(body)
+    if problem:
+        print(f"deliver: {problem}", file=sys.stderr)
         return 2
     if args.id is not None and not MSG_ID_RE.fullmatch(args.id):
         print("deliver: --id must match [A-Za-z0-9_-]{1,64}", file=sys.stderr)
@@ -2156,10 +2322,8 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     if not sender or not SENDER_RE.fullmatch(sender):
         print("deliver: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
         return 2
-    with locked():
-        journal = read_json(JOURNAL)
     try:
-        state, hit, key = resolve_target(args.target, agents, journal)
+        state, hit, _key = resolve_target(args.target, agents, read_json(JOURNAL))
     except SleeperError as exc:
         print(f"deliver: {exc}", file=sys.stderr)
         return 1
@@ -2171,23 +2335,29 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         return 1
     from_pane = os.environ.get("HERDR_PANE_ID")
     with mailbox_lock(uuid):
-        msg, new = queue_message(uuid, sender, body, args.id)
-        if not new:
-            print(f"msg {msg['id']} is already queued or delivered; not sent twice")
+        msg, status = queue_message(uuid, sender, body, args.id)
+        if status == "delivered":
+            print(f"msg {msg['id']} was delivered already; not sent twice")
             return 0
-        event("deliver-queued", id=msg["id"], sender=sender, from_pane=from_pane, to=name, uuid=uuid,
-              target_state=state, bytes=len(body.encode()))
-        code, text = finish_delivery(state, hit, key, msg["id"], sender, from_pane, config)
+        if status == "new":
+            event("deliver-queued", id=msg["id"], sender=sender, from_pane=from_pane, to=name, uuid=uuid,
+                  target_state=state, bytes=len(body.encode()))
+        # a retried id that is still queued tries the wake and the typing again
+        code, text = finish_delivery(uuid, msg["id"], sender, from_pane, config)
     print(text)
     return code
 
 
-def finish_delivery(state: str, hit: dict, key: str | None, msg_id: str, sender: str, from_pane: str | None,
+def finish_delivery(uuid: str, msg_id: str, sender: str, from_pane: str | None,
                     config: dict) -> tuple[int, str]:
-    """Wake the target if it sleeps, wait until it is idle, type its queued mail in.
-    Returns (exit code, one line for the sender). Caller holds the target's mailbox lock."""
-    uuid = (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
-    name = (hit.get("name") or hit["pane_id"]) if state == "live" else wake_name(hit)
+    """Wake the session if it sleeps, wait until it is idle, type its queued mail in. Where the
+    session is comes from fresh state, not from the caller's look before the mailbox lock.
+    Returns (exit code, one line for the sender). Caller holds the session's mailbox lock."""
+    where = session_state(uuid)
+    if where is None:
+        return 3, f"queued msg {msg_id} for {uuid}: neither live nor asleep now; typed in when it next runs"
+    state, hit, key = where
+    name = wake_name(hit) if state == "asleep" else (hit.get("name") or hit["pane_id"])
     woke = False
     if state == "asleep":
         if sender in config["wake_refuse_from"] or (from_pane and from_pane in config["wake_refuse_from"]):
@@ -2195,47 +2365,46 @@ def finish_delivery(state: str, hit: dict, key: str | None, msg_id: str, sender:
             return 3, (f"queued msg {msg_id} for {name}: {sender} may not wake sleepers; "
                        "it is typed in when the agent next runs")
         with locked():
-            outcome = wake_entry(hit, via=f"deliver:{sender}", key=key)
+            entry = read_json(JOURNAL).get(key or "")
+            # the row is re-read under the lock: the one read above may be gone or another session's
+            outcome = (wake_entry(entry, via=f"deliver:{sender}", key=key)
+                       if valid_entry(entry) and entry["uuid"] == uuid else live_agent(uuid, ready=False) is not None)
         if outcome == DELEGATED:
-            outcome = await_stub_wake(hit)
+            outcome = await_stub_wake(entry)
         if not outcome:
             event("deliver-held", id=msg_id, sender=sender, to=name, reason="wake refused or failed")
             return 3, (f"queued msg {msg_id} for {name}: the wake was refused or failed (see `log`); "
                        "it is typed in when the agent next runs")
         woke = True
-    target = None
+    target, refusal = None, "not idle"
     for _ in range(DELIVER_READY_SECONDS if woke else 1):
         target = live_agent(uuid)
-        if target:
+        refusal = mail_refusal(target["pane_id"], uuid) if target else "not idle"
+        if not refusal:
             break
         time.sleep(1)
-    if not target:
-        return 3, f"queued msg {msg_id} for {name}: not idle yet; typed in when it is"
+    if refusal or not target:
+        return 3, f"queued msg {msg_id} for {name}: not ready yet ({refusal}); typed in when it is"
     try:
-        type_mail(target["pane_id"], uuid, name)
+        sent, refusal = type_mail(target["pane_id"], uuid, name)
     except SleeperError as exc:
-        event("deliver-held", id=msg_id, sender=sender, to=name, reason=f"prompt failed: {exc}")
+        event("deliver-held", id=msg_id, sender=sender, to=name, reason=str(exc))
         return 3, f"queued msg {msg_id} for {name}: typing it in failed ({exc}); the watcher retries"
+    if refusal and not sent:
+        return 3, f"queued msg {msg_id} for {name}: not ready yet ({refusal}); typed in when it is"
     return 0, f"delivered msg {msg_id} to {name}" + (" (woke it)" if woke else "")
 
 
 def cmd_deliver_pending(args: argparse.Namespace) -> int:
     """Internal (spawned by claude-hook): wake the sleeper holding mail for UUID and type it in."""
+    if not valid_session_id(args.uuid) or not SENDER_RE.fullmatch(args.sender or ""):
+        say("deliver-pending: malformed session id or sender; nothing done")
+        return 2
     config, _src = load_config()
-    with locked():
-        journal = read_json(JOURNAL)
-    hit = next(((k, e) for k, e in journal.items() if valid_entry(e) and e["uuid"] == args.uuid), None)
     with mailbox_lock(args.uuid):
         if not pending_mail(args.uuid):
             return 0
-        if hit is None:
-            agent = live_agent(args.uuid, ready=False)
-            if agent is None:
-                say(f"deliver-pending {args.uuid}: neither asleep nor live; mail stays queued")
-                return 3
-            code, text = finish_delivery("live", agent, None, "(queued)", args.sender, None, config)
-        else:
-            code, text = finish_delivery("asleep", hit[1], hit[0], "(queued)", args.sender, None, config)
+        code, text = finish_delivery(args.uuid, "(queued)", args.sender, None, config)
     say(f"deliver-pending: {text}")
     return code
 
@@ -2292,9 +2461,32 @@ def hook_sender(payload: dict) -> str:
     return name if SENDER_RE.fullmatch(name) else re.sub(r"[^A-Za-z0-9_.:@-]", "-", name)[:64].strip("-") or "claude"
 
 
+def sleeper_named(to: str, journal: dict) -> tuple[str, dict] | None:
+    """The one sleeping claude session SendMessage would address as `to` (its Claude session
+    name), or None: no match, several, or one not cleanly asleep."""
+    hits = []
+    for key, e in journal.items():
+        if not valid_entry(e) or e.get("kind") != "claude" or is_orphan(key, e) or e.get("phase") != "asleep":
+            continue
+        claude_name = e.get("claude_name") or claude_session_name(transcript_for(e["uuid"]))
+        if claude_name == to:
+            hits.append((key, e))
+    return hits[0] if len(hits) == 1 else None
+
+
+def live_claude_named(to: str) -> bool:
+    """Does a live claude session carry this Claude name? Then SendMessage reaches it itself."""
+    for a in list_agents():
+        uuid = (a.get("agent_session") or {}).get("value")
+        if a.get("agent") == "claude" and valid_session_id(uuid) and claude_session_name(transcript_for(uuid)) == to:
+            return True
+    return False
+
+
 def cmd_claude_hook(_args: argparse.Namespace) -> int:
     """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook. Fails open: on any error
-    it prints nothing and the tool behaves as without the plugin."""
+    it prints nothing and the tool behaves as without the plugin. Never takes the global lock: a
+    sleep transaction may hold it longer than the hook may run."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
@@ -2313,34 +2505,38 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
             tool_input = payload.get("tool_input") or {}
             to = REF_SUFFIX.sub("", str(tool_input.get("to") or "")).strip()
             body = str(tool_input.get("message") or "")
-            if not to or not body.strip() or len(body.encode()) > DELIVER_MAX_BYTES:
+            if not to or not body.strip():
                 return 0
-            with locked():
-                journal = read_json(JOURNAL)
-            try:
-                state, hit, _key = resolve_target(to, [], journal)  # only sleepers: live peers keep SendMessage
-            except SleeperError:
+            hit = sleeper_named(to, read_json(JOURNAL))
+            if hit is None or live_claude_named(to):  # live peers keep SendMessage
                 return 0
-            if state != "asleep" or is_orphan(_key or "", hit) or hit.get("phase") != "asleep":
+            entry = hit[1]
+            problem = body_problem(body)
+            if problem:
+                deny(f"{to} is asleep (unloaded by herdr-sleeper) and this message cannot be relayed to it: "
+                     f"{problem}.")
                 return 0
             sender = hook_sender(payload)
-            with mailbox_lock(hit["uuid"]):
-                msg, _new = queue_message(hit["uuid"], sender, body, None)
+            with mailbox_lock(entry["uuid"]):
+                msg, _status = queue_message(entry["uuid"], sender, body, None)
             event("deliver-queued", id=msg["id"], sender=sender, from_pane=os.environ.get("HERDR_PANE_ID"),
-                  to=wake_name(hit), uuid=hit["uuid"], target_state="asleep", bytes=len(body.encode()), via="hook")
-            subprocess.Popen([sys.executable, str(SELF), "deliver-pending", hit["uuid"], "--from", sender],
+                  to=wake_name(entry), uuid=entry["uuid"], target_state="asleep", bytes=len(body.encode()), via="hook")
+            subprocess.Popen([sys.executable, str(SELF), "deliver-pending", entry["uuid"], "--from", sender],
                              start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
-            reason = (f"{to} was asleep (unloaded by herdr-sleeper). Your message is queued as msg {msg['id']}; "
-                      "the session is being woken and will get it in about a minute, with a note that you relayed "
-                      f"it. Its reply comes back to you as {sender}. Do not resend.")
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                                     "permissionDecisionReason": reason}}))
+            deny(f"{to} was asleep (unloaded by herdr-sleeper). Your message is queued as msg {msg['id']}; "
+                 "the session is being woken and will get it in about a minute, with a note that you relayed "
+                 f"it. Its reply comes back to you as {sender}. Do not resend.")
             return 0
     except Exception as exc:  # the hook must never break the tool it watches
         with contextlib.suppress(Exception):
             say(f"claude-hook: {type(exc).__name__}: {exc}")
     return 0
+
+
+def deny(reason: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
 
 
 def flush_mail(agents: list[dict]) -> None:
@@ -2361,9 +2557,12 @@ def flush_mail(agents: list[dict]) -> None:
             if not got:
                 continue  # a `deliver` is on it
             try:
-                type_mail(target["pane_id"], box.name, target.get("name") or target["pane_id"])
+                _sent, refusal = type_mail(target["pane_id"], box.name, target.get("name") or target["pane_id"])
             except SleeperError as exc:
-                say(f"mail for {box.name}: typing it in failed ({exc}); next tick retries")
+                say(f"mail for {box.name}: {exc}; next tick retries")
+                continue
+            if refusal:
+                note_skip(target["pane_id"], f"mail waits: {refusal}")
 
 
 # --------------------------------------------------------------- reconcile
@@ -2649,11 +2848,18 @@ def installed_build(kind: str) -> str | None:
     return os.path.realpath(found) if found else None
 
 
+RUNTIMES = {"node", "bun", "deno"}
+RESTART_COOLDOWN_SECONDS = 6 * 3600
+RESTART_TRIED: dict[str, float] = {}  # session id -> when the watcher last restarted it
+
+
 def outdated_build(agent: dict) -> tuple[str, str] | None:
     """(running, installed) when the agent runs another build than the installed one, else None."""
     kind = str(agent.get("agent"))
     present, _argv, pid = agent_process(agent["pane_id"], kind)
     running = running_build(pid) if present is True else None
+    if running and os.path.basename(running) in RUNTIMES:
+        return None  # an npm/bun install: the process shows its runtime, never the build it loaded
     installed = installed_build(kind)
     if running and installed and os.path.realpath(running) != installed:
         return running, installed
@@ -2669,7 +2875,8 @@ def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: se
     for agent in sorted((a for a in agents if a.get("agent") == "claude" and a["pane_id"] in clocks
                          and a["pane_id"] not in skip), key=lambda a: clocks[a["pane_id"]]["since"]):
         since = clocks[agent["pane_id"]]["since"]
-        if (now - since) / 3600 < window:
+        uuid = (agent.get("agent_session") or {}).get("value")
+        if (now - since) / 3600 < window or now - RESTART_TRIED.get(str(uuid), -math.inf) < RESTART_COOLDOWN_SECONDS:
             continue
         ok, _reason, _ = assess(agent, agents, window, journal, None, idle_since=since)
         builds = outdated_build(agent) if ok else None
@@ -2683,10 +2890,23 @@ def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: se
         if not did:
             note_skip(pane, f"restart onto {new} refused: {outcome}")
             return None
+        RESTART_TRIED[str(uuid)] = now  # one try per cooldown: a restart that does not take must not loop
         entry = read_json(JOURNAL).get(pane)
         result = wake_entry(entry, via=f"restart:{new}", key=pane) if isinstance(entry, dict) else False
-        event("restarted", pane=pane, name=wake_name(entry or {"pane_id": pane}), uuid=(entry or {}).get("uuid"),
-              old=old, new=new, woke=result is True, delegated=result == DELEGATED)
+        name = wake_name(entry or {"pane_id": pane})
+        event("restarted", pane=pane, name=name, uuid=uuid, old=old, new=new, woke=result is True,
+              delegated=result == DELEGATED)
+        if result is True:
+            fresh = next((a for a in list_agents() if a["pane_id"] == pane), None)
+            still = outdated_build(fresh) if fresh and fresh.get("agent") == "claude" else None
+            if still:
+                event("restart-failed", pane=pane, name=name, uuid=uuid, reason=f"still runs {os.path.basename(still[0])}")
+                say(f"WARN restart {pane}: woken, but still on {os.path.basename(still[0])}")
+                return None
+        elif result != DELEGATED:
+            event("restart-failed", pane=pane, name=name, uuid=uuid, reason="wake failed; left asleep")
+            notify(f"{SLEEP_MARK}restart of {name} failed", "left asleep: focus the pane or run `wake`",
+                   enabled=config["notify"])
         say(f"restart {pane}: {old} -> {new}: " + ("woken" if result is True else "wake delegated to the stub"
                                                    if result == DELEGATED else "wake failed; left asleep"))
         return entry if result == DELEGATED else None
@@ -2707,11 +2927,12 @@ def memory_pressure() -> int:
 
 
 def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict], config: dict,
-                   now: float) -> tuple[list[dict], str]:
-    """Panes to sleep before their window: longest idle first, each idle >= pressure_idle.
-
-    Over max_live, as many as bring the live count back to the cap; under memory pressure
-    (warn or critical), one per tick, so the next tick sees what that freed.
+                   now: float) -> tuple[list[dict], int, str]:
+    """Candidates to sleep before their window, longest idle first, each idle >= pressure_idle,
+    and how many of them should sleep. Over max_live, as many as bring the live count back to
+    the cap; under memory pressure (warn or critical), one per tick, so the next tick sees what
+    that freed. The caller walks the list until that many slept: one refusing pane (a draft, a
+    background shell) must not hold the cap up for good.
     """
     window = config["pressure_idle_hours"] * 3600
     live = sum(1 for a in agents if a.get("agent") in config["agents"])
@@ -2719,7 +2940,7 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
     level = memory_pressure()
     want = max(over, 1 if level > 1 else 0)
     if not want:
-        return [], ""
+        return [], 0, ""
     taken = {a["pane_id"] for a in due} | set(config["exclude"])
     ready = sorted((a for a in agents if a["pane_id"] in clocks and a["pane_id"] not in taken
                     and a.get("name") not in config["exclude"]
@@ -2727,7 +2948,7 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
                    key=lambda a: clocks[a["pane_id"]]["since"])
     why = (f"{live} live > max_live {config['max_live']}" if over else "") + \
           (f"{'; ' if over else ''}memory pressure {PRESSURE_NAMES.get(level, level)}" if level > 1 else "")
-    return ready[:want], why
+    return ready, want, why
 
 
 def watch_tick(clocks: dict[str, dict], config: dict) -> None:
@@ -2781,13 +3002,17 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
         if json.dumps(clocks, sort_keys=True) != before:
             persist_clocks(clocks)
             before = json.dumps(clocks, sort_keys=True)
-        early, why_early = early_sleepers(agents, clocks, due, config, now)
-        if early:
-            say(f"early sleep ({why_early}): {', '.join(a['pane_id'] for a in early)}")
+        early, want_early, why_early = early_sleepers(agents, clocks, due, config, now)
+        if early and why_early != LAST_SKIP.get("<early>"):
+            LAST_SKIP["<early>"] = why_early
+            say(f"early sleep ({why_early}): {want_early} of {', '.join(a['pane_id'] for a in early)}")
         # 2. sleep what is due; one pane failing in any way costs that pane, not the tick
+        slept_early = 0
         for agent in due + early:
             if STOP["requested"]:
                 break  # a stopping watcher starts no new transaction
+            if agent not in due and slept_early >= want_early:
+                break
             pane, kind = agent["pane_id"], agent.get("agent")
             since = clocks[pane]["since"]
             window = config["idle_hours"] if agent in due else config["pressure_idle_hours"]
@@ -2805,6 +3030,8 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                 did, outcome = False, f"error: {exc}"
             except Exception as exc:  # nor may a bug that only this pane's data triggers
                 did, outcome = False, f"error: {type(exc).__name__}: {exc}"
+            if did or outcome == DRY_RUN_OUTCOME:
+                slept_early += agent not in due
             if did:
                 say(f"slept {pane} ({agent.get('name') or kind}) uuid={uuid}")
                 clocks.pop(pane, None)

@@ -41,7 +41,8 @@ herdr plugin link <checkout>
 
 After an agent has been idle for a user-chosen window (`idle = "12h"` —
 default 12 h), it exits the agent process (SIGTERM for claude and opencode:
-both shut down cleanly), keeps the pane, reports a `sleeper` placeholder so the sidebar keeps its
+both shut down cleanly; direct children that outlive it, such as MCP
+servers, get a SIGTERM once they are reparented to launchd/init), keeps the pane, reports a `sleeper` placeholder so the sidebar keeps its
 row, leaves a wake stub in the pane ("press Enter to resume"), prefixes the
 pane label with 💤, and posts a notification with the freed MB.
 
@@ -103,11 +104,17 @@ Config: `<plugin config dir>/config.toml` — Herdr's
 `max_live` (more live sessions than this: the longest-idle ones sleep
 early, 0 = no cap), `pressure_idle` (the shorter window for that early
 sleep, default `30m`, never later than `idle`; under macOS memory pressure
-warn/critical one session per tick sleeps early too), `restart_outdated` (an idle claude session whose process runs another
+warn/critical one session per tick sleeps early too; a candidate that
+refuses, a draft or a background shell, is passed over for the next
+longest-idle one), `restart_outdated` (an idle claude session whose process runs another
 build than the installed `claude` resolves to, per `lsof`'s txt entry, is
 slept and woken at once onto the new build, one per tick, after every check a
 sleep needs and at least `pressure_idle` of quiet; keep-listed sessions too,
-since a restart is not a sleep; event `restarted` with both builds),
+since a restart is not a sleep; event `restarted` with both builds, then
+`restart-failed` if the woken session still runs the old build or the wake
+failed. One try per session every 6 h, so a restart that does not take never
+loops. An npm/bun install shows only its runtime to `lsof`, so it is never
+restarted),
 `wake_refuse_from` (see Messages below), `dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
@@ -152,13 +159,20 @@ echo "rebase onto main, then ping me" | herdr-sleeper deliver ts-api --from orch
 ```
 
 The target is a pane id, agent name, wake name, or session id. The message
-(stdin, up to 64 KB) goes into a 0600 file in `mailbox/<session>/` first.
+(stdin, up to 64 KB; no control characters but newline and tab, since a CR
+would submit early and an ESC would drive the TUI) goes into a 0600 file in
+`mailbox/<session>/` first.
 A live, idle agent gets it typed in at once. A sleeping one is woken through
 the usual wake path and gets it as soon as it is idle again. A busy or
 blocked agent (a permission prompt is never typed into) gets it from the
 watcher once it is idle. The file is removed only after `agent prompt`
-succeeded (at least once; `--id` deduplicates retries). A session with
-pending mail is never put to sleep. The agent sees
+succeeded (at least once; `--id` deduplicates retries, and a retried id
+that is still queued tries the wake and the typing again). Each message is
+typed only after a fresh look: the pane runs that session, idle or done, no
+sleep transaction holds it, and the composer is empty (`agent prompt` into a
+draft would send the draft along). A sleep and a delivery to the same session
+exclude each other through the session's mailbox lock. A session with pending
+mail is never put to sleep. The agent sees
 
 ```
 [relayed from orchestrator via herdr-sleeper, msg 3f9a…; not from the owner]
@@ -173,6 +187,9 @@ messages wait for the target's next wake instead of causing one (agents
 that read untrusted content). Exit codes: 0 delivered, 3 queued, 1 refused,
 2 bad input. Any local process running as the same user can send. The
 sender name is self-declared, so the audit trail is only as good as that.
+`herdr agent prompt` takes the text as an argument, so while it runs the
+message is visible in the process list to processes of the same user; the
+plugin itself never logs it, not even inside a Herdr error.
 
 `presence [--json]` lists every live agent and every sleeper (state, Herdr
 name, Claude session name, pane, kind, cwd, session id, slept since), with
@@ -185,14 +202,17 @@ matcher `ListAgents` and a `PreToolUse` hook with matcher `SendMessage`:
 - after `ListAgents`, it adds the sleeping sessions (by their Claude session
   names, which the plugin reads from each transcript's `agent-name`
   records) as extra context;
-- before `SendMessage` to one of those names, it queues the message, starts
+- before `SendMessage` to one of those names (the Claude session name only;
+  a live session carrying the same name keeps it), it queues the message, starts
   a detached `deliver-pending` that wakes the session and types the message
   in, and denies the tool call with a reason saying so. The sender
   therefore does not resend, and the reply comes back to the sender's
   session name through the normal cross-session path.
 
-Live peers are left to `SendMessage`. Any error lets the tool run as if the
-plugin were absent.
+Live peers are left to `SendMessage`. A message that `deliver` would reject
+(control characters, over 64 KB) is denied with that reason. Any error lets
+the tool run as if the plugin were absent. The hook never waits for the
+global lock, which a sleep transaction may hold longer than a hook may run.
 
 ## Safety rules (all fail closed)
 
@@ -219,7 +239,8 @@ introduces are marked.
    `N monitors`, running subagents — patterns from
    [netresearch/herdr-bg-activity](https://github.com/netresearch/herdr-bg-activity)),
    no shell process below the agent (a background Bash task), and no pending
-   `ScheduleWakeup` or session cron job in the transcript tail. The screen is
+   `ScheduleWakeup` in the transcript tail, and no session cron job anywhere
+   in the transcript (the watcher reads it incrementally). The screen is
    read with `--format ansi` for that. The positive-empty-composer check
    still guards kinds exited by typing.
 3. The record is written *before* the exit. If the agent is still there

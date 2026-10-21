@@ -63,6 +63,8 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
+    for name in ("RESTART_TRIED", "CRON_SCAN"):   # per-process watcher memory
+        monkeypatch.setattr(sleeper, name, {})
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
         monkeypatch.delenv(var, raising=False)
     root = tmp_path / "projects"
@@ -2278,3 +2280,138 @@ def test_focus_delegated_to_the_stub_finishes_the_row(fake: FakeHerdr) -> None:
     focus_env("w1:p1")
     assert sleeper.cmd_on_focus() == 0
     assert journal() == {} and fake.agents[0]["name"] == "a"
+
+
+# ------------------------------------------------------------ review fixes
+
+@pytest.mark.parametrize("styled, state", [
+    ("\x1b[2mrun the tests\x1b[0m", "empty"),                 # the dim suggestion
+    ("\x1b[38;2;200;2;2mtyped in red\x1b[0m", "draft"),        # truecolour: the 2 is not dim
+    ("\x1b[38;5;2mtyped in green\x1b[0m", "draft"),            # palette colour 2
+    ("\x1b[48;2;1;2;3;2msuggested\x1b[0m", "empty"),          # dim after a background colour
+    ("\x1b[38:2::1:2:3mcolon form\x1b[0m", "draft"),
+])
+def test_composer_parses_sgr_colour_arguments(styled: str, state: str) -> None:
+    screen = "⏺ done\n❯\xa0" + styled + "\n" + "─" * 40 + "\n  ⏵⏵ bypass permissions on\n"
+    assert sleeper.composer_state(screen)[0] == state
+
+
+def test_sleep_yields_to_a_delivery_in_progress(fake: FakeHerdr) -> None:
+    with sleeper.mailbox_lock(UUID):
+        slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert not slept and "being delivered" in outcome and fake.signals == [] and journal() == {}
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+
+
+def test_mail_is_never_typed_into_a_draft_or_a_journaled_pane(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.screen = CLAUDE_SCREEN.format(composer="half a thought")
+    assert deliver(monkeypatch, "a") == 3 and prompts(fake) == []
+    fake.screen = EMPTY_SCREEN
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {**agent(), "uuid": UUID, "kind": "claude", "phase": "exit-requested"}})
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1
+    sleeper.write_json(sleeper.JOURNAL, {})
+    sleeper.flush_mail(fake.agents)
+    assert len(prompts(fake)) == 1 and sleeper.pending_mail(UUID) == []
+
+
+@pytest.mark.parametrize("body", ["stop\x1b[2J", "line\rsubmit early", "nul\x00", "csi\x9b"])
+def test_deliver_rejects_control_characters(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    assert deliver(monkeypatch, "a", body=body) == 2 and prompts(fake) == []
+
+
+def test_deliver_types_newlines_and_tabs(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a", body="one\n\ttwo") == 0 and prompts(fake)[0][3].endswith("one\n\ttwo")
+
+
+def test_prompt_failure_keeps_the_message_out_of_the_log(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing(*args: str, **kw: Any) -> dict[str, Any]:
+        if args[:2] == ("agent", "prompt"):
+            raise sleeper.SleeperError(f"herdr agent prompt failed: cannot type {args[3]!r}")
+        return fake(*args, **kw)
+    monkeypatch.setattr(sleeper, "herdr", failing)
+    assert deliver(monkeypatch, "a", body="the secret plan") == 3
+    for path in (sleeper.EVENTS, sleeper.LOGFILE):
+        assert "secret plan" not in (path.read_text() if path.exists() else "")
+    assert len(sleeper.pending_mail(UUID)) == 1
+
+
+def test_deliver_retry_of_a_queued_id_tries_again(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", msg_id="m-2") == 3
+    fake.agents[0]["agent_status"] = "idle"
+    assert deliver(monkeypatch, "a", msg_id="m-2") == 0 and len(prompts(fake)) == 1
+    assert deliver(monkeypatch, "a", msg_id="m-2") == 0 and len(prompts(fake)) == 1
+
+
+def test_deliver_pending_validates_its_arguments(fake: FakeHerdr) -> None:
+    assert sleeper.cmd_deliver_pending(types.SimpleNamespace(uuid="../x", sender="orc")) == 2
+
+
+def test_hook_matches_claude_names_only_and_yields_to_live_ones(fake: FakeHerdr, state: Path,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: None)
+    send = {"hook_event_name": "PreToolUse", "tool_name": "SendMessage"}
+    assert run_hook(monkeypatch, capsys, {**send, "tool_input": {"to": "a", "message": "hi"}}) is None
+    assert run_hook(monkeypatch, capsys, {**send, "tool_input": {"to": UUID, "message": "hi"}}) is None
+    fake.agents.append({**agent(pane="w2:p1", uuid="u2-session", name="other", terminal="t2"), "pid_hint": 102})
+    named_transcript(state, "u2-session", "ts-api-worker")             # a live session took the name
+    assert run_hook(monkeypatch, capsys, {**send, "tool_input": {"to": "ts-api-worker", "message": "hi"}}) is None
+    assert sleeper.pending_mail(UUID) == []
+
+
+def test_hook_refuses_to_relay_control_characters(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: pytest.fail("woke for a bad message"))
+    out = run_hook(monkeypatch, capsys, {"hook_event_name": "PreToolUse", "tool_name": "SendMessage",
+                                         "tool_input": {"to": "ts-api-worker", "message": "x\x1b[2J"}})
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny" and "control characters" in hso["permissionDecisionReason"]
+    assert sleeper.pending_mail(UUID) == []
+
+
+def test_wake_keeps_a_row_that_now_names_another_session(fake: FakeHerdr) -> None:
+    entry = slept_entry(fake)
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {**entry, "uuid": "u-later"}})   # slept again meanwhile
+    assert sleeper.wake_entry(entry) is True
+    assert journal()["w1:p1"]["uuid"] == "u-later"
+
+
+def test_restart_skips_runtimes_and_does_not_loop(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 3600}}
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/opt/homebrew/bin/node")
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == []                                            # an npm install: build unknown
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.305")   # and it stays old after the wake
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert len(fake.signals) == 1 and "restart-failed" in events()
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 3600}}
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert len(fake.signals) == 1                                        # cooldown: no restart loop
+
+
+def test_crons_count_over_the_whole_transcript(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "TRANSCRIPT_TAIL_BYTES", 500)
+    path = transcript(state, UUID, 0)
+    path.write_text(_tool("CronCreate", _iso(3 * 86400)) + _prompt(_iso(600)) * 50)
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"   # long before the tail
+    with path.open("a") as fh:
+        fh.write(_tool("CronDelete", _iso(60)))
+    assert sleeper.scheduled_work(UUID) is None                                # read incrementally
+    path.write_text(_tool("CronCreate", _iso(60)) + _prompt(_iso(30)) * 50)     # rewritten, not appended
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"
+
+
+def test_early_sleep_passes_over_a_refusing_pane(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clocks = _three_idle_agents(fake, state)
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    fake.helpers = {300: "zsh"}                    # the longest idle runs a background shell
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "max_live": 2})
+    assert list(journal()) == ["w2:p1"]
