@@ -98,6 +98,11 @@ overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
 idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`.
+The directory is 0700 and every file 0600 (files from earlier versions are
+tightened when next written); the two logs rotate to `<name>.1` at 1 MB.
+`panes.json` keeps only the argv a wake would replay, never the raw command
+line, and log/event reasons name options and draft locations, never values
+or draft text.
 A legacy standalone-script journal (`~/.local/state/herdr-sleeper/`) is
 adopted once, on the default session's first startup. An older config —
 v0.1.0's manual-run location
@@ -207,7 +212,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 156 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 164 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

@@ -256,6 +256,29 @@ def test_replayable_argv_refuses_dangerous(args: list[str], needle: str) -> None
     assert argv is None and why and needle in why
 
 
+def test_replayable_argv_reasons_never_echo_values() -> None:
+    for args in (["--api-key=sk-secret-1"], ["--print=sk-secret-1"], ["--verbose", "sk-secret-1 do the thing"]):
+        argv, why = sleeper.replayable_argv(args)
+        assert argv is None and why and "sk-secret-1" not in why
+    assert sleeper.replayable_argv(["--env", "TOKEN=sk-secret-1"])[0] is None  # values here were secrets
+
+
+def test_composer_detail_never_carries_the_draft() -> None:
+    for composer in ("my password is hunter2", ""):
+        screen = CLAUDE_SCREEN.format(composer=composer)
+        if not composer:
+            screen = screen.replace("────────\n  ◤", "  hunter2 on the second line\n────────\n  ◤", 1)
+        state, detail = sleeper.composer_state(screen)
+        assert state == "draft" and "hunter2" not in detail
+
+
+def test_session_id_shape() -> None:
+    ok = sleeper.valid_session_id
+    assert ok(UUID) and ok("ses_3f9a1bc2") and ok("u")
+    for bad in ("", "../x", "a/b", "*", "a b", "-r", "x;y", None, 5, "a" * 129):
+        assert not ok(bad)
+
+
 def test_parse_duration() -> None:
     assert sleeper.parse_duration("12h") == 12
     assert sleeper.parse_duration("90m") == 1.5
@@ -281,7 +304,7 @@ CLAUDE_SCREEN = """
 def test_composer_state_fails_closed() -> None:
     cs = sleeper.composer_state
     assert cs(CLAUDE_SCREEN.format(composer=""))[0] == "empty"
-    assert cs(CLAUDE_SCREEN.format(composer="half-typed thought")) == ("draft", "half-typed thought")
+    assert cs(CLAUDE_SCREEN.format(composer="half-typed thought")) == ("draft", "text in the composer")
     multiline = CLAUDE_SCREEN.format(composer="") .replace("────────\n  ◤", "  second line of a draft\n────────\n  ◤", 1)
     assert cs(multiline)[0] == "draft"
     assert cs("❯ \n  ?\n────────\n")[0] == "draft"          # one-character draft is still a draft
@@ -775,6 +798,62 @@ def test_snapshot_keeps_sleeping_panes(fake: FakeHerdr) -> None:
     fake.agents[0].update(agent="claude", agent_session={"value": "different"})
     sleeper.merge_snapshot(fake.agents)
     assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["uuid"] == "different"
+
+
+def test_snapshot_keeps_only_the_replayable_argv(fake: FakeHerdr) -> None:
+    fake.argv = ["--dangerously-skip-permissions", "--model", "opus", "sk-secret-1 initial prompt"]
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] is None     # refused argv: nothing kept
+    fake.argv = ["--dangerously-skip-permissions", "--resume", UUID, "--model", "opus"]
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == ["--dangerously-skip-permissions", "--model", "opus"]
+    assert "sk-secret-1" not in sleeper.SNAPSHOT.read_text()
+
+
+def test_snapshot_purges_raw_argv_of_earlier_versions(fake: FakeHerdr) -> None:
+    sleeper.write_json(sleeper.SNAPSHOT, {
+        "w9:p1": {"kind": "claude", "uuid": "old-session", "argv": ["--print", "sk-secret-1"]},
+        "w9:p2": {"kind": "opencode", "uuid": "ses_2", "argv": ["--token", "sk-secret-2"]},
+        "w9:p3": {"kind": "claude", "uuid": "kept-session", "argv": ["--verbose", "--resume", "x"]}})
+    sleeper.merge_snapshot(fake.agents)
+    snap = sleeper.read_json(sleeper.SNAPSHOT)
+    assert snap["w9:p1"]["argv"] is None and snap["w9:p2"]["argv"] is None
+    assert snap["w9:p3"]["argv"] == ["--verbose"]
+    assert "sk-secret" not in sleeper.SNAPSHOT.read_text()
+
+
+def test_state_files_are_private(fake: FakeHerdr) -> None:
+    sleeper.STATE_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    sleeper.STATE_DIR.chmod(0o755)
+    sleeper.EVENTS.write_text("")
+    sleeper.EVENTS.chmod(0o644)                         # as an earlier version left it
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+    with sleeper.locked():
+        pass
+    assert sleeper.STATE_DIR.stat().st_mode & 0o777 == 0o700
+    for path in (sleeper.JOURNAL, sleeper.EVENTS, sleeper.LOGFILE, sleeper.LOCK, sleeper.SNAPSHOT):
+        if path.exists():
+            assert path.stat().st_mode & 0o777 == 0o600, path.name
+
+
+def test_logs_rotate(state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper, "LOG_MAX_BYTES", 200)
+    for i in range(20):
+        sleeper.event("tick", n=i)
+    rotated = sleeper.EVENTS.with_name(sleeper.EVENTS.name + ".1")
+    assert rotated.exists() and sleeper.EVENTS.stat().st_size <= 300
+    assert rotated.stat().st_mode & 0o777 == 0o600
+    sleeper.cmd_log(types.SimpleNamespace(tail=None))
+    shown = [json.loads(l)["n"] for l in capsys.readouterr().out.splitlines()]
+    assert shown == sorted(shown) and shown[-1] == 19   # rotated half first, newest last
+
+
+def test_sleep_refuses_a_session_id_of_unexpected_shape(fake: FakeHerdr) -> None:
+    fake.agents[0]["agent_session"] = {"value": "../../etc"}
+    ok, reason, _ = sleeper.assess(fake.agents[0], fake.agents, 0, {}, idle_since=0)
+    assert not ok and "unexpected shape" in reason
+    slept, outcome = sleeper.sleep_agent(fake.agents[0], 0, set(), dry_run=False, allow_focused=True)
+    assert not slept and "unexpected shape" in outcome and fake.signals == []
 
 
 # ------------------------------------------------------------------ stub

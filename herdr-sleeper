@@ -247,25 +247,48 @@ def manual_command(entry: dict) -> str:
 
 # -------------------------------------------------------------------- output
 
+LOG_MAX_BYTES = 1_000_000  # sleeper.log and events.jsonl rotate to <name>.1 past this
+
+
+def ensure_state_dir() -> None:
+    """Create the state dir private to its owner: it holds session ids, cwds and pane titles."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        if STATE_DIR.stat().st_mode & 0o077:
+            STATE_DIR.chmod(0o700)  # created by an earlier version under the default umask
+
+
+def open_private(path: Path, flags: int) -> int:
+    """os.open with O_CREAT and mode 0600; tightens a file an earlier version left 0644."""
+    ensure_state_dir()
+    fd = os.open(path, flags | os.O_CREAT, 0o600)
+    with contextlib.suppress(OSError):
+        if os.fstat(fd).st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+    return fd
+
+
+def append_private(path: Path, line: str) -> None:
+    """Append one line to a 0600 file, rotating it to <name>.1 once it outgrows LOG_MAX_BYTES."""
+    with contextlib.suppress(OSError):
+        if path.stat().st_size > LOG_MAX_BYTES:
+            os.replace(path, path.with_name(path.name + ".1"))
+    with os.fdopen(open_private(path, os.O_WRONLY | os.O_APPEND), "a") as fh:
+        fh.write(line + "\n")
+
+
 def say(msg: str) -> None:
     """Diagnostics: to the log always, to the caller's stdout too."""
-    line = f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}"
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with LOGFILE.open("a") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
+    with contextlib.suppress(OSError):
+        append_private(LOGFILE, f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}")
     print(msg, file=sys.stderr)
 
 
 def event(what: str, **fields: object) -> None:
     """Append one structured record to events.jsonl (what `log` shows)."""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
         rec = {"at": dt.datetime.now().isoformat(timespec="seconds"), "event": what, **fields}
-        with EVENTS.open("a") as fh:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        append_private(EVENTS, json.dumps(rec, sort_keys=True))
     except OSError as exc:
         say(f"WARN could not write event: {exc}")
 
@@ -279,7 +302,7 @@ def notify(title: str, body: str = "", enabled: bool = True) -> None:
 # ---------------------------------------------------------------- json state
 
 def write_json(path: Path, data: object) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -321,8 +344,7 @@ class locked:
         self.timeout = timeout
 
     def __enter__(self) -> "locked":
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        self.fh = LOCK.open("a+")
+        self.fh = os.fdopen(open_private(LOCK, os.O_RDWR), "a+")
         try:
             fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return self
@@ -401,10 +423,18 @@ def list_agents() -> list[dict]:
     return agents
 
 
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")  # claude uuids, opencode `ses_…` ids
+
+
+def valid_session_id(value: object) -> bool:
+    """A session id safe to put into a transcript glob, an argv, or a typed stub command."""
+    return isinstance(value, str) and SESSION_ID_RE.fullmatch(value) is not None
+
+
 def valid_entry(entry: object) -> bool:
     """A journal/snapshot entry we are willing to act on."""
     return (isinstance(entry, dict) and isinstance(entry.get("pane_id"), str)
-            and isinstance(entry.get("uuid"), str) and isinstance(entry.get("kind"), str))
+            and valid_session_id(entry.get("uuid")) and isinstance(entry.get("kind"), str))
 
 
 # -------------------------------------------------------------------- config
@@ -654,14 +684,17 @@ def rss_mb(pane: str) -> int:
 
 REFUSED_OPTIONS = {"--fork-session", "--print", "--session-id", "--new", "--replay", "-p"}
 BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d"}
-VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source", "--env"}
+# Values of these are replayed and kept in the journal, so none of them may carry a secret
+# (`--env KEY=VALUE` did; an argv with it now refuses as an unrecognised option).
+VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source"}
 
 
 def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
     """Strip session-selection flags; refuse argv that would fork the session or re-run work.
 
     Returns (argv_to_replay, refusal_reason). Claude-specific: only used for
-    kinds whose profile replays the original argv.
+    kinds whose profile replays the original argv. A reason names options, never
+    values or positional text: it ends up in the log and the event stream.
     """
     out: list[str] = []
     i = 0
@@ -670,7 +703,7 @@ def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
         if a == "--":
             return None, "argv contains `--` (positional input would be replayed)"
         if a in REFUSED_OPTIONS or a.split("=", 1)[0] in REFUSED_OPTIONS:
-            return None, f"argv contains {a} (not safely replayable)"
+            return None, f"argv contains {a.split('=', 1)[0]} (not safely replayable)"
         if a in ("--resume", "-r"):
             if i + 1 < len(args) and not args[i + 1].startswith("-"):
                 i += 1  # drop its value too
@@ -695,8 +728,9 @@ def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
             continue
         if a.startswith("-"):
             # an option we do not know the arity of: guessing could turn a prompt into a "value" and replay it
-            return None, f"argv has unrecognised option {a} (add it to VALUE_OPTIONS/BOOLEAN_OPTIONS if it is safe)"
-        return None, f"argv has positional input {a!r} (an initial prompt would be re-sent on wake)"
+            return None, (f"argv has unrecognised option {a.split('=', 1)[0]} "
+                          "(add it to VALUE_OPTIONS/BOOLEAN_OPTIONS if it is safe)")
+        return None, "argv has positional input (an initial prompt would be re-sent on wake)"
     return out, None
 
 
@@ -714,13 +748,13 @@ def composer_state(screen: str | None) -> tuple[str, str]:
     for idx in range(len(lines) - 1, -1, -1):
         stripped = lines[idx].lstrip()
         if stripped.startswith(PROMPT_GLYPHS):
-            draft = stripped[1:].strip()
-            if draft:
-                return "draft", draft[:60]
+            # the detail is logged: say where the draft is, never what it says
+            if stripped[1:].strip():
+                return "draft", "text in the composer"
             rest = [ln.strip() for ln in lines[idx + 1:]]
             below = [ln for ln in rest if not (ln.startswith(FOOTER_PREFIXES) or set(ln) <= {"─"})]
             if below:
-                return "draft", below[0][:60]
+                return "draft", "text below the composer line"
             if not rest:  # a bare glyph with nothing rendered under it is not a composer we can vouch for
                 return "unknown", "no footer below the prompt"
             return "empty", ""
@@ -897,6 +931,14 @@ def put_back(journal: dict, pane: str, row: dict, why: str) -> None:
         journal[pane] = back
 
 
+def snapshot_argv(kind: str, argv: object) -> list[str] | None:
+    """What panes.json keeps of an argv: only what a wake would replay (claude), else nothing.
+    Raw argv can carry an initial prompt or option values; it never reaches the disk."""
+    if not PROFILES.get(kind, {}).get("argv_after_binary") or not isinstance(argv, list):
+        return None
+    return replayable_argv([str(a) for a in argv])[0]
+
+
 def merge_snapshot(agents: list[dict]) -> None:
     """pane→uuid→argv for every supported pane, merged so that panes currently asleep keep their handle.
 
@@ -926,6 +968,7 @@ def merge_snapshot(agents: list[dict]) -> None:
         present, argv, _pid = agent_process(a["pane_id"], kind)
         if argv is None and present is None and prior.get("uuid") == uuid:
             argv = prior.get("argv")  # process-info hiccup: keep what we knew rather than erase it
+        argv = snapshot_argv(kind, argv)
         snap[a["pane_id"]] = {
             "kind": kind, "uuid": uuid, "name": a.get("name"), "cwd": a.get("cwd"),
             "title": a.get("terminal_title_stripped"), "argv": argv,
@@ -936,6 +979,9 @@ def merge_snapshot(agents: list[dict]) -> None:
         now = ((live.get(pane) or {}).get("agent_session") or {}).get("value")
         if now and isinstance(snap[pane], dict) and snap[pane].get("uuid") != now:
             retire(pane)
+    for row in snap.values():  # rows written by earlier versions held the raw argv
+        if isinstance(row, dict) and row.get("argv") is not None:
+            row["argv"] = snapshot_argv(str(row.get("kind") or "claude"), row["argv"])
     write_json(SNAPSHOT, snap)
 
 
@@ -969,6 +1015,8 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
     uuid = (agent.get("agent_session") or {}).get("value")
     if not uuid:
         return False, "no session uuid (cannot resume)", None
+    if not valid_session_id(uuid):
+        return False, "session id has an unexpected shape (refusing to use it in a glob or argv)", None
     if not allow_focused and agent.get("focused") is not False:  # missing/None must not read as "not focused"
         return False, "pane is focused (or focus unknown)", None
     status = agent.get("agent_status")
@@ -1064,6 +1112,8 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
     uuid = (agent.get("agent_session") or {}).get("value")
     if not uuid:
         return False, "no session uuid (cannot resume)"
+    if not valid_session_id(uuid):
+        return False, "session id has an unexpected shape (refusing to use it in a glob or argv)"
 
     replay: list[str] = []
     if profile["argv_after_binary"]:
@@ -1232,7 +1282,7 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         set_state_dir(Path(state_dir))
     journal = read_json(JOURNAL)
     entry = journal.get(pane) or {}
-    if entry.get("uuid") != uuid:
+    if entry.get("uuid") != uuid or not valid_entry(entry):
         print(f"herdr-sleeper: no journal entry for {uuid} in {pane}; type `exit` or start an agent by hand")
         return 0
     kind = entry.get("kind") or "claude"
@@ -1763,8 +1813,7 @@ def watcher_alive(rec: dict | None) -> bool:
 def watcher_lock_held() -> bool:
     """Is a watcher holding watcher.lock? (No ps, no pid file: cheap enough for every focus hook.)"""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        fh = WATCHER_LOCK.open("a+")
+        fh = os.fdopen(open_private(WATCHER_LOCK, os.O_RDWR), "a+")
     except OSError:
         return False
     try:
@@ -1799,7 +1848,7 @@ def ensure_watcher(replace_changed: bool = True, heal: bool = False) -> str:
                 os.kill(cur["pid"], 0)
             except OSError:
                 break
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     env = {k: v for k, v in os.environ.items() if not (heal and k.startswith("HERDR_SLEEPER_"))}
     env["HERDR_BIN_PATH"] = HERDR_BIN
     child = subprocess.Popen([sys.executable, str(SELF), "watch"], start_new_session=True,
@@ -1970,8 +2019,7 @@ def pause(seconds: float) -> None:
 
 
 def watch_loop() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock_fh = WATCHER_LOCK.open("a+")
+    lock_fh = os.fdopen(open_private(WATCHER_LOCK, os.O_RDWR), "a+")
     for waited in range(WATCHER_LOCK_WAIT_SECONDS + 1):  # an old watcher may be finishing a transaction
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1984,7 +2032,7 @@ def watch_loop() -> None:
             time.sleep(1)
     try:
         signal.signal(signal.SIGTERM, on_term)
-        WATCHER_PID.write_text(json.dumps({"pid": os.getpid(), "stamp": code_stamp(), "lock": True}))
+        write_json(WATCHER_PID, {"pid": os.getpid(), "stamp": code_stamp(), "lock": True})
         say(f"watcher start session={SESSION}")
         clocks = load_clocks()
         failures = 0
@@ -2029,10 +2077,10 @@ def wake_lock(pane: str):
     Returns a release callable, or None when a recent holder is on this pane.
     """
     path = STATE_DIR / f".{pane.replace(':', '_')}.wakelock"
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     for _ in range(2):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.write(fd, str(os.getpid()).encode())
             os.close(fd)
 
@@ -2286,10 +2334,13 @@ def cmd_list(_args: argparse.Namespace) -> int:
 
 
 def cmd_log(args: argparse.Namespace) -> int:
-    if not EVENTS.exists():
+    lines: list[str] = []
+    for path in (EVENTS.with_name(EVENTS.name + ".1"), EVENTS):  # the rotated file holds the older half
+        if path.exists():
+            lines += path.read_text().splitlines()
+    if not lines:
         print("(no events yet)")
         return 0
-    lines = EVENTS.read_text().splitlines()
     for line in (lines[-args.tail:] if args.tail else lines):
         print(line)
     return 0
