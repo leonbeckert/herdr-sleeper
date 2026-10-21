@@ -116,6 +116,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import traceback
 from pathlib import Path
@@ -682,6 +683,85 @@ def rss_mb(pane: str) -> int:
         return 0
 
 
+SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "login"}
+# Executable names (ps `comm`) an agent of each kind may run as: the binary itself, or the runtime of
+# an npm/bun install. SIGTERM goes only to a pid whose name is on this list.
+AGENT_COMMS = {"claude": {"claude", "node"}, "opencode": {"opencode", "node", "bun"}}
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, executable name) for every process; {} when ps fails (callers fail closed).
+    Names only (`comm`): argument vectors can carry secrets and are not read here."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True,
+                             timeout=15, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2].strip()))
+    return table
+
+
+def descendants(table: dict[int, tuple[int, str]], pid: int) -> dict[int, str]:
+    """Every process below pid in the table: pid -> executable name."""
+    kids: dict[int, list[int]] = {}
+    for child, (parent, _comm) in table.items():
+        kids.setdefault(parent, []).append(child)
+    out: dict[int, str] = {}
+    todo = list(kids.get(pid, []))
+    while todo:
+        child = todo.pop()
+        if child not in out:
+            out[child] = table[child][1]
+            todo.extend(kids.get(child, []))
+    return out
+
+
+def signalable(pid: object, kind: str, table: dict[int, tuple[int, str]]) -> str | None:
+    """Why pid must not get our SIGTERM, or None when it may. A pid of 0 or -1 would signal a whole
+    process group or every process we own; a reused pid would hit a stranger."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or pid in (os.getpid(), os.getppid()):
+        return f"pid {pid!r} is not a plausible agent pid"
+    row = table.get(pid)
+    if row is None:
+        return f"pid {pid} is not in the process table (gone, or ps failed)"
+    if row[1].lstrip("-") not in AGENT_COMMS.get(kind, {kind}):
+        return f"pid {pid} runs {row[1]!r}, not {kind}"
+    return None
+
+
+def pane_at_shell(pane: str) -> bool | None:
+    """Is the pane's foreground nothing but its shell? Typing a line (`pane run`, `agent start`)
+    into anything else (an editor, a pager, a REPL) would feed it keystrokes. None: cannot tell."""
+    info = herdr("pane", "process-info", "--pane", pane, check=False).get("process_info")
+    if not isinstance(info, dict) or not isinstance(info.get("foreground_processes"), list):
+        return None
+    procs = info["foreground_processes"]
+    if not procs:
+        return None  # [] is "could not see the job", never "bare shell"
+    names = [os.path.basename(str((p.get("argv") or [p.get("name") or ""])[0])).lstrip("-") for p in procs]
+    return all(n in SHELLS for n in names)
+
+
+def reap_helpers(helpers: dict[int, str]) -> list[str]:
+    """SIGTERM the agent's former children that outlived it: still alive, same name, and reparented
+    to launchd/init (ppid 1). MCP servers and other helpers otherwise keep their memory forever."""
+    if not helpers:
+        return []
+    table = process_table()
+    reaped: list[str] = []
+    for pid, comm in helpers.items():
+        row = table.get(pid)
+        if row and row[0] == 1 and row[1] == comm:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+                reaped.append(comm)
+    return reaped
+
+
 REFUSED_OPTIONS = {"--fork-session", "--print", "--session-id", "--new", "--replay", "-p"}
 BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d"}
 # Values of these are replayed and kept in the journal, so none of them may carry a secret
@@ -1172,14 +1252,19 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
     # 3. the exit itself. A signal discards composer drafts instead of submitting them;
     #    a typed command is only used for kinds whose composer we positively verified empty.
     how = "signal"
+    helpers: dict[int, str] = {}
     if profile["exit"] == "signal":
         present, _argv, pid = agent_process(pane, kind)
-        if present is not True or not pid:
+        table = process_table()
+        why = ("agent process not identifiable for signal" if present is not True or not pid
+               else signalable(pid, kind, table))
+        if why:
             journal = read_json(JOURNAL)
             journal.pop(pane, None)
             write_json(JOURNAL, journal)
-            event("refused", pane=pane, name=name, uuid=uuid, reason="agent process not identifiable for signal")
-            return False, "refused: agent process not identifiable for signal"
+            event("refused", pane=pane, name=name, uuid=uuid, reason=why)
+            return False, f"refused: {why}"
+        helpers = descendants(table, int(pid))  # reparented to init once the agent exits; reaped below
         freed_mb = freed_mb or rss_mb(pane)
         try:
             os.kill(int(pid), signal.SIGTERM)
@@ -1210,21 +1295,29 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         event("exit-uncertain", pane=pane, name=name, uuid=uuid)
         return False, "exit uncertain; will reconcile next tick"
 
-    journal = read_json(JOURNAL)
-    if pane in journal:
-        journal[pane]["phase"] = "asleep"
-        write_json(JOURNAL, journal)
+    time.sleep(1)  # let the agent's own shutdown stop its children first
+    reaped = reap_helpers(helpers)
 
     # 5. reset terminal modes, claim the sidebar row, leave the Enter-stub, mark the label, notify.
     #    The stub runs as a child of the pane's shell (no `exec` — the shell must survive beneath
     #    it, or the pane would close when the woken agent exits). The pane shell has none of the
-    #    plugin env, so the typed command carries the stub's own routing (see stub_command).
-    herdr("pane", "run", pane, stub_command(pane, uuid, entry["slept_at"]), check=False)
+    #    plugin env, so the typed command carries the stub's own routing (see stub_command). It is
+    #    typed only at a bare shell; otherwise the pane sleeps without one ("stub": false) and
+    #    focus or `wake` resume it with `agent start` once the pane is back at its shell.
+    at_shell = pane_at_shell(pane) is True
+    journal = read_json(JOURNAL)
+    if pane in journal:
+        journal[pane].update(phase="asleep", stub=at_shell)
+        write_json(JOURNAL, journal)
+    if at_shell:
+        herdr("pane", "run", pane, stub_command(pane, uuid, entry["slept_at"]), check=False)
+    else:
+        say(f"WARN {pane}: the pane's foreground is not its shell after the exit; asleep without a wake stub")
     herdr("pane", "rename", pane, SLEEP_MARK + (label or entry["title"] or name), check=False)
     time.sleep(2)  # herdr takes ~2s to drop the exited agent's session; the claim is ignored before that
     claim(pane, kind, done=entry["status"] == "done")
     event("slept", pane=pane, name=name, uuid=uuid, kind=kind, title=entry["title"], cwd=entry["cwd"],
-          freed_mb=freed_mb or None, how=how)
+          freed_mb=freed_mb or None, how=how, stub=at_shell, helpers_stopped=reaped or None)
     notify(f"{SLEEP_MARK}slept {name}", f"freed ~{freed_mb} MB · wake: focus the pane, press Enter, or "
             f"{shlex.join([str(SELF), 'wake', name])}", enabled=notify_enabled)
     return True, "slept"
@@ -1343,6 +1436,8 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         release(pane)  # must precede the agent: a stale claim outranks detection
         restore_label(pane, cur, (herdr("pane", "get", pane, check=False).get("pane") or {}).get("label"))
         event("woke", pane=pane, name=name, uuid=uuid, via="stub", slept_at=cur.get("slept_at"))
+        with contextlib.suppress(OSError, termios.error, ValueError):
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)  # keys typed while waking must not reach the composer
         os.execvp(binary, [kind, *argv])
     except (Exception, KeyboardInterrupt) as exc:  # anything before the exec took: the row goes back at once
         with locked():
@@ -1473,6 +1568,12 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
     if stub:
         herdr("pane", "send-keys", pane, "enter", check=False)  # let the stub do the exec-wake
         return DELEGATED
+    if pane_at_shell(pane) is not True:
+        # agent start types the line into the pane: into an editor or a pager it would be keystrokes
+        say(f"cannot wake {name}: pane {pane} is not at its bare shell (something else runs in the "
+            "foreground); entry kept")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason="foreground is not the shell")
+        return False
 
     def start(agent_name: str) -> dict:
         return herdr("agent", "start", agent_name, "--kind", kind, "--pane", pane, "--timeout", str(WAKE_TIMEOUT_MS),

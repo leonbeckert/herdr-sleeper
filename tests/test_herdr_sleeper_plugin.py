@@ -106,10 +106,16 @@ class FakeHerdr:
         self.empty_argv = False             # process-info lists the agent with no readable argv
         self.empty_foreground = False       # process-info answers with [] (Herdr could not see the job)
         self.signals: list[tuple[int, int]] = []
+        self.helpers: dict[int, str] = {}   # pid -> name of the agent's children (MCP servers …)
+        self.comm: str | None = None        # what ps reports for the agent pid (None: its kind)
+        self.foreground: str | None = None  # a non-shell foreground in agent-less panes (e.g. "vim")
         self.execvps: list[tuple[str, list[str]]] = []
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
+        if pid in self.helpers:
+            self.helpers.pop(pid)
+            return
         if self.exit_leaves_agent and sig == signal.SIGTERM:
             for a in self.agents:
                 if a["pane_id"] in {p for p in self.stub_panes} or True:
@@ -118,9 +124,21 @@ class FakeHerdr:
                         a.pop("agent_session", None)
             # the fake's processes carry pid 1 for the agent; drop any pane whose agent had no explicit pid
             for a in self.agents:
-                if a.get("agent") and a.get("pid_hint", 1) == pid:
+                if a.get("agent") and a.get("pid_hint", 101) == pid:
                     a.pop("agent", None)
                     a.pop("agent_session", None)
+
+    def process_table(self) -> dict[int, tuple[int, str]]:
+        table: dict[int, tuple[int, str]] = {50: (1, "zsh")}
+        live = set()
+        for a in self.agents:
+            if a.get("agent") and a.get("agent") != sleeper.CLAIM_AGENT:
+                pid = a.get("pid_hint", 101)
+                live.add(pid)
+                table[pid] = (50, self.comm or a["agent"])
+        for pid, comm in self.helpers.items():
+            table[pid] = (101 if 101 in live else 1, comm)
+        return table
 
     def _procs(self, pane: str, a: dict[str, Any] | None) -> list[dict[str, Any]]:
         if pane in self.stub_panes:
@@ -130,11 +148,13 @@ class FakeHerdr:
             return []
         present = (a is not None and bool(a.get("agent"))) if self.process_override is None else self.process_override
         if not present:
+            if self.foreground:
+                return [{"argv0": self.foreground, "name": self.foreground, "argv": [self.foreground], "pid": 60}]
             return [{"argv0": "zsh", "name": "zsh", "argv": ["-zsh"], "pid": 50}]   # an idle pane lists its shell
         kind = (a or {}).get("agent") or "claude"
         proc = {"argv0": kind, "name": kind, "argv": [] if self.empty_argv else [kind, *self.argv]}
         if not self.pidless:
-            proc["pid"] = a.get("pid_hint", 1)
+            proc["pid"] = a.get("pid_hint", 101)
         return [proc]
 
     def __call__(self, *args: str, check: bool = True, timeout: float = 0) -> dict[str, Any]:
@@ -210,6 +230,7 @@ def fake(state: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHerdr:
     monkeypatch.setattr(sleeper.time, "sleep", lambda s: None)
     monkeypatch.setattr(sleeper, "EXIT_WAIT_SECONDS", 2)
     monkeypatch.setattr(sleeper.os, "kill", f.kill)
+    monkeypatch.setattr(sleeper, "process_table", f.process_table)
     transcript(state, UUID, 30)
     return f
 
@@ -460,7 +481,7 @@ def test_assess_scan_rows_and_gates(state: Path) -> None:
 def test_sleep_happy_path_signals_and_leaves_stub(fake: FakeHerdr) -> None:
     slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
     assert slept and outcome == "slept"
-    assert fake.signals == [(1, signal.SIGTERM)]                     # the exit is a signal, not a typed command
+    assert fake.signals == [(101, signal.SIGTERM)]                   # the exit is a signal, not a typed command
     j = journal()["w1:p1"]
     assert j["uuid"] == UUID and j["kind"] == "claude" and j["phase"] == "asleep"
     assert j["argv"] == ["--dangerously-skip-permissions"] and j["terminal_id"] == "term-1"
@@ -870,11 +891,58 @@ def test_stub_wakes_by_exec_after_enter(fake: FakeHerdr, monkeypatch: pytest.Mon
     monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: pytest.fail("no helper process carries the uuid"))
     execvps: list[tuple[str, list[str]]] = []
     monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execvps.append((b, a)))
+    flushed: list[int] = []
+    monkeypatch.setattr(sleeper.termios, "tcflush", lambda fd, how: flushed.append(how))
+    monkeypatch.setattr(sleeper.sys.stdin, "fileno", lambda: 0, raising=False)
     assert sleeper.cmd_stub("w1:p1", UUID) == 0
     assert execvps == [("/opt/bin/claude", ["claude", "--dangerously-skip-permissions", "--resume", UUID])]
+    assert flushed == [sleeper.termios.TCIFLUSH]   # type-ahead dropped before the agent owns the tty
     row = journal()["w1:p1"]   # G1: kept as `waking` (same pid after exec) until reconcile sees the session
     assert row["phase"] == "waking" and row["waking_pid"] == os.getpid() and events()[-1] == "woke"
     assert any(c[:2] == ("pane", "release-agent") for c in fake.calls)
+
+
+@pytest.mark.parametrize("pid", [0, 1, -1, True, None, "101"])
+def test_signalable_refuses_implausible_pids(pid: object) -> None:
+    assert sleeper.signalable(pid, "claude", {101: (50, "claude")})
+
+
+def test_signalable_wants_the_agent_name_in_the_process_table() -> None:
+    assert sleeper.signalable(101, "claude", {101: (50, "claude")}) is None
+    assert sleeper.signalable(101, "claude", {101: (50, "node")}) is None          # npm install
+    assert "not in the process table" in sleeper.signalable(101, "claude", {})
+    assert "not claude" in sleeper.signalable(101, "claude", {101: (50, "vim")})
+    assert sleeper.signalable(sleeper.os.getpid(), "claude", {sleeper.os.getpid(): (1, "claude")})
+
+
+def test_sleep_refuses_when_the_pid_runs_something_else(fake: FakeHerdr) -> None:
+    fake.comm = "vim"   # the pid process-info named was reused by another program
+    slept, outcome = sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert not slept and "not claude" in outcome and fake.signals == []
+    assert "w1:p1" not in journal()
+
+
+def test_sleep_reaps_helpers_left_behind(fake: FakeHerdr) -> None:
+    fake.helpers = {201: "python", 202: "node"}   # MCP servers the agent did not stop
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+    assert (201, signal.SIGTERM) in fake.signals and (202, signal.SIGTERM) in fake.signals
+    rec = json.loads(sleeper.EVENTS.read_text().splitlines()[-1])
+    assert rec["event"] == "slept" and sorted(rec["helpers_stopped"]) == ["node", "python"]
+
+
+def test_sleep_without_a_bare_shell_types_no_stub(fake: FakeHerdr) -> None:
+    fake.foreground = "vim"   # after the exit, something other than the shell owns the tty
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+    assert not any(c[:2] == ("pane", "run") for c in fake.calls)
+    assert journal()["w1:p1"]["stub"] is False and journal()["w1:p1"]["phase"] == "asleep"
+
+
+def test_wake_refuses_agent_start_off_the_shell(fake: FakeHerdr) -> None:
+    entry = slept_entry(fake)
+    fake.foreground = "less"
+    assert sleeper.wake_entry(entry) is False
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls)
+    assert journal()["w1:p1"]["uuid"] == UUID and events()[-1] == "wake-refused"
 
 
 def test_stub_leaves_shell_on_interrupt(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
