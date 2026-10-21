@@ -51,7 +51,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
     d = tmp_path / "state"
     for name in ("STATE_DIR", "JOURNAL", "SNAPSHOT", "EVENTS", "LOGFILE", "LOCK", "WATCHER_PID",
-                 "IDLE_FILE", "WATCHER_LOCK"):
+                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED"):
         base = getattr(sleeper, name, None)
         if base is None:
             continue
@@ -359,11 +359,12 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
     for var in ("HERDR_SLEEPER_IDLE_HOURS", "HERDR_SLEEPER_IDLE", "HERDR_SLEEPER_EXCLUDE",
                 "HERDR_SLEEPER_AGENTS", "HERDR_SLEEPER_POLL_SECONDS", "HERDR_SLEEPER_NOTIFY",
-                "HERDR_SLEEPER_WAKE_ON_FOCUS"):
+                "HERDR_SLEEPER_WAKE_ON_FOCUS", "HERDR_SLEEPER_DRY_RUN"):
         monkeypatch.delenv(var, raising=False)
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
-                      "poll_seconds": 60, "notify": True, "wake_on_focus": True}
+                      "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
+                      "watcher": "plugin"}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -940,6 +941,44 @@ def test_sleep_refuses_a_session_id_of_unexpected_shape(fake: FakeHerdr) -> None
     assert not ok and "unexpected shape" in reason
     slept, outcome = sleeper.sleep_agent(fake.agents[0], 0, set(), dry_run=False, allow_focused=True)
     assert not slept and "unexpected shape" in outcome and fake.signals == []
+
+
+def test_external_watcher_is_never_spawned(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = state / "config.toml"; cfg.write_text('watcher = "external"\n'); monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a watcher"))
+    assert "supervised externally" in sleeper.ensure_watcher()
+    cfg.write_text('watcher = "cron"\n')
+    with pytest.raises(sleeper.ConfigError):
+        sleeper.load_config()
+
+
+def test_stop_keeps_the_watcher_stopped(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a watcher"))
+    assert sleeper.cmd_stop(types.SimpleNamespace()) == 0
+    assert sleeper.STOPPED.exists() and "stopped by `stop`" in sleeper.ensure_watcher()
+    REAL_HEAL()                                    # a focus hook must not respawn it either
+    spawned: list[Any] = []
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: spawned.append(a) or types.SimpleNamespace(pid=1))
+    monkeypatch.setattr(sleeper, "watcher_lock_held", lambda: False)
+    assert sleeper.cmd_start(types.SimpleNamespace()) == 0
+    assert not sleeper.STOPPED.exists() and spawned
+
+
+def test_uninstall_wakes_everything_and_keeps_orphans(fake: FakeHerdr, capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    j = journal(); j[ORPHAN] = {**j["w1:p1"], "phase": "orphaned", "pane_id": "w9:p9"}; sleeper.write_json(sleeper.JOURNAL, j)
+    assert sleeper.cmd_uninstall(types.SimpleNamespace()) == 1
+    assert list(journal()) == [ORPHAN] and sleeper.STOPPED.exists()
+    assert "manual resume" in capsys.readouterr().out
+
+
+def test_dry_run_watcher_sleeps_nothing_and_writes_no_events(fake: FakeHerdr) -> None:
+    config = {**sleeper.DEFAULTS, "idle_hours": 0.0, "dry_run": True}
+    sleeper.watch_tick({}, config)
+    sleeper.watch_tick({}, config)
+    assert fake.signals == [] and journal() == {} and "refused" not in events()
+    assert "would sleep (dry run)" in sleeper.LOGFILE.read_text()
 
 
 # ------------------------------------------------------------------ stub

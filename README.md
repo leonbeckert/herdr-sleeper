@@ -63,6 +63,13 @@ Wake paths:
    30 s for the session to come back before reporting success (a stub that
    exec'd but whose session Herdr has not reported yet counts as started).
 
+Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
+state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
+`uninstall` runs before removing the plugin: it stops the watcher, wakes
+every sleeper, and lists what is left (orphaned, displaced, failed wakes);
+the state dir stays while anything is listed. `ps` and `lsof` are looked up
+with the system directories added, so a launchd job's bare PATH works.
+
 The idle clock is `state_change_seq` movement from the watcher's polling of
 `agent list` (default 60 s) — no transcript mtime, no launchd, and the
 clock restarts on any state change between polls. `done` (idle-but-unviewed)
@@ -92,7 +99,11 @@ herdr plugin action invoke djbclark.herdr-sleeper.log
 Config: `<plugin config dir>/config.toml` — Herdr's
 `~/.config/herdr/plugins/config/djbclark.herdr-sleeper/config.toml` (run
 `herdr plugin list` to see it) — `idle` (duration), `agents` (list),
-`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`;
+`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`,
+`dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
+instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
+heal the watcher; `"external"`: a service manager runs
+`herdr-sleeper watch` and hooks never spawn one);
 overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
@@ -219,7 +230,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 182 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 186 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

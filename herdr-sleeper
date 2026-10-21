@@ -28,6 +28,8 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper on-focus                pane.focused hook (internal)
   herdr-sleeper stub PANE UUID          in-pane wake stub (internal)
   herdr-sleeper scan                    one watcher tick, on demand
+  herdr-sleeper stop / start            stop the watcher and keep it stopped / undo that
+  herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
 
 Fail-closed rules, inherited from the standalone script and its three review
 rounds, the live-deployment iteration, and the v0.1.1 review (Fable, Grok):
@@ -145,6 +147,10 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 LEGACY_CONFIG_FILES = [XDG_CONFIG / "herdr" / "plugins" / PLUGIN_ID / "config.toml",
                        XDG_CONFIG / "herdr-sleeper" / "config.toml"]
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or os.environ.get("HERDR_SLEEPER_HERDR_BIN") or "herdr"
+# launchd and plugin runtimes start with a bare PATH: system tools are looked up with the system dirs added
+SYSTEM_PATH = os.pathsep.join([os.environ.get("PATH", ""), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+PS = shutil.which("ps", path=SYSTEM_PATH) or "ps"
+LSOF = shutil.which("lsof", path=SYSTEM_PATH) or "lsof"
 
 # Pane ids (w27:p1B) are unique only within one Herdr session; the legacy
 # standalone script served the default session. Named sessions get their own
@@ -161,6 +167,7 @@ LOCK = STATE_DIR / "lock"
 WATCHER_PID = STATE_DIR / "watcher.pid"
 WATCHER_LOCK = STATE_DIR / "watcher.lock"     # held by the one running watcher for its lifetime
 IDLE_FILE = STATE_DIR / "idle.json"            # pane -> {terminal_id, seq, since}: idle clocks across watcher restarts
+STOPPED = STATE_DIR / "stopped"                # `stop` was run: no watcher ticks or respawns until `start`
 
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
@@ -193,6 +200,8 @@ DEFAULTS = {
     "poll_seconds": WATCHER_POLL_SECONDS_DEFAULT,
     "notify": True,
     "wake_on_focus": True,
+    "dry_run": False,            # the watcher logs "would sleep" instead of sleeping
+    "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
 }
 
 
@@ -545,7 +554,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
                 raise ConfigError(f"{CONFIG_FILE}: unknown key {k!r}")
     env = {"idle_hours": "HERDR_SLEEPER_IDLE_HOURS", "idle": "HERDR_SLEEPER_IDLE", "exclude": "HERDR_SLEEPER_EXCLUDE",
            "agents": "HERDR_SLEEPER_AGENTS", "poll_seconds": "HERDR_SLEEPER_POLL_SECONDS",
-           "notify": "HERDR_SLEEPER_NOTIFY", "wake_on_focus": "HERDR_SLEEPER_WAKE_ON_FOCUS"}
+           "notify": "HERDR_SLEEPER_NOTIFY", "wake_on_focus": "HERDR_SLEEPER_WAKE_ON_FOCUS",
+           "dry_run": "HERDR_SLEEPER_DRY_RUN"}
     if "HERDR_SLEEPER_IDLE" in os.environ and "HERDR_SLEEPER_IDLE_HOURS" in os.environ:
         raise ConfigError("set only one of HERDR_SLEEPER_IDLE and HERDR_SLEEPER_IDLE_HOURS")
     for k, var in env.items():
@@ -554,7 +564,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
             key = "idle_hours" if k == "idle" else k
             values[key] = (raw_v.split() if k in ("exclude", "agents")
                            else parse_duration(raw_v) if key == "idle_hours"
-                           else _env_bool(var, raw_v) if key in ("notify", "wake_on_focus")
+                           else _env_bool(var, raw_v) if key in ("notify", "wake_on_focus", "dry_run")
                            else raw_v)
             source[key] = f"${var}"
     if source["exclude"] == "default":
@@ -595,9 +605,11 @@ def load_config() -> tuple[dict, dict[str, str]]:
     unknown = [a for a in values["agents"] if a not in PROFILES]
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
-    for key in ("notify", "wake_on_focus"):
+    for key in ("notify", "wake_on_focus", "dry_run"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
+    if values["watcher"] not in ("plugin", "external"):
+        raise ConfigError('watcher must be "plugin" or "external"')
     return values, source
 
 
@@ -684,7 +696,7 @@ def rss_mb(pane: str) -> int:
     if not pids:
         return 0
     try:
-        out = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([PS, "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True, timeout=10).stdout
         return sum(int(x) for x in out.split() if x.isdigit()) // 1024
     except (OSError, ValueError, subprocess.SubprocessError):
         return 0
@@ -700,7 +712,7 @@ def process_table() -> dict[int, tuple[int, str]]:
     """pid -> (ppid, executable name) for every process; {} when ps fails (callers fail closed).
     Names only (`comm`): argument vectors can carry secrets and are not read here."""
     try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True,
+        out = subprocess.run([PS, "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True,
                              timeout=15, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -1020,7 +1032,7 @@ def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | No
         if a["pane_id"] != except_pane and (a.get("agent_session") or {}).get("value") == uuid:
             return f"pane {a['pane_id']}"
     try:
-        ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=15, check=True).stdout
+        ps = subprocess.run([PS, "-eo", "pid=,args="], capture_output=True, text=True, timeout=15, check=True).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise SleeperError(f"cannot verify session liveness: ps failed ({exc})")
     for line in ps.splitlines():
@@ -1053,7 +1065,7 @@ def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | No
 def process_cwd(pid: str) -> str | None:
     """The process's cwd via lsof, or None when that could not be established (callers treat None as unknown)."""
     try:
-        proc = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run([LSOF, "-a", "-p", pid, "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -1144,7 +1156,7 @@ def waking_alive(entry: dict) -> bool | None:
     except OSError:
         return None
     try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True,
+        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True,
                              timeout=10, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1379,10 +1391,9 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         # wake_pending, waking); the same uuid (an exit-requested retry) may be rewritten
         return False, (f"refused: pane holds a kept handle for {held.get('uuid')} ({held.get('phase', 'asleep')}); "
                        "wake or resolve it first")
-    if dry_run:
+    if dry_run:  # no event: the dry-run watcher asks this every tick; its log records changes only
         stop, _ = recheck(agent, idle_hours, journal, exclude, idle_since, allow_focused)
         if stop:
-            event("refused", pane=pane, name=agent.get("name"), uuid=uuid, reason=stop)
             return False, f"refused: {stop}"
         return False, "would sleep (dry run)"
 
@@ -1511,11 +1522,11 @@ def stub_command(pane: str, uuid: str, slept_at: str) -> str:
 
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
-    global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE
+    global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
-    WATCHER_LOCK, IDLE_FILE = STATE_DIR / "watcher.lock", STATE_DIR / "idle.json"
+    WATCHER_LOCK, IDLE_FILE, STOPPED = STATE_DIR / "watcher.lock", STATE_DIR / "idle.json", STATE_DIR / "stopped"
 
 
 def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
@@ -2057,7 +2068,7 @@ def process_is_watcher(pid: int) -> bool:
     """Does pid run `… herdr-sleeper watch`? Matched as argv tokens, so a reused pid running
     `cargo watch` or `fswatch` is not taken for the watcher (and never gets our SIGTERM)."""
     try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     toks = out.split()
@@ -2095,10 +2106,24 @@ def watcher_lock_held() -> bool:
         fh.close()
 
 
+def watcher_mode() -> str:
+    """'plugin' (hooks spawn and heal the watcher) or 'external' (a service manager runs it).
+    A broken config reads as 'plugin': the watcher lock still keeps a second one from ticking."""
+    try:
+        return load_config()[0]["watcher"]
+    except ConfigError:
+        return "plugin"
+
+
 def ensure_watcher(replace_changed: bool = True, heal: bool = False) -> str:
     """Make sure one watcher runs this code. Startup replaces a watcher running older code;
     a heal (replace_changed=False) only fills a gap. The new watcher itself waits on
-    watcher.lock for an old one to finish its transaction, so two never tick at once."""
+    watcher.lock for an old one to finish its transaction, so two never tick at once.
+    Spawns nothing after `stop`, or when a service manager owns the watcher."""
+    if STOPPED.exists():
+        return "watcher stopped by `stop` (run `start` to resume)"
+    if watcher_mode() == "external":
+        return f"watcher is supervised externally ({'running' if watcher_lock_held() else 'not running: check its service'})"
     cur = watcher_pid_record()
     alive = watcher_alive(cur)
     if alive and cur.get("stamp") == code_stamp():
@@ -2135,8 +2160,8 @@ def heal_watcher() -> None:
     next focus, not the next server start.
     """
     try:
-        if watcher_lock_held():
-            return  # a v0.1.1+ watcher runs (code changes are startup's business)
+        if watcher_lock_held() or STOPPED.exists():
+            return  # a v0.1.1+ watcher runs (code changes are startup's business), or `stop` was meant
         # nothing holds the lock: no watcher, or one older than watcher.lock (v0.1.0), whose recorded
         # stamp differs — replaced the way startup does it (SIGTERM, wait), not left running old code
         msg = ensure_watcher(replace_changed=True, heal=True)
@@ -2257,7 +2282,7 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                         note_skip(pane, reason)
                     continue
                 uuid = (agent.get("agent_session") or {}).get("value")  # capture before sleep mutates the pane
-                did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=False,
+                did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=config["dry_run"],
                                            idle_since=since, notify_enabled=config["notify"])
             except SleeperError as exc:  # one flaky pane must not starve the rest of the tick
                 did, outcome = False, f"error: {exc}"
@@ -2306,6 +2331,11 @@ def watch_loop() -> None:
         clocks = load_clocks()
         failures = 0
         while not STOP["requested"]:
+            if STOPPED.exists():
+                say("watcher stopped by `stop`; idling until `start`")
+                while STOPPED.exists() and not STOP["requested"]:
+                    pause(30)  # a service manager would restart an exited watcher; idle instead
+                continue
             rec = watcher_pid_record()
             if rec and rec.get("pid") != os.getpid() and watcher_alive(rec):
                 say("watcher superseded; exiting")  # e.g. an older version's watcher took the pid file
@@ -2580,6 +2610,54 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def stop_watcher(wait_seconds: int = 60) -> str:
+    """SIGTERM the recorded watcher and wait for it: it finishes its transaction first."""
+    rec = watcher_pid_record()
+    if not watcher_alive(rec):
+        return "no watcher running"
+    with contextlib.suppress(OSError):
+        os.kill(rec["pid"], signal.SIGTERM)
+    for _ in range(wait_seconds):
+        if not watcher_alive(rec):
+            return f"watcher pid {rec['pid']} stopped"
+        time.sleep(1)
+    return f"watcher pid {rec['pid']} did not stop within {wait_seconds}s (it idles once it sees the stop marker)"
+
+
+def cmd_stop(_args: argparse.Namespace) -> int:
+    ensure_state_dir()
+    os.close(open_private(STOPPED, os.O_WRONLY))
+    print(stop_watcher())
+    if watcher_mode() == "external":
+        print("its service manager may start it again; a restarted watcher idles until `start`")
+    event("stopped")
+    return 0
+
+
+def cmd_start(_args: argparse.Namespace) -> int:
+    with contextlib.suppress(FileNotFoundError):
+        STOPPED.unlink()
+    event("started")
+    print(ensure_watcher())
+    return 0
+
+
+def cmd_uninstall(_args: argparse.Namespace) -> int:
+    """Before removing the plugin: stop the watcher for good, wake every sleeper, report the rest.
+    The state dir stays: for anything still listed it holds the only resume handle."""
+    cmd_stop(_args)
+    journal = read_json(JOURNAL)
+    if any(isinstance(e, dict) and not is_orphan(k, e) and e.get("phase") != "displaced" for k, e in journal.items()):
+        cmd_wake(argparse.Namespace(target=None, all=True))
+    left = read_json(JOURNAL)
+    if left:
+        print(f"{len(left)} record(s) remain in {JOURNAL} (orphaned, displaced, or a failed wake); "
+              f"`list` prints their manual resume lines. Keep {STATE_DIR} until they are resolved.")
+        return 1
+    print(f"nothing is asleep; remove the plugin, then {STATE_DIR} if you no longer need its log")
+    return 0
+
+
 def cmd_list(_args: argparse.Namespace) -> int:
     heal_watcher()
     try:
@@ -2635,6 +2713,9 @@ def main(argv: list[str] | None = None) -> int:
     lp.add_argument("--tail", type=int, default=None)
     lp.set_defaults(fn=cmd_log)
     sub.add_parser("on-focus", help="pane.focused hook (internal)").set_defaults(fn=lambda a: cmd_on_focus())
+    sub.add_parser("stop", help="stop the watcher and keep it stopped").set_defaults(fn=cmd_stop)
+    sub.add_parser("start", help="undo `stop`").set_defaults(fn=cmd_start)
+    sub.add_parser("uninstall", help="stop, wake everything, report what is left").set_defaults(fn=cmd_uninstall)
     sub.add_parser("watch", help="the idle watcher loop (internal)").set_defaults(fn=lambda a: watch_loop() or 0)
     stp = sub.add_parser("stub", help="in-pane wake stub (internal)")
     stp.add_argument("pane")
