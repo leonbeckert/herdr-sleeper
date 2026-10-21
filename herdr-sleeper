@@ -29,6 +29,7 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper stub PANE UUID          in-pane wake stub (internal)
   herdr-sleeper scan                    one watcher tick, on demand
   herdr-sleeper stop / start            stop the watcher and keep it stopped / undo that
+  herdr-sleeper deliver TARGET --from SENDER   message on stdin to a live or sleeping agent (wakes it)
   herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
 
 Fail-closed rules, inherited from the standalone script and its three review
@@ -168,6 +169,8 @@ WATCHER_PID = STATE_DIR / "watcher.pid"
 WATCHER_LOCK = STATE_DIR / "watcher.lock"     # held by the one running watcher for its lifetime
 IDLE_FILE = STATE_DIR / "idle.json"            # pane -> {terminal_id, seq, since}: idle clocks across watcher restarts
 STOPPED = STATE_DIR / "stopped"                # `stop` was run: no watcher ticks or respawns until `start`
+MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
+DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
 
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
@@ -204,6 +207,7 @@ DEFAULTS = {
     "max_live": 0,               # more live sessions than this: the longest-idle ones sleep early (0 = no cap)
     "pressure_idle_hours": 0.5,  # the shorter window for early sleep (over max_live, or memory pressure)
     "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
+    "wake_refuse_from": [],      # senders whose messages never wake a sleeper (they wait in the mailbox)
 }
 
 
@@ -605,7 +609,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
         raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
-    for key in ("exclude", "agents"):
+    for key in ("exclude", "agents", "wake_refuse_from"):
         v = values[key]
         if isinstance(v, str):
             v = [v]
@@ -1292,6 +1296,8 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, f"session also open in {', '.join(a['pane_id'] for a in others)}", None
     if kind == "claude" and transcript_for(uuid) is None:
         return False, "no transcript on disk (nothing to resume)", None
+    if pending_mail(uuid):
+        return False, "mail pending (delivered once the agent is idle)", None
     if idle_since is not None:
         idle = (time.time() - idle_since) / 3600
         if idle < idle_hours:
@@ -1533,10 +1539,12 @@ def stub_command(pane: str, uuid: str, slept_at: str) -> str:
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
+    global MAILBOX, DELIVERED
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
     WATCHER_LOCK, IDLE_FILE, STOPPED = STATE_DIR / "watcher.lock", STATE_DIR / "idle.json", STATE_DIR / "stopped"
+    MAILBOX, DELIVERED = STATE_DIR / "mailbox", STATE_DIR / "delivered.json"
 
 
 def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
@@ -1962,6 +1970,243 @@ def cmd_wake(args: argparse.Namespace) -> int:
     return 0 if woke == len(targets) else 1
 
 
+# ---------------------------------------------------------------- deliver
+
+DELIVER_MAX_BYTES = 64 * 1024
+DELIVER_READY_SECONDS = 120   # a resumed claude needs a few seconds before it takes a prompt
+DELIVERED_KEEP = 500
+SENDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,63}")
+MSG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def pending_mail(uuid: str) -> list[Path]:
+    """This session's undelivered messages, oldest first (file names start with a ns timestamp)."""
+    with contextlib.suppress(OSError):
+        return sorted((MAILBOX / uuid).glob("*.json"))
+    return []
+
+
+class mailbox_lock:
+    """Serialises deliveries to one session (a `deliver` and the watcher's flush may overlap)."""
+
+    def __init__(self, uuid: str, wait: bool = True) -> None:
+        self.uuid, self.wait = uuid, wait
+
+    def __enter__(self) -> bool:
+        box = MAILBOX / self.uuid
+        ensure_state_dir()
+        box.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.fh = os.fdopen(open_private(box / ".lock", os.O_RDWR), "a+")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB))
+            return True
+        except OSError:
+            return False
+
+    def __exit__(self, *exc: object) -> None:
+        with contextlib.suppress(OSError):
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def envelope(msg: dict) -> str:
+    """The text the target agent sees: who relayed it, the message id, and that the owner did not
+    type it (an agent running with bypassed permissions must not take it for the owner's word)."""
+    return f"[relayed from {msg['from']} via herdr-sleeper, msg {msg['id']}; not from the owner]\n\n{msg['body']}"
+
+
+def recently_delivered() -> dict:
+    try:
+        return read_json(DELIVERED)
+    except SleeperError:
+        return {}
+
+
+def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tuple[dict, bool]:
+    """Write the message into the session's mailbox (0600). Returns (message, is_new): an id that
+    is already queued or was delivered recently is not queued twice."""
+    if msg_id is None:
+        msg_id = hashlib.sha256(f"{sender}\0{uuid}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
+    if msg_id in recently_delivered():
+        return {"id": msg_id}, False
+    for path in pending_mail(uuid):
+        if path.stem.split("-", 1)[-1] == msg_id:
+            return {"id": msg_id}, False
+    msg = {"id": msg_id, "from": sender, "to": uuid, "at": dt.datetime.now().isoformat(timespec="seconds"),
+           "body": body}
+    path = MAILBOX / uuid / f"{time.time_ns()}-{msg_id}.json"
+    fd = open_private(path, os.O_WRONLY | os.O_EXCL)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(msg) + "\n")
+    return msg, True
+
+
+def type_mail(pane: str, uuid: str, name: str) -> int:
+    """Type every queued message for uuid into its live agent, oldest first; each file is removed
+    only after `agent prompt` succeeded (at least once). Caller holds the mailbox lock."""
+    sent = 0
+    for path in pending_mail(uuid):
+        try:
+            msg = json.loads(path.read_text())
+        except (OSError, ValueError):
+            aside = path.with_suffix(".damaged")
+            with contextlib.suppress(OSError):
+                os.replace(path, aside)
+            say(f"WARN mailbox file {path.name} unreadable; moved aside to {aside.name}")
+            continue
+        herdr("agent", "prompt", pane, envelope(msg))
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        done = recently_delivered()
+        done[msg["id"]] = dt.datetime.now().isoformat(timespec="seconds")
+        write_json(DELIVERED, dict(sorted(done.items(), key=lambda kv: kv[1])[-DELIVERED_KEEP:]))
+        event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
+              bytes=len(str(msg.get("body", "")).encode()))
+        sent += 1
+    return sent
+
+
+def live_agent(uuid: str, ready: bool = True) -> dict | None:
+    """The live agent running uuid (idle or done when ready=True), from a fresh `agent list`."""
+    for a in list_agents():
+        if a.get("agent") and a.get("agent") != CLAIM_AGENT and (a.get("agent_session") or {}).get("value") == uuid:
+            if not ready or a.get("agent_status") in SLEEPABLE_STATUSES:
+                return a
+    return None
+
+
+def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str, dict, str | None]:
+    """('live', agent, None) or ('asleep', entry, journal key) for a pane id, agent name, wake
+    name, or session id. More than one match refuses, naming the candidates."""
+    live = [a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
+            and target in (a["pane_id"], a.get("name"), (a.get("agent_session") or {}).get("value"))]
+    if len(live) > 1:
+        raise SleeperError(f"{target!r} matches {len(live)} live agents ({', '.join(a['pane_id'] for a in live)}); "
+                           "name the pane id instead")
+    if live:
+        return "live", live[0], None
+    hits = [(k, e) for k, e in journal.items()
+            if valid_entry(e) and target in (k, e["uuid"], e.get("name") or None, wake_name(e))]
+    if len(hits) > 1:
+        raise SleeperError(f"{target!r} matches {len(hits)} sleeping agents ({', '.join(k for k, _ in hits)}); "
+                           "name the pane id instead")
+    if hits:
+        return "asleep", hits[0][1], hits[0][0]
+    raise SleeperError(f"no live or sleeping agent matches {target!r} (see `herdr-sleeper presence`)")
+
+
+def context_sender(agents: list[dict]) -> str | None:
+    """The calling agent's name (or pane id), when the caller runs inside a Herdr pane."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return None
+    hit = next((a for a in agents if a["pane_id"] == pane), None)
+    return (hit or {}).get("name") or pane
+
+
+def cmd_deliver(args: argparse.Namespace) -> int:
+    """Deliver a message (stdin) to a live or sleeping agent. Exit 0 delivered, 3 queued (it is
+    typed in once the target is live and idle), 1 refused, 2 bad input."""
+    body = sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    if not body.strip():
+        print("deliver: empty message on stdin", file=sys.stderr)
+        return 2
+    if len(body.encode()) > DELIVER_MAX_BYTES:
+        print(f"deliver: message over {DELIVER_MAX_BYTES} bytes; send a file path instead", file=sys.stderr)
+        return 2
+    if args.id is not None and not MSG_ID_RE.fullmatch(args.id):
+        print("deliver: --id must match [A-Za-z0-9_-]{1,64}", file=sys.stderr)
+        return 2
+    try:
+        config, _src = load_config()
+    except ConfigError as exc:
+        print(f"deliver: broken config — {exc}", file=sys.stderr)
+        return 1
+    agents = list_agents()
+    sender = args.sender or context_sender(agents)
+    if not sender or not SENDER_RE.fullmatch(sender):
+        print("deliver: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+        return 2
+    with locked():
+        journal = read_json(JOURNAL)
+    try:
+        state, hit, key = resolve_target(args.target, agents, journal)
+    except SleeperError as exc:
+        print(f"deliver: {exc}", file=sys.stderr)
+        return 1
+    uuid = (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
+    name = (hit.get("name") or hit["pane_id"]) if state == "live" else wake_name(hit)
+    if not valid_session_id(uuid):
+        print(f"deliver: {name} reports no session id; nothing to queue against "
+              "(use `herdr agent prompt` for a session that cannot be resumed)", file=sys.stderr)
+        return 1
+    from_pane = os.environ.get("HERDR_PANE_ID")
+    with mailbox_lock(uuid):
+        msg, new = queue_message(uuid, sender, body, args.id)
+        if not new:
+            print(f"msg {msg['id']} is already queued or delivered; not sent twice")
+            return 0
+        event("deliver-queued", id=msg["id"], sender=sender, from_pane=from_pane, to=name, uuid=uuid,
+              target_state=state, bytes=len(body.encode()))
+        woke = False
+        if state == "asleep":
+            if sender in config["wake_refuse_from"] or (from_pane and from_pane in config["wake_refuse_from"]):
+                event("deliver-held", id=msg["id"], sender=sender, to=name, reason="sender may not wake")
+                print(f"queued msg {msg['id']} for {name}: {sender} may not wake sleepers; "
+                      "it is typed in when the agent next runs")
+                return 3
+            with locked():
+                outcome = wake_entry(hit, via=f"deliver:{sender}", key=key)
+            if outcome == DELEGATED:
+                outcome = await_stub_wake(hit)
+            if not outcome:
+                event("deliver-held", id=msg["id"], sender=sender, to=name, reason="wake refused or failed")
+                print(f"queued msg {msg['id']} for {name}: the wake was refused or failed (see `log`); "
+                      "it is typed in when the agent next runs")
+                return 3
+            woke = True
+        target = None
+        for _ in range(DELIVER_READY_SECONDS if woke else 1):
+            target = live_agent(uuid)
+            if target:
+                break
+            time.sleep(1)
+        if not target:
+            print(f"queued msg {msg['id']} for {name}: not idle yet; typed in when it is")
+            return 3
+        try:
+            type_mail(target["pane_id"], uuid, name)
+        except SleeperError as exc:
+            event("deliver-held", id=msg["id"], sender=sender, to=name, reason=f"prompt failed: {exc}")
+            print(f"queued msg {msg['id']} for {name}: typing it in failed ({exc}); the watcher retries")
+            return 3
+    print(f"delivered msg {msg['id']} to {name}" + (" (woke it)" if woke else ""))
+    return 0
+
+
+def flush_mail(agents: list[dict]) -> None:
+    """Watcher: type queued mail into targets that are live and idle now. Never wakes anyone:
+    a sleeper is woken only by the `deliver` that queued for it."""
+    boxes: list[Path] = []
+    with contextlib.suppress(OSError):
+        boxes = [d for d in MAILBOX.iterdir() if d.is_dir() and valid_session_id(d.name)]
+    for box in boxes:
+        if not pending_mail(box.name):
+            continue
+        target = next((a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
+                       and (a.get("agent_session") or {}).get("value") == box.name
+                       and a.get("agent_status") in SLEEPABLE_STATUSES), None)
+        if not target:
+            continue
+        with mailbox_lock(box.name, wait=False) as got:
+            if not got:
+                continue  # a `deliver` is on it
+            try:
+                type_mail(target["pane_id"], box.name, target.get("name") or target["pane_id"])
+            except SleeperError as exc:
+                say(f"mail for {box.name}: typing it in failed ({exc}); next tick retries")
+
+
 # --------------------------------------------------------------- reconcile
 
 def reconcile(agents: list[dict]) -> None:
@@ -2346,6 +2591,7 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                 note_skip(pane, outcome)
     if json.dumps(clocks, sort_keys=True) != before:
         persist_clocks(clocks)
+    flush_mail(agents)
 
 
 def on_term(*_a: object) -> None:
@@ -2763,6 +3009,11 @@ def main(argv: list[str] | None = None) -> int:
     lp.add_argument("--tail", type=int, default=None)
     lp.set_defaults(fn=cmd_log)
     sub.add_parser("on-focus", help="pane.focused hook (internal)").set_defaults(fn=lambda a: cmd_on_focus())
+    dp = sub.add_parser("deliver", help="deliver a message (stdin) to a live or sleeping agent, waking it")
+    dp.add_argument("target", help="pane id, agent name, wake name, or session id")
+    dp.add_argument("--from", dest="sender", help="who sends it (default: the calling pane's agent name)")
+    dp.add_argument("--id", help="message id for deduplication (default: generated)")
+    dp.set_defaults(fn=cmd_deliver)
     sub.add_parser("stop", help="stop the watcher and keep it stopped").set_defaults(fn=cmd_stop)
     sub.add_parser("start", help="undo `stop`").set_defaults(fn=cmd_start)
     sub.add_parser("uninstall", help="stop, wake everything, report what is left").set_defaults(fn=cmd_uninstall)

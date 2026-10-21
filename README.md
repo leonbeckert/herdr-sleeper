@@ -137,6 +137,38 @@ command = "djbclark.herdr-sleeper.sleep-pane"
 description = "sleep this agent pane"
 ```
 
+## Messages between agents
+
+A slept agent has no process, so `herdr agent prompt` and Claude Code's
+`SendMessage` cannot reach it. `deliver` can:
+
+```sh
+echo "rebase onto main, then ping me" | herdr-sleeper deliver ts-api --from orchestrator
+```
+
+The target is a pane id, agent name, wake name, or session id. The message
+(stdin, up to 64 KB) goes into a 0600 file in `mailbox/<session>/` first.
+A live, idle agent gets it typed in at once. A sleeping one is woken through
+the usual wake path and gets it as soon as it is idle again. A busy or
+blocked agent (a permission prompt is never typed into) gets it from the
+watcher once it is idle. The file is removed only after `agent prompt`
+succeeded (at least once; `--id` deduplicates retries). A session with
+pending mail is never put to sleep. The agent sees
+
+```
+[relayed from orchestrator via herdr-sleeper, msg 3f9a…; not from the owner]
+
+rebase onto main, then ping me
+```
+
+so an agent running with bypassed permissions does not take it for its
+owner's instructions. `events.jsonl` records each delivery (id, sender,
+target, size) but never the text. `wake_refuse_from` lists senders whose
+messages wait for the target's next wake instead of causing one (agents
+that read untrusted content). Exit codes: 0 delivered, 3 queued, 1 refused,
+2 bad input. Any local process running as the same user can send. The
+sender name is self-declared, so the audit trail is only as good as that.
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -233,7 +265,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 189 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 196 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

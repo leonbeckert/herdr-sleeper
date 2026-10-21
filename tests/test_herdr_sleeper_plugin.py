@@ -51,7 +51,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
     d = tmp_path / "state"
     for name in ("STATE_DIR", "JOURNAL", "SNAPSHOT", "EVENTS", "LOGFILE", "LOCK", "WATCHER_PID",
-                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED"):
+                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED", "MAILBOX", "DELIVERED"):
         base = getattr(sleeper, name, None)
         if base is None:
             continue
@@ -365,7 +365,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
-                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5}
+                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": []}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -980,6 +980,77 @@ def test_dry_run_watcher_sleeps_nothing_and_writes_no_events(fake: FakeHerdr) ->
     sleeper.watch_tick({}, config)
     assert fake.signals == [] and journal() == {} and "refused" not in events()
     assert "would sleep (dry run)" in sleeper.LOGFILE.read_text()
+
+
+def deliver(monkeypatch: pytest.MonkeyPatch, target: str, body: str = "please rebase", sender: str = "orc",
+            msg_id: str | None = None) -> int:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(body))
+    return sleeper.cmd_deliver(types.SimpleNamespace(target=target, sender=sender, id=msg_id))
+
+
+def prompts(fake: FakeHerdr) -> list[tuple[str, ...]]:
+    return [c for c in fake.calls if c[:2] == ("agent", "prompt")]
+
+
+def test_deliver_to_a_live_idle_agent(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a") == 0
+    (call,) = prompts(fake)
+    assert call[2] == "w1:p1" and call[3].startswith("[relayed from orc via herdr-sleeper, msg ")
+    assert "not from the owner]" in call[3] and call[3].endswith("please rebase")
+    assert sleeper.pending_mail(UUID) == []
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()]
+    assert [r["event"] for r in rec] == ["deliver-queued", "delivered"]
+    assert all("please rebase" not in json.dumps(r) for r in rec)      # the audit log holds no message body
+
+
+def test_deliver_wakes_a_sleeper_then_types_the_message(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    slept_entry(fake)
+    assert deliver(monkeypatch, UUID) == 0                                # addressed by session id
+    assert any(c[:2] == ("agent", "start") for c in fake.calls)
+    assert "w1:p1" not in journal() and prompts(fake)[-1][3].endswith("please rebase")
+
+
+def test_deliver_holds_mail_when_the_target_is_busy(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "blocked"                            # a permission prompt: never type into it
+    assert deliver(monkeypatch, "w1:p1") == 3
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1
+    ok, reason, _ = sleeper.assess({**fake.agents[0], "agent_status": "idle"}, fake.agents, 0, {}, idle_since=0)
+    assert not ok and "mail pending" in reason                            # pending mail keeps it awake
+    fake.agents[0]["agent_status"] = "idle"
+    sleeper.flush_mail(fake.agents)                                       # the watcher types it in later
+    assert len(prompts(fake)) == 1 and sleeper.pending_mail(UUID) == []
+
+
+def test_deliver_dedups_by_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a", msg_id="m-1") == 0
+    assert deliver(monkeypatch, "a", msg_id="m-1") == 0
+    assert len(prompts(fake)) == 1
+
+
+def test_deliver_refused_sender_does_not_wake(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = state / "config.toml"; cfg.write_text('wake_refuse_from = ["web-reader"]\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    slept_entry(fake)
+    assert deliver(monkeypatch, "a", sender="web-reader") == 3
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls) and "w1:p1" in journal()
+    assert len(sleeper.pending_mail(UUID)) == 1
+
+
+def test_deliver_validates_input(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a", body="  \n") == 2
+    assert deliver(monkeypatch, "a", body="x" * (sleeper.DELIVER_MAX_BYTES + 1)) == 2
+    assert deliver(monkeypatch, "a", sender="evil; rm") == 2
+    assert deliver(monkeypatch, "a", msg_id="../x") == 2
+    assert deliver(monkeypatch, "nobody") == 1
+    assert prompts(fake) == []
+
+
+def test_mail_files_are_private(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a") == 3
+    (path,) = sleeper.pending_mail(UUID)
+    assert path.stat().st_mode & 0o777 == 0o600 and path.parent.stat().st_mode & 0o777 == 0o700
 
 
 # ------------------------------------------------------------------ stub
