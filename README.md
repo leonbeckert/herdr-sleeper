@@ -103,7 +103,12 @@ Config: `<plugin config dir>/config.toml` — Herdr's
 `max_live` (more live sessions than this: the longest-idle ones sleep
 early, 0 = no cap), `pressure_idle` (the shorter window for that early
 sleep, default `30m`, never later than `idle`; under macOS memory pressure
-warn/critical one session per tick sleeps early too), `dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
+warn/critical one session per tick sleeps early too), `restart_outdated` (an idle claude session whose process runs another
+build than the installed `claude` resolves to, per `lsof`'s txt entry, is
+slept and woken at once onto the new build, one per tick, after every check a
+sleep needs and at least `pressure_idle` of quiet; keep-listed sessions too,
+since a restart is not a sleep; event `restarted` with both builds),
+`wake_refuse_from` (see Messages below), `dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one);
@@ -285,7 +290,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 201 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 203 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

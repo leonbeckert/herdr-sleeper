@@ -210,6 +210,7 @@ DEFAULTS = {
     "pressure_idle_hours": 0.5,  # the shorter window for early sleep (over max_live, or memory pressure)
     "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
     "wake_refuse_from": [],      # senders whose messages never wake a sleeper (they wait in the mailbox)
+    "restart_outdated": False,   # idle claude sessions on an older build: sleep + wake onto the installed one
 }
 
 
@@ -621,7 +622,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     unknown = [a for a in values["agents"] if a not in PROFILES]
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
-    for key in ("notify", "wake_on_focus", "dry_run"):
+    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if values["watcher"] not in ("plugin", "external"):
@@ -2630,6 +2631,68 @@ def persist_clocks(clocks: dict[str, dict]) -> None:
         say(f"WARN could not persist idle clocks: {exc}")
 
 
+def running_build(pid: object) -> str | None:
+    """The executable a process runs (lsof's first txt entry, symlinks resolved by the kernel)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return None
+    try:
+        out = subprocess.run([LSOF, "-a", "-p", str(pid), "-d", "txt", "-Fn"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return next((ln[1:] for ln in out.splitlines() if ln.startswith("n/")), None)
+
+
+def installed_build(kind: str) -> str | None:
+    """What a fresh start of kind would run: its PATH entry with symlinks resolved."""
+    found = shutil.which(kind, path=os.pathsep.join([os.path.expanduser("~/.local/bin"), SYSTEM_PATH]))
+    return os.path.realpath(found) if found else None
+
+
+def outdated_build(agent: dict) -> tuple[str, str] | None:
+    """(running, installed) when the agent runs another build than the installed one, else None."""
+    kind = str(agent.get("agent"))
+    present, _argv, pid = agent_process(agent["pane_id"], kind)
+    running = running_build(pid) if present is True else None
+    installed = installed_build(kind)
+    if running and installed and os.path.realpath(running) != installed:
+        return running, installed
+    return None
+
+
+def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: set[str], journal: dict,
+                           config: dict, now: float) -> dict | None:
+    """Restart at most one idle, outdated claude session per tick: sleep it, wake it at once.
+    It has to pass every check a sleep needs (the keep-list excepted: a restart is not a sleep),
+    idle at least pressure_idle. Returns the entry to confirm when the wake went to the stub."""
+    window = config["pressure_idle_hours"]
+    for agent in sorted((a for a in agents if a.get("agent") == "claude" and a["pane_id"] in clocks
+                         and a["pane_id"] not in skip), key=lambda a: clocks[a["pane_id"]]["since"]):
+        since = clocks[agent["pane_id"]]["since"]
+        if (now - since) / 3600 < window:
+            continue
+        ok, _reason, _ = assess(agent, agents, window, journal, None, idle_since=since)
+        builds = outdated_build(agent) if ok else None
+        if not builds:
+            continue
+        pane, old, new = agent["pane_id"], os.path.basename(builds[0]), os.path.basename(builds[1])
+        if config["dry_run"]:
+            note_skip(pane, f"would restart onto {new} (runs {old}; dry run)")
+            return None
+        did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False)
+        if not did:
+            note_skip(pane, f"restart onto {new} refused: {outcome}")
+            return None
+        entry = read_json(JOURNAL).get(pane)
+        result = wake_entry(entry, via=f"restart:{new}", key=pane) if isinstance(entry, dict) else False
+        event("restarted", pane=pane, name=wake_name(entry or {"pane_id": pane}), uuid=(entry or {}).get("uuid"),
+              old=old, new=new, woke=result is True, delegated=result == DELEGATED)
+        say(f"restart {pane}: {old} -> {new}: " + ("woken" if result is True else "wake delegated to the stub"
+                                                   if result == DELEGATED else "wake failed; left asleep"))
+        return entry if result == DELEGATED else None
+    return None
+
+
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
 
 
@@ -2657,8 +2720,9 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
     want = max(over, 1 if level > 1 else 0)
     if not want:
         return [], ""
-    taken = {a["pane_id"] for a in due}
+    taken = {a["pane_id"] for a in due} | set(config["exclude"])
     ready = sorted((a for a in agents if a["pane_id"] in clocks and a["pane_id"] not in taken
+                    and a.get("name") not in config["exclude"]
                     and now - clocks[a["pane_id"]]["since"] >= window),
                    key=lambda a: clocks[a["pane_id"]]["since"])
     why = (f"{live} live > max_live {config['max_live']}" if over else "") + \
@@ -2682,6 +2746,7 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     seen: set[str] = set()
     exclude = set(config["exclude"])
     before = json.dumps(clocks, sort_keys=True)
+    restarting: dict | None = None
     with locked():
         try:
             merge_snapshot(agents)
@@ -2701,16 +2766,15 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                 continue
             pane = agent["pane_id"]
             seen.add(pane)
-            if exclude and (pane in exclude or agent.get("name") in exclude):
-                clocks.pop(pane, None)
-                continue
             # `done` = idle-but-unviewed: its clock must accrue too or background-finished panes never sleep
             if agent.get("agent_status") not in SLEEPABLE_STATUSES or agent.get("focused") is not False:
                 clocks.pop(pane, None)
                 continue
             if clock_since(clocks, agent, now) is None:
                 clocks[pane] = {**clock_key(agent), "since": now}
-            if now - clocks[pane]["since"] >= config["idle_hours"] * 3600:
+            # excluded panes keep a clock (restart_outdated may move them to a new build) but never sleep
+            excluded = bool(exclude) and (pane in exclude or agent.get("name") in exclude)
+            if not excluded and now - clocks[pane]["since"] >= config["idle_hours"] * 3600:
                 due.append(agent)
         for pane in [p for p in clocks if p not in seen]:
             clocks.pop(pane, None)
@@ -2747,6 +2811,14 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                 LAST_SKIP.pop(pane, None)
             elif not outcome.startswith(QUIET_OUTCOMES):
                 note_skip(pane, outcome)
+        if config["restart_outdated"] and not STOP["requested"]:
+            try:
+                restarting = restart_onto_new_build(agents, clocks, {a["pane_id"] for a in due + early},
+                                                    read_json(JOURNAL), config, now)
+            except SleeperError as exc:
+                say(f"restart-outdated: {exc}")
+    if restarting:
+        await_stub_wake(restarting)  # outside the lock: the stub takes it
     if json.dumps(clocks, sort_keys=True) != before:
         persist_clocks(clocks)
     flush_mail(agents)

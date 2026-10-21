@@ -365,7 +365,8 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
-                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": []}
+                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
+                      "restart_outdated": False}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -1329,6 +1330,37 @@ def test_pressure_idle_must_fit_inside_idle(state: Path, monkeypatch: pytest.Mon
             sleeper.load_config()
 
 
+def test_restart_outdated_sleeps_and_wakes_onto_the_new_build(fake: FakeHerdr, state: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    builds = {"running": "/v/2.1.305"}
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: builds["running"])
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 3600}}
+    config = {**sleeper.DEFAULTS, "restart_outdated": True, "exclude": ["a"]}   # keep-listed: restarts anyway
+    sleeper.watch_tick(clocks, config)
+    assert fake.signals == [(101, signal.SIGTERM)]
+    assert any(c[:2] == ("agent", "start") for c in fake.calls) and "w1:p1" not in journal()
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if '"restarted"' in l][-1]
+    assert rec["old"] == "2.1.305" and rec["new"] == "2.1.306" and rec["woke"] is True
+
+
+def test_restart_outdated_leaves_current_young_and_dry_run_sessions(fake: FakeHerdr, state: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 3600}}
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.306")
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == []                                            # already current
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.305")
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True, "dry_run": True})
+    assert fake.signals == [] and "would restart onto 2.1.306" in sleeper.LOGFILE.read_text()
+    young = {"w1:p1": {**clocks["w1:p1"], "since": 1_000_000.0 - 60}}
+    sleeper.watch_tick(young, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == []                                            # idle a minute: not yet
+
+
 def test_watch_tick_honors_excludes_and_kinds(fake: FakeHerdr, state: Path,
                                               monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = state / "config.toml"
@@ -1337,7 +1369,7 @@ def test_watch_tick_honors_excludes_and_kinds(fake: FakeHerdr, state: Path,
     config, _src = sleeper.load_config()
     clocks: dict[str, Any] = {}
     sleeper.watch_tick(clocks, config)
-    assert journal() == {} and clocks == {}                       # excluded before the clock even starts
+    assert journal() == {} and "w1:p1" in clocks                  # clocked (for restart_outdated), never slept
 
     fake.agents[0].pop("name")
     sleeper.watch_tick(clocks, config)
