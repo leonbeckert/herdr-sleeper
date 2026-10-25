@@ -1545,7 +1545,7 @@ def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours
         "terminal_id": agent.get("terminal_id") or pane_info.get("terminal_id"),
         "name": agent.get("name"), "label": label, "title": agent.get("terminal_title_stripped"),
         "cwd": agent.get("cwd"), "uuid": uuid, "kind": kind,
-        "argv": replay or None, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "argv": replay, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
         "status": agent.get("agent_status"), "phase": "exit-requested",
         "claude_name": claude_session_name(transcript_for(uuid)) if kind == "claude" else None,
     }
@@ -2082,6 +2082,15 @@ def cmd_wake(args: argparse.Namespace) -> int:
                 journal[hit[0]] = hit[1]
                 write_json(JOURNAL, journal)
                 print(f"recovering {hit[0]} from panes.json")
+            if (getattr(args, "without_flags", False) and hit[1].get("argv") is None
+                    and PROFILES.get(hit[1].get("kind"), {}).get("argv_after_binary")):
+                # the operator vouches for a plain resume; persisted, so the stub's own check agrees
+                journal = read_json(JOURNAL)
+                hit[1]["argv"] = []
+                journal[hit[0]] = hit[1]
+                write_json(JOURNAL, journal)
+                event("argv-assumed-empty", pane=hit[1]["pane_id"], uuid=hit[1]["uuid"])
+                print(f"{hit[0]}: original flags unknown; resuming without flags as asked")
             targets = [hit[1]]
         woke = 0
         for entry in targets:
@@ -3337,6 +3346,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(f"error: refusing to scan with a broken config — {exc}", file=sys.stderr)
         return 2
     exclude = set(config["exclude"]) | set(args.exclude or [])
+    dry_run = args.dry_run or config["dry_run"]  # a configured dry run binds a manual tick too
     rows = []
     slept = 0
     with locked():
@@ -3352,7 +3362,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             outcome = reason
             if ok:
                 try:
-                    did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=args.dry_run,
+                    did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=dry_run,
                                                idle_since=since, notify_enabled=config["notify"])
                 except SleeperError as exc:
                     did, outcome = False, f"error: {exc}"
@@ -3363,7 +3373,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         mark = "SLEEP" if r["outcome"] == "slept" else "would" if r["outcome"].startswith("would") else "keep "
         print(f"{mark} {r['pane']:8} {(r['name'] or '-'):20} {r['status'] or '-':8} {r['outcome']}")
     print(f"{slept} slept, {len(rows)} inspected, idle window {config['idle_hours']:g}h"
-          + (" (dry run)" if args.dry_run else ""))
+          + (" (dry run)" if dry_run else ""))
     return 0
 
 
@@ -3462,9 +3472,11 @@ def main(argv: list[str] | None = None) -> int:
     wp = sub.add_parser("wake", help="wake one sleeping agent (pane id, wake name, or agent name)")
     wp.add_argument("target", nargs="?")
     wp.add_argument("--all", action="store_true")
+    wp.add_argument("--without-flags", action="store_true",
+                    help="resume a session whose original flags are unknown with none (one target only)")
     wp.set_defaults(fn=cmd_wake)
     sub.add_parser("wake-all", help="wake every sleeping agent").set_defaults(fn=lambda a: cmd_wake(
-        argparse.Namespace(target=None, all=True)))
+        argparse.Namespace(target=None, all=True, without_flags=False)))
     sub.add_parser("list", help="what is sleeping").set_defaults(fn=cmd_list)
     lp = sub.add_parser("log", help="events, newest last")
     lp.add_argument("--tail", type=int, default=None)

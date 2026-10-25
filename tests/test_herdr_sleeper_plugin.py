@@ -833,6 +833,29 @@ def test_wake_refuses_when_argv_unknown(fake: FakeHerdr) -> None:
     assert not any(c[:2] == ("agent", "start") for c in fake.calls)
 
 
+def test_plain_launched_session_wakes(fake: FakeHerdr) -> None:
+    """A session started without flags has nothing to replay: that is known, not unknown."""
+    fake.argv = []
+    entry = slept_entry(fake)
+    assert entry["argv"] == []
+    assert sleeper.wake_entry(entry)
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert "--resume" in start and "--dangerously-skip-permissions" not in start
+
+
+def test_wake_without_flags_resumes_unknown_argv(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    slept_entry(fake)
+    rows = journal()
+    rows["w1:p1"]["argv"] = None  # what sleeps before the fix wrote for a plain `claude`
+    sleeper.write_json(sleeper.JOURNAL, rows)
+    monkeypatch.setattr(sleeper, "list_agents", lambda: fake.agents)
+    assert sleeper.main(["wake", "w1:p1"]) != 0
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls)
+    assert sleeper.main(["wake", "w1:p1", "--without-flags"]) == 0
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert "--resume" in start and "--dangerously-skip-permissions" not in start
+
+
 def test_wake_refuses_when_session_live_elsewhere(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
     entry = slept_entry(fake)
     monkeypatch.setattr(sleeper, "uuid_live_elsewhere", lambda uuid, except_pane=None, cwd=None: "pid 42")
@@ -2093,6 +2116,21 @@ def test_scan_honours_the_persisted_idle_clock(fake: FakeHerdr, state: Path, mon
                                                      "since": time.time() - 2 * 3600}})
     sleeper.cmd_scan(types.SimpleNamespace(dry_run=False, exclude=None))
     assert journal()["w1:p1"]["phase"] == "asleep"
+
+
+def test_scan_honours_the_configured_dry_run(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    """`dry_run = true` binds a manual tick too: a plain `scan` slept two sessions for real."""
+    cfg = state / "config.toml"
+    cfg.write_text('idle = "1h"\ndry_run = true\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    monkeypatch.setattr(sleeper, "list_agents", lambda: fake.agents)
+    sleeper.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sleeper.write_json(sleeper.IDLE_FILE, {"w1:p1": {"terminal_id": "term-1", "seq": 5, "uuid": UUID,
+                                                     "since": time.time() - 2 * 3600}})
+    sleeper.cmd_scan(types.SimpleNamespace(dry_run=False, exclude=None))
+    out = capsys.readouterr().out
+    assert journal() == {} and "would sleep" in out and "(dry run)" in out
 
 
 def test_idle_clock_restarts_when_the_session_differs(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:

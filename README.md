@@ -82,8 +82,11 @@ clock again (a later sleep, never an earlier one). Resets reach the file
 before the tick sleeps anything. `scan` honours the same clocks (an
 unclocked pane's stretch starts now), so it no longer sleeps everything at
 once.
+It also honours `dry_run`; `scan --dry-run` previews without it.
 
-Supported kinds: **claude** (original argv replayed on wake) and
+Supported kinds: **claude** (original argv replayed on wake; a session
+started without flags resumes with none, and `wake --without-flags` resumes
+one whose flags are unknown) and
 **opencode** (`-s <session>`). Codex is deliberately absent — see the
 comment on `PROFILES` in the script.
 
@@ -116,7 +119,7 @@ since a restart is not a sleep; event `restarted` with both builds, then
 failed. One try per session every 6 h, so a restart that does not take never
 loops. An npm/bun install shows only its runtime to `lsof`, so it is never
 restarted),
-`wake_refuse_from` (see Messages below), `dry_run` (the watcher logs `would sleep (dry run)` once per idle stretch
+`wake_refuse_from` (see Messages below), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one);
