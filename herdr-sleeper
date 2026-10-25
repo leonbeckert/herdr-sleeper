@@ -841,7 +841,7 @@ REFUSED_OPTIONS = {"--fork-session", "--print", "--session-id", "--new", "--repl
 BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d"}
 # Values of these are replayed and kept in the journal, so none of them may carry a secret
 # (`--env KEY=VALUE` did; an argv with it now refuses as an unrecognised option).
-VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source"}
+VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source", "-n", "--name"}
 
 
 def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:

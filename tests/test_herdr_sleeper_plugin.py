@@ -261,6 +261,8 @@ def test_replayable_argv_strips_session_selectors() -> None:
     assert ok(["--resume", "--model", "opus"]) == (["--model", "opus"], None)  # bare --resume opens a picker
     assert ok([]) == ([], None)
     assert ok(["--add-dir", "/x", "--verbose"]) == (["--add-dir", "/x", "--verbose"], None)
+    assert ok(["--dangerously-skip-permissions", "-n", "ts-x"]) == (["--dangerously-skip-permissions", "-n", "ts-x"], None)
+    assert ok(["--name=ts-x"]) == (["--name=ts-x"], None)
     assert ok(["--unknown-flag", "value"])[0] is None and "unrecognised" in ok(["--unknown-flag", "value"])[1]
     assert ok(["--model"])[0] is None  # value option missing its value
 
