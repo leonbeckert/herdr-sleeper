@@ -382,8 +382,8 @@ label, or leave `done` panes alone for longer. (Review v0.1.0 F22.)
 
 These come from the first reboot of the deployment host (2026-10-26) and from reading Herdr **0.9.5** (tag
 `v0.9.5`); citations in this section are against that tag. On that reboot every awake Claude pane came back
-natively; no slept pane was exercised. The lab results that confirm or refute 10.1 and 10.4 against a real
-Herdr server are still to be added here.
+natively; no slept pane was exercised. Two labs against a real, isolated, headless Herdr 0.9.5 server then
+confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 10.9.
 
 **10.1 A claim does not survive a restart; a reported resume command does.**
 - *Trap:* a slept pane is saved with its cwd and its 💤 label and nothing else. The stub is a process, and
@@ -431,9 +431,97 @@ Herdr server are still to be added here.
 - *Instead:* report a missing external watcher wherever someone looks (a WARN and an event at startup, rate
   limited from hooks, a header in `list`, a note in the agents' peer list). Treat "no server" as a reason to
   retry at the poll interval, not as a failure. fsync the file, then the directory.
-- *Unverified:* whether a headless Herdr server with no client attached starts restored resume commands, and
-  whether it starts one whose agent label it does not know (`sleeper`). CHANGELOG #2064 (0.8.0) says headless
-  servers resume without an attach; the lab still has to show it for a reported command.
+- *Lab (10.9):* a headless server with no client attached does start a restored resume command, also one whose
+  agent label it does not know (`sleeper`). It types the command into the restored login shell before its first
+  prompt, so it runs under the pane shell's `PATH` and Python (keep the script an absolute path behind `env`),
+  and `process-info` shows the argv after `env` has exec'd (`python … herdr-sleeper stub …`). The claim is not
+  restored: `pane get` has no `agent` until the next tick claims the pane again. A watcher that ticked during
+  `server stop` got `server_unavailable` ("server is shutting down"), which now counts as "no server" too.
+
+**10.5 Some CLI calls answer success with nothing.**
+- *Trap:* the plugin trusts the JSON envelope, not the exit code (Herdr prints `{"error": …}` with exit 0 for
+  most calls). But the "ok" calls (`pane report-agent`, `report-agent-session`, `release-agent`,
+  `report-metadata`, `send-keys`, `send-text`, `server stop`; `send_ok_request`, `src/cli.rs:755`) print nothing
+  on success and print the error JSON on stderr with exit 1. The new resume report used the checked path, so
+  every successful report read as a failure: the lab log said `resume-not-reported`, and the claim was sent a
+  second time without the command. Herdr had saved the command anyway, so only the log was wrong.
+- *Evidence:* lab, first sleep. The unit tests passed because the fake `herdr` replaced the whole call, not the
+  process it parses.
+- *Instead:* list the commands that answer with nothing and treat exit 0, empty stdout and no error on stderr as
+  success for them. Test the parser against the real output shapes (a fake `subprocess.run`), not only the
+  decision logic against a fake `herdr`.
+
+**10.6 A pane whose shell never came back keeps Herdr's own resume plan.**
+- *Trap:* when the agent's exit does not return the pane to its shell (in the lab, `claude --resume …; sleep 900`),
+  Herdr keeps the agent for longer than the exit wait, and then keeps the pane's persisted Claude session. Our
+  claim is ignored there (`current_session_owner_conflicts`, `src/terminal/state.rs:1330`, inside
+  `set_hook_authority_at`, `:701`), and the next restart resumes the session natively, awake, under the 💤 label.
+  The sleep transaction had also given up before labelling and claiming the pane (`exit-uncertain`), and the
+  reconcile that later found the agent gone set the row to `asleep` with no label, so a restart would have
+  orphaned its own pane.
+- *Instead:* when reconcile settles a late exit in the same terminal, label the pane and claim it then, with
+  `stub = false` and no resume command. When a session turns out to run again (two sightings) and the pane still
+  carries our label, put the pane's own label back. A stub-less pane therefore comes back either awake (Herdr
+  kept its session) or as a labelled shell that wakes on focus; it is never lost. `agent list` rows carry no
+  `label`; read it from `pane list`.
+
+**10.7 A saved resume command outlives the row it was for.**
+- *Trap:* a slept pane whose 💤 label was removed is orphaned after a restart (2.3), but Herdr has still typed our
+  stub back in, and keeps the command for every later restart. Neither a `release-agent` without the claim nor
+  the stub exiting back to the shell drops it (lab); the stub just prints "no journal entry" each time. The stub
+  can also exit before reconcile looks, because reconcile orphaned the row first, so "is our stub running" is
+  not a usable test for "is our command saved".
+- *Instead:* when reconcile orphans a row that may have reported a resume command (`stub` not false) and no agent
+  runs in the pane, claim the pane and release it. A release by the holder drops the command (lab: the next
+  restart typed nothing). A claude that starts in the pane also drops it (another agent took the pane).
+
+**10.8 The stub path is not the only wake after a restart.**
+- *Lab:* Enter before the first tick (the stub runs, the pane is not claimed yet) resumed the same session; the
+  stub's release cannot drop the command without the claim, but the resumed claude takes the pane, and that drops
+  it. Focus on a headless server works: `workspace focus` fires `pane.focused` with no client attached, and the
+  plugin's hook delegated Enter to the stub (or started the agent with `agent start` in a labelled bare shell).
+  After every wake the pane's saved plan was Claude's own again, and a restart after the wake brought the
+  session back natively as `claude --resume <id>`, with no stub.
+
+**10.9 Lab protocol and results (2026-10-26, Herdr 0.9.5, Claude Code 2.1.306).**
+- *Setup:* `env -i` with a whitelist (HOME, USER, LOGNAME, SHELL, LANG, LC_ALL, TERM, TMPDIR, PATH) plus its own
+  `XDG_CONFIG_HOME` and `XDG_STATE_HOME` under a fresh `/tmp` directory; no `HERDR_*` or `CLAUDE*` variables.
+  Server `herdr --session sleeper-test server` started in the background, never attached; every `server stop`
+  only after checking that `herdr status server` names the lab socket. The plugin was linked from the
+  development clone (`herdr plugin link`), config `idle = "24h"`, `watcher = "external"`, `notify = false`,
+  `poll_seconds = 3`. Sleeper CLI and watcher ran from the clone with `HERDR_SESSION`, `HERDR_SOCKET_PATH` (the
+  lab socket) and `HERDR_BIN_PATH`, so plugin hooks and manual runs shared one state dir. Three throwaway Claude
+  sessions were seeded with `claude -p … --setting-sources local --model haiku --session-id <uuid>` in
+  separate cwds and resumed interactively in three panes (A, B, C); a fourth pane (plain shell) was there to
+  move focus away. The CLI and watcher ran on Homebrew Python 3.15, the in-pane stub on `/usr/bin/python3` 3.9.
+- *A, stub, the main case:* `sleep-pane` → `pane get` shows `agent: sleeper`, label `💤 …`, the stub in the
+  foreground, and `session.json` holds `agent_resume` = the stub argv (`env … herdr-sleeper stub <pane> <uuid>
+  <state dir>`). `server stop` + headless start → the stub runs again (new pid, same pane id, new terminal id),
+  the label is back, `pane get` has no agent, `list` shows the row `asleep`, not orphaned. One tick (`scan`, and
+  in later rounds the running watcher) → `reconciled` / `reclaimed-after-restart` with the new terminal id, the
+  journal row carries it, `pane get` shows `agent: sleeper` again. Wakes, each after its own sleep and restart:
+  `wake` (Enter delegated to the stub), Enter by `send-keys` before any tick, and focus (`workspace focus`) —
+  every time the same pid exec'd into `claude --resume <same uuid>`, the label went back to the original, and
+  the saved plan became Claude's own (`agent_resume` null, `agent_session` = the uuid). Pass, after the fix in
+  10.5 (before it, the same results plus a false `resume-not-reported`).
+- *A, no stub after a restart:* sleep, ctrl-c in the stub ("left as a shell", claim released, command dropped),
+  restart → a labelled bare shell, the watcher left it alone; focus → `identity re-established after a Herdr
+  restart`, `agent start` resumed the same uuid. Pass.
+- *B, slept without a stub (`claude …; sleep 900`):* `exit-uncertain` (25 s), then reconcile → `asleep`, now
+  with the 💤 label and `stub: false`, but no claim (10.6). Restart → Herdr resumed the session natively,
+  awake; two ticks later the row was dropped (`running`) and the label cleared. Not the bare-shell outcome the
+  plan expected; it is safe (one live copy, nothing lost) and documented in 10.6.
+- *C, label removed before the restart:* `pane rename --clear` on a slept pane, restart → Herdr typed the stub
+  in anyway, the tick re-keyed the row `orphan:<uuid8>` (`list` prints the manual resume line), and dropped our
+  saved command (10.7); Enter in that stub left a shell and resumed nothing ("the journal entry changed"; in the
+  race case "no journal entry"). The next restart typed nothing into C. Pass with 10.7 (before it, every
+  restart typed the stub again).
+- *Server down:* the external watcher, running across a `server stop` with a 4–10 s gap, logged "herdr server
+  not reachable … retrying every 3s" once and "reachable again after 2 tick(s)", then re-claimed A in the same
+  tick. Pass (after counting `server_unavailable`).
+- *Not covered:* a real macOS reboot or loginwindow restart; an awake session busy at the restart; opencode;
+  Python 3.12 for the in-pane stub. A best-effort `agent rename` back to the slept name failed once right after a
+  stub wake (`agent_not_found`, the agent was not registered yet); logged, not retried.
 
 ---
 
