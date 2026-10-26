@@ -1,6 +1,6 @@
 id = "djbclark.herdr-sleeper"
 name = "Herdr Sleeper"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.9.1"
 description = "Sleep idle resumable agents after a configurable window (fail-closed); wake on focus, Enter, or command."
 platforms = ["macos", "linux"]

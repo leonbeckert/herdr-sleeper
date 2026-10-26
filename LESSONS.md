@@ -108,7 +108,8 @@ processes by argv structure.**
   refused wake left the record "owned" by a terminal never proven to be ours. A later rule then deleted the record.
 - *Evidence:* review (v0.1.1 #2).
 - *Instead:* keep the candidate identity in memory, and write it only together with the state change of a wake
-  that started.
+  that started. The one other action that may adopt a new terminal is a re-claim after a restart, and only on
+  stronger evidence than the label: our own stub for this pane and this session running in it (10.2).
 
 **2.4 `state_change_seq` restarts at 0 on every server run.**
 - *Trap:* we keyed idle clocks on `state_change_seq`. After a restart, small counter values match by coincidence.
@@ -126,7 +127,8 @@ processes by argv structure.**
   history (`initial_history_ansi`, `src/persist/restore.rs:638, 657`). After a restart, a slept pane therefore
   shows your old "press Enter to resume" text although no stub is running in it.
 - *Instead:* decide on purpose which of the two (Herdr or the sleeper) owns resume after a restart. Don't word the
-  in-pane hint so that it only makes sense while a stub is actually running.
+  in-pane hint so that it only makes sense while a stub is actually running. Since Herdr 0.9.2 the claim can also
+  name what Herdr should run after a restart (10.1).
 - *Untested:* a late agent hook report landing after your claim takes authority back.
 
 **2.6 Startup hooks run at server start and on live-handoff import. They do not run on plugin install.**
@@ -375,6 +377,63 @@ label, or leave `done` panes alone for longer. (Review v0.1.0 F22.)
 - *Instead:* the soak must stop and restart the server with a slept pane, reproduce a reused pane id (close the
   highest workspace, restart, create a workspace), and sleep a focused pane. Small trap: a new directory can hold
   `agent start` on Claude Code's folder-trust prompt, so run lab agents in directories that are already trusted.
+
+## 10. Reboots
+
+These come from the first reboot of the deployment host (2026-10-26) and from reading Herdr **0.9.5** (tag
+`v0.9.5`); citations in this section are against that tag. On that reboot every awake Claude pane came back
+natively; no slept pane was exercised. The lab results that confirm or refute 10.1 and 10.4 against a real
+Herdr server are still to be added here.
+
+**10.1 A claim does not survive a restart; a reported resume command does.**
+- *Trap:* a slept pane is saved with its cwd and its 💤 label and nothing else. The stub is a process, and
+  processes are not saved. The claim is hook authority, which is not in the snapshot either. Our own claim also
+  cleared the pane's persisted agent session (2.5). After a restart the pane is a bare shell with the label:
+  Enter does nothing, and only focus or `wake` resumes it.
+- *Evidence:* source. Since 0.9.2 (CHANGELOG #4687) `pane report-agent … -- <argv>` stores a resume command for
+  the reporter that holds the pane (`src/app/api/panes.rs:1554-1597`, `report_agent_resume` at `:1668`). The
+  snapshot saves it (`src/persist/snapshot.rs:375`), restore puts it back on the new terminal
+  (`src/persist/restore.rs:457, 603, 703`) and prefers it over a native plan (`pane_restore_startup`,
+  `:815-827`), as long as `session.resume_agents_on_restore` is on. Herdr drops it when the reporter releases
+  the pane (`forget_reported_resume_of`, `src/terminal/state.rs:2022`, called from the release path at `:1859`),
+  when the pane is back at an idle shell (`:1901`), or when another agent takes the pane
+  (`reconcile_reported_resume`, `:1996-2009`).
+- *Trap 2:* `validate_resume_argv` (`src/agent_resume.rs:58-89`) refuses a path as the first element (restore
+  types the command into the shell), an apostrophe anywhere, control characters, more than 64 arguments or
+  8 KiB. It checks only the first element for a plain name, so `env VAR=… /abs/path/plugin stub …` passes.
+- *Instead:* report the stub's argv as the resume command in the claim, and only when the stub was actually
+  typed. Build the typed line and the reported argv from one function, so the process that comes back is exactly
+  the one your structural stub match (1.2) recognises. Check the argv locally against the same rules first, and
+  on any refusal fall back to the plain claim and log it: a pane without a resume command still wakes on focus.
+
+**10.2 After a restart, claim the pane again, and only on proof.**
+- *Trap:* the resume command brings the stub back, but not the claim: the sidebar row is gone, and the stored
+  command belongs to a reporter that no longer holds the pane, so the next restart may not have it.
+- *Instead:* in reconcile, a row that is asleep, whose pane has our label and a new terminal id, *and* whose
+  foreground is our stub for this pane and this session, is ours: claim it again with the same resume command,
+  and record the new terminal id in the same step (2.3). Leave a restarted pane without the stub alone; focus
+  and `wake` handle it as before.
+
+**10.3 Native restore drops the flags a session was started with.**
+- *Trap:* Herdr's own restore plan for Claude is `claude --resume <id>` and nothing else
+  (`src/agent_resume.rs:203-210`). A crash-recovery snapshot that records "what runs now" overwrites the flags
+  it had with nothing on the first tick after a restart, and a later sleep of that session would replay none.
+- *Instead:* when the live argv after the binary is exactly `--resume <same session>`, keep the flags the
+  snapshot already had, and let a sleep of such a session take its flags from the snapshot.
+
+**10.4 Plan for the service coming up before, after, or without the multiplexer.**
+- *Trap 1:* with an externally supervised watcher (launchd), nothing in the plugin starts one, and nothing said
+  that it was missing: sleeping, reconcile and mail flushing stopped silently. On 2026-10-26 the service jobs
+  of the deployment host did not start after an OS update; the cause was outside the plugin.
+- *Trap 2:* a watcher that starts before the server sees every call fail and backs off exponentially, so it
+  catches up minutes after the server is there.
+- *Trap 3:* an atomic `os.replace` without an fsync can leave an empty file after a power cut.
+- *Instead:* report a missing external watcher wherever someone looks (a WARN and an event at startup, rate
+  limited from hooks, a header in `list`, a note in the agents' peer list). Treat "no server" as a reason to
+  retry at the poll interval, not as a failure. fsync the file, then the directory.
+- *Unverified:* whether a headless Herdr server with no client attached starts restored resume commands, and
+  whether it starts one whose agent label it does not know (`sleeper`). CHANGELOG #2064 (0.8.0) says headless
+  servers resume without an attach; the lab still has to show it for a reported command.
 
 ---
 

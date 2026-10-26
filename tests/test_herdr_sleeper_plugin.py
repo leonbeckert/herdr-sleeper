@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
+import stat
 import time
 import types
 from pathlib import Path
@@ -51,7 +53,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
     d = tmp_path / "state"
     for name in ("STATE_DIR", "JOURNAL", "SNAPSHOT", "EVENTS", "LOGFILE", "LOCK", "WATCHER_PID",
-                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED", "MAILBOX", "DELIVERED"):
+                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED", "MAILBOX", "DELIVERED", "WATCHER_MISSING"):
         base = getattr(sleeper, name, None)
         if base is None:
             continue
@@ -112,6 +114,22 @@ class FakeHerdr:
         self.comm: str | None = None        # what ps reports for the agent pid (None: its kind)
         self.foreground: str | None = None  # a non-shell foreground in agent-less panes (e.g. "vim")
         self.execvps: list[tuple[str, list[str]]] = []
+        self.resumes: dict[str, list[str]] = {}  # pane -> the resume command its claim reported (Herdr saves it)
+        self.reject_resume: str | None = None    # error code a report-agent carrying a resume command gets
+
+    def restart(self, keep_resume: bool = True) -> None:
+        """A Herdr server restart: every terminal gets a new id, saved labels come back, claims (hook
+        authority) do not, and no process survives. A pane whose claim reported a resume command
+        gets it typed back into its shell — our stub; every other slept pane is a bare shell.
+        Live agents stand for natively resumed sessions and stay. keep_resume=False: an older
+        Herdr that saves no resume commands."""
+        if not keep_resume:
+            self.resumes.clear()
+        for a in self.agents:
+            a["terminal_id"] = f"{a.get('terminal_id')}-r"
+            if a.get("agent") == sleeper.CLAIM_AGENT:
+                a.pop("agent", None)
+        self.stub_panes = {p for p, argv in self.resumes.items() if "stub" in argv}
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
@@ -204,9 +222,18 @@ class FakeHerdr:
             by_pane[args[2]]["name"] = args[3]
             return {"agent": {"name": args[3]}}
         if args[:2] == ("pane", "report-agent"):
+            resume = list(args[args.index("--") + 1:]) if "--" in args else None
+            if resume is not None and self.reject_resume:
+                if check:
+                    raise sleeper.HerdrError(f"herdr pane report-agent failed: {{'code': '{self.reject_resume}'}}",
+                                             self.reject_resume)
+                return {}
             by_pane[args[2]]["agent"] = sleeper.CLAIM_AGENT
+            if resume is not None:
+                self.resumes[args[2]] = resume
             return {}
         if args[:2] == ("pane", "release-agent"):
+            self.resumes.pop(args[2], None)   # Herdr forgets the releasing reporter's resume command
             a = by_pane[args[2]]
             if a.get("agent") == sleeper.CLAIM_AGENT:
                 a.pop("agent", None)
@@ -2461,3 +2488,256 @@ def test_early_sleep_passes_over_a_refusing_pane(fake: FakeHerdr, state: Path, m
     fake.helpers = {300: "zsh"}                    # the longest idle runs a background shell
     sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "max_live": 2})
     assert list(journal()) == ["w2:p1"]
+
+
+# ------------------------------------------- B-274: surviving a Herdr restart
+
+def test_claim_reports_stub_resume_argv(fake: FakeHerdr) -> None:
+    """The stub's argv is reported as the pane's resume command, so Herdr types it back after a restart."""
+    slept_entry(fake)
+    want = sleeper.stub_argv("w1:p1", UUID)
+    assert fake.resumes["w1:p1"] == want
+    assert want[0] == "env" and str(SCRIPT) in want                  # a plain command first, the script by path
+    assert want[-4:] == ["stub", "w1:p1", UUID, str(sleeper.STATE_DIR)]
+    assert stub_run(fake).endswith(shlex.join(want))                 # what is typed and what is reported agree
+    assert sleeper.resume_argv_problem(want) is None and "resume-not-reported" not in events()
+
+
+def test_no_resume_when_stub_not_typed(fake: FakeHerdr) -> None:
+    fake.foreground = "vim"   # no bare shell after the exit: no stub, so a restart must not start one
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+    reports = [c for c in fake.calls if c[:2] == ("pane", "report-agent")]
+    assert reports and all("--" not in c for c in reports) and fake.resumes == {}
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+
+
+@pytest.mark.parametrize("argv, needle", [
+    ([], "empty"),
+    (["/usr/bin/env", "x"], "plain command"),
+    (["-env"], "plain command"),
+    (["env", "a\x07b"], "control"),
+    (["env", "a\x85b"], "control"),                     # C1 controls count too (Rust char::is_control)
+    (["env", *["a"] * 64], "arguments"),
+    (["env", "a" * 8200], "bytes"),
+    (["env", "/tmp/it's"], "apostrophe"),
+])
+def test_resume_argv_problem_mirrors_herdr(argv: list[str], needle: str) -> None:
+    why = sleeper.resume_argv_problem(argv)
+    assert why and needle in why
+    ok = ["env", "HERDR_SESSION=default", "/x/herdr-sleeper", "stub", "w1:p1", UUID]
+    assert sleeper.resume_argv_problem(ok) is None
+
+
+def test_resume_argv_validation_falls_back(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A state dir with an apostrophe makes a resume command Herdr refuses: never sent, plain claim instead."""
+    monkeypatch.setattr(sleeper, "STATE_DIR", state / "it's state")
+    assert slept_entry(fake)["phase"] == "asleep"
+    reports = [c for c in fake.calls if c[:2] == ("pane", "report-agent")]
+    assert len(reports) == 1 and "--" not in reports[0]
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT and fake.resumes == {}
+    assert "resume-not-reported" in events() and "apostrophe" in sleeper.LOGFILE.read_text()
+
+
+@pytest.mark.parametrize("code", ["resume_not_accepted", "invalid_resume_argv"])
+def test_claim_retries_without_resume_on_resume_not_accepted(fake: FakeHerdr, code: str) -> None:
+    fake.reject_resume = code
+    slept_entry(fake)
+    reports = [c for c in fake.calls if c[:2] == ("pane", "report-agent")]
+    assert len(reports) == 2 and "--" in reports[0] and "--" not in reports[1]
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT and fake.resumes == {}   # the row is claimed anyway
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if "resume-not-reported" in l][-1]
+    assert code in rec["reason"]
+
+
+def test_reconcile_reclaims_restarted_pane_with_running_stub(fake: FakeHerdr) -> None:
+    slept_entry(fake)
+    fake.restart()
+    assert fake.stub_panes == {"w1:p1"} and "agent" not in fake.agents[0]   # stub typed back, claim gone
+    assert sleeper.identity(journal()["w1:p1"], fake.agents[0]) == "restarted"
+    sleeper.reconcile(fake.agents)
+    j = journal()["w1:p1"]
+    assert j["terminal_id"] == "term-1-r" and j["phase"] == "asleep"       # stamped together with the claim
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+    assert fake.resumes["w1:p1"] == sleeper.stub_argv("w1:p1", UUID)     # reported again for the next restart
+    rec = json.loads(sleeper.EVENTS.read_text().splitlines()[-1])
+    assert rec["event"] == "reconciled" and rec["outcome"] == "reclaimed-after-restart"
+    assert rec["terminal_id"] == "term-1-r"
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)                                          # settled: nothing more to do
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])
+    fake.stub_execs_on_enter = True                                         # and Enter goes to the stub
+    assert sleeper.wake_entry(journal()["w1:p1"]) == sleeper.DELEGATED
+    assert "w1:p1" not in fake.resumes                                      # released: Herdr drops the command
+
+
+def test_reconcile_reclaims_a_restarted_pane_listed_under_our_placeholder(fake: FakeHerdr) -> None:
+    """Should Herdr list the restored pane with the resume command's agent label, it is still re-claimed."""
+    slept_entry(fake)
+    fake.restart()
+    fake.agents[0]["agent"] = sleeper.CLAIM_AGENT
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["terminal_id"] == "term-1-r" and events()[-1] == "reconciled"
+
+
+def test_reconcile_leaves_restarted_pane_without_stub(fake: FakeHerdr) -> None:
+    fake.foreground = "vim"
+    slept_entry(fake)                                  # asleep with stub=false: no resume reported
+    fake.foreground = None
+    fake.restart()
+    assert fake.stub_panes == set()
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["terminal_id"] == "term-1" and "agent" not in fake.agents[0]
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])
+    assert sleeper.wake_entry(journal()["w1:p1"]) is True     # focus/`wake` start it into the bare shell
+
+
+def test_restart_without_a_saved_resume_leaves_a_shell_that_wakes(fake: FakeHerdr) -> None:
+    """An older Herdr (or a refused resume): the stub does not come back; nothing is re-claimed or
+    re-stamped, and the pane still wakes with `agent start`."""
+    slept_entry(fake)
+    fake.restart(keep_resume=False)
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["terminal_id"] == "term-1" and "agent" not in fake.agents[0]
+    assert sleeper.wake_entry(journal()["w1:p1"]) is True and journal() == {}
+
+
+def test_merge_snapshot_keeps_flags_after_native_resume(fake: FakeHerdr) -> None:
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == ["--dangerously-skip-permissions"]
+    fake.argv = ["--resume", UUID]               # Herdr's native restore: `claude --resume <uuid>`, no flags
+    fake.agents[0]["terminal_id"] = "term-1-r"
+    sleeper.merge_snapshot(fake.agents)
+    row = sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]
+    assert row["argv"] == ["--dangerously-skip-permissions"] and row["terminal_id"] == "term-1-r"
+    assert slept_entry(fake)["argv"] == ["--dangerously-skip-permissions"]   # and its wake gets them back
+
+
+def test_merge_snapshot_still_updates_on_real_argv_change(fake: FakeHerdr) -> None:
+    sleeper.merge_snapshot(fake.agents)
+    fake.argv = ["--model", "opus", "--resume", UUID]       # flags of its own: what runs is what counts
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == ["--model", "opus"]
+    fake.argv = []                                           # restarted by hand without flags
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == []
+    fake.agents[0]["agent_session"] = {"value": "other-session"}   # a bare --resume of another session
+    fake.argv = ["--resume", "other-session"]                       # inherits nothing
+    sleeper.merge_snapshot(fake.agents)
+    row = sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]
+    assert row["uuid"] == "other-session" and row["argv"] == []
+
+
+def external_watcher(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = state / "config.toml"
+    cfg.write_text('watcher = "external"\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+
+
+def test_external_watcher_missing_warns_rate_limited(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    REAL_HEAL()
+    assert "watcher-missing" not in events()                 # plugin mode heals instead (Popen below fails)
+    external_watcher(state, monkeypatch)
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a watcher"))
+    REAL_HEAL(); REAL_HEAL()
+    assert events().count("watcher-missing") == 1             # once an hour, not on every focus hook
+    old = time.time() - 2 * 3600
+    os.utime(sleeper.WATCHER_MISSING, (old, old))
+    REAL_HEAL()
+    assert events().count("watcher-missing") == 2
+    assert sleeper.cmd_startup() == 0                        # server start says so every time
+    assert events().count("watcher-missing") == 3
+    assert "WARN the external herdr-sleeper watcher is not running" in sleeper.LOGFILE.read_text()
+    fh = hold_flock(sleeper.WATCHER_LOCK)                     # the service is back
+    os.utime(sleeper.WATCHER_MISSING, (old, old))
+    REAL_HEAL(); sleeper.cmd_startup()
+    fh.close()
+    sleeper.cmd_stop(types.SimpleNamespace())                 # `stop` is deliberate, not missing
+    os.utime(sleeper.WATCHER_MISSING, (old, old))
+    REAL_HEAL(); sleeper.cmd_startup()
+    assert events().count("watcher-missing") == 3
+
+
+def test_list_shows_watcher_missing_header(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    capsys.readouterr()
+    sleeper.cmd_list(types.SimpleNamespace())
+    assert "WARNING" not in capsys.readouterr().out           # plugin mode: no header
+    external_watcher(state, monkeypatch)
+    sleeper.cmd_list(types.SimpleNamespace())
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("WARNING: the external herdr-sleeper watcher is not running")
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True)) == 0
+    cap = capsys.readouterr()
+    assert json.loads(cap.out) and "WARNING" in cap.err      # --json output stays parseable
+    sleeper.cmd_presence(types.SimpleNamespace(json=False))
+    assert capsys.readouterr().out.startswith("WARNING")
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    assert "watcher is not running" in ctx["hookSpecificOutput"]["additionalContext"]
+    fh = hold_flock(sleeper.WATCHER_LOCK)
+    sleeper.cmd_list(types.SimpleNamespace())
+    fh.close()
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_hook_notes_a_missing_watcher_with_nobody_asleep(fake: FakeHerdr, state: Path,
+                                                        monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    external_watcher(state, monkeypatch)
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    text = ctx["hookSpecificOutput"]["additionalContext"]
+    assert text.startswith("Note: herdr-sleeper's watcher is not running") and "Sleeping sessions" not in text
+
+
+def test_server_down_retries_at_poll_interval(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    def tick(n: int) -> None:
+        if n <= 12:   # the watcher came up before the Herdr server (a reboot)
+            raise sleeper.HerdrError("herdr agent list failed: no herdr server is running", "server_not_running")
+
+    sleeps = run_loop(monkeypatch, tick, 14)
+    log = sleeper.LOGFILE.read_text()
+    assert sum(sleeps) == 14 * 60                    # every retry at the 60 s poll, no exponential backoff
+    assert "backing off" not in log and log.count("herdr server not reachable") == 1
+    assert "herdr server reachable again after 12 tick(s)" in log
+
+
+@pytest.mark.parametrize("exc, down", [
+    (sleeper.HerdrError("x", "server_not_running"), True),
+    (sleeper.SleeperError("herdr agent list failed: Connection refused (os error 61)"), True),
+    (sleeper.SleeperError("herdr agent list failed: No such file or directory (os error 2)"), True),
+    (sleeper.HerdrError("herdr pane get failed", "pane_not_found"), False),
+    (sleeper.SleeperError("herdr agent list timed out after 30.0s"), False),
+])
+def test_server_down_classifies_errors(exc: Exception, down: bool) -> None:
+    assert sleeper.server_down(exc) is down
+
+
+def test_herdr_error_carries_the_code(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    err = json.dumps({"id": "1", "error": {"code": "server_not_running", "message": "no herdr server is running"}})
+    monkeypatch.setattr(sleeper.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(stdout="", stderr=err + "\n", returncode=1))
+    with pytest.raises(sleeper.HerdrError) as info:
+        sleeper.herdr("agent", "list")
+    assert info.value.code == "server_not_running" and sleeper.server_down(info.value)
+    assert sleeper.herdr("agent", "list", check=False) == {}
+
+
+def test_write_json_fsyncs(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        order.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        real_fsync(fd)
+
+    def replace(a: Any, b: Any) -> None:
+        order.append("replace")
+        real_replace(a, b)
+
+    monkeypatch.setattr(sleeper.os, "fsync", fsync)
+    monkeypatch.setattr(sleeper.os, "replace", replace)
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {"uuid": UUID}})
+    assert order == ["file", "replace", "dir"]            # data on disk before it replaces the old file
+    assert sleeper.read_json(sleeper.JOURNAL) == {"w1:p1": {"uuid": UUID}}

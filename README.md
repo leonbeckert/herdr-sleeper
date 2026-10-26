@@ -28,7 +28,10 @@ herdr plugin install djbclark/herdr-sleeper
 
 Requires Herdr ≥ 0.9.1 on macOS or Linux, and Python 3.9 or newer on the
 PATH the Herdr server sees (stdlib only — no packages, no venv; config
-parsing falls back to a built-in TOML subset below Python 3.11).
+parsing falls back to a built-in TOML subset below Python 3.11). Slept panes
+survive a Herdr restart with their stub from Herdr 0.9.2 on (reported resume
+commands) while `session.resume_agents_on_restore` is on, which is the default;
+see *Restarts and reboots*.
 
 For local development:
 
@@ -90,6 +93,49 @@ one whose flags are unknown) and
 **opencode** (`-s <session>`). Codex is deliberately absent — see the
 comment on `PROFILES` in the script.
 
+### Restarts and reboots
+
+Herdr saves a pane's label and a resume command a reporter gave it, not its
+processes and not the reporter's claim. So the claim on a slept pane carries
+the stub's own argv as the pane's resume command
+(`pane report-agent … -- env HERDR_SESSION=… /abs/path/herdr-sleeper stub
+<pane> <session> <state dir>`), and only when the stub was actually typed.
+After a server restart (`herdr update`, a crash, a reboot) Herdr types that
+command into the restored shell, so the pane comes back with its 💤 label
+and its stub, and Enter, focus and `wake` work as before. The next watcher
+tick sees label + new terminal id + our stub for this pane and session,
+claims the pane again (sidebar row, resume command for the next restart) and
+records the new terminal id in the same step (event `reconciled`, outcome
+`reclaimed-after-restart`). A restarted pane without a stub is left alone:
+focus and `wake` start the agent into the bare shell as before. Herdr drops
+the command when the pane is released, which every wake does, or when
+another agent takes the pane. A command Herdr would refuse (an apostrophe in
+a path, a control character, over 64 arguments or 8 KiB; checked locally
+first, mirroring `validate_resume_argv`) or a refusal from Herdr
+(`resume_not_accepted`, `invalid_resume_argv`, an older Herdr) falls back to
+the plain claim and logs `resume-not-reported`; such a pane comes back as a
+shell that wakes on focus. This path is unit-tested against a fake `herdr`;
+whether a real headless server starts the restored command with no client
+attached is still to be checked in a lab (LESSONS.md, 10.4).
+
+Sessions that were awake are Herdr's: it restores them natively as a bare
+`claude --resume <session>`, without the flags they were started with. The
+crash-recovery snapshot keeps the flags of a row whose session comes back
+that way, and a later sleep of that session replays them on wake.
+
+After a reboot the watcher may start before the Herdr server. A tick that
+finds no server (`server_not_running`, or a refused or missing socket) is
+retried every poll interval instead of backing off, and logged once per
+outage. State files are written with an fsync of the file and then of the
+directory, so a power cut does not leave an empty journal.
+
+With `watcher = "external"`, hooks never start a watcher, so nothing would
+notice a service that did not come up. A missing one (no `stop`, and nothing
+holds `watcher.lock`) is therefore reported: a WARN and a `watcher-missing`
+event at server start and, at most once an hour, from any plugin activity; a
+`WARNING:` header in `list` and `presence` (on stderr with `--json`); and a
+short note in the ListAgents hook's context.
+
 ## Use
 
 ```bash
@@ -122,7 +168,8 @@ restarted),
 `wake_refuse_from` (see Messages below), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
-`herdr-sleeper watch` and hooks never spawn one);
+`herdr-sleeper watch` and hooks never spawn one, but report it when it is
+missing);
 overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
@@ -270,7 +317,10 @@ introduces are marked.
    `list` prints its manual resume line. A legacy record with no terminal
    id needs the label as well. A record is dropped only when the *same*
    terminal now runs a different session (a deliberate replacement). The
-   crash-recovery snapshot keeps an orphan copy the same way.
+   crash-recovery snapshot keeps an orphan copy the same way. *v0.1.2:* a
+   restarted pane that runs our stub for this pane and session (brought back
+   by the reported resume command) is re-claimed, and only then is its new
+   terminal id recorded.
 5. Wake refuses if the session id is live in any pane or any process that
    selects it (our own stub is recognised by its argv structure, never by
    substring), when that cannot be verified, when an `exit-requested`
@@ -306,7 +356,9 @@ introduces are marked.
    inheriting the caller's `HERDR_SLEEPER_*` overrides). A recorded watcher
    pid is trusted only when its argv is `… herdr-sleeper watch` and, for a
    v0.1.1 record, it holds `watcher.lock`. One failing pane costs that pane,
-   not the tick.
+   not the tick. *v0.1.2:* no Herdr server is retried at the poll interval,
+   not backed off; a missing external watcher is reported (see *Restarts and
+   reboots*).
 
 Known limits: SIGTERM leaves a small window between the final recheck and
 the process handling it (only a native Herdr operation could close it);
@@ -315,11 +367,14 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 203 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 257 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
-loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
-the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.
-Verified on Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
+loop (idle clocks, backoff, server-down retries, the watcher lock), the
+focus hook, the stub, the resume command and the re-claim after a restart
+(the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
+migration, against a fake `herdr`. v0.1.2 was run on Python 3.9 (Apple's
+`/usr/bin/python3`) and 3.12. The fake does not prove what a real Herdr
+restores; see LESSONS.md, section 10.
 
 ## Credits
 

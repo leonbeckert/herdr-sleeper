@@ -66,6 +66,11 @@ rounds, the live-deployment iteration, and the v0.1.1 review (Fable, Grok):
    resume line. A legacy record with no terminal id needs the label too. A
    record is dropped only when the *same* terminal now runs a different
    session (deliberate). cwd is a wake precondition ("cd back"), not identity.
+   Restart survival: the claim reports the stub's argv as the pane's resume
+   command (only when the stub was typed), so Herdr types the stub back into
+   the restored pane; reconcile then sees label + new terminal + our stub for
+   this pane and session, re-claims the pane and records the new terminal id
+   in the same step. A restarted pane without a stub is left to focus/`wake`.
 5. Wake refuses if the session id is live in any pane or any process that
    selects it (our own stub is matched by argv structure, not substring),
    when that cannot be verified (an empty process list is unknown), when an
@@ -92,6 +97,12 @@ rounds, the live-deployment iteration, and the v0.1.1 review (Fable, Grok):
    + `state_change_seq` + session (wall clock), written before any sleep of
    the tick; anything missing, damaged, or mismatched starts the clock now —
    a later sleep, never an earlier one; `scan` honours the same clocks.
+   No Herdr server (the watcher came up first after a reboot) is not a
+   failure: it is retried every poll interval. With `watcher = "external"`
+   hooks never spawn a watcher, so a missing one is reported instead: WARN
+   and a `watcher-missing` event at startup and (hourly at most) from any
+   plugin activity, a header in `list`/`presence`, a note in the ListAgents
+   hook. State files are fsync'd (file, then directory) before they count.
 
 Ideas adopted from the two community plugins studied before writing this
 (dalogax/herdr-agent-hibernate, prabhatgmp/herdr-park): the SIGTERM exit
@@ -172,6 +183,7 @@ WATCHER_PID = STATE_DIR / "watcher.pid"
 WATCHER_LOCK = STATE_DIR / "watcher.lock"     # held by the one running watcher for its lifetime
 IDLE_FILE = STATE_DIR / "idle.json"            # pane -> {terminal_id, seq, since}: idle clocks across watcher restarts
 STOPPED = STATE_DIR / "stopped"                # `stop` was run: no watcher ticks or respawns until `start`
+WATCHER_MISSING = STATE_DIR / "watcher-missing"  # mtime: when a missing external watcher was last reported
 MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
 DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
 
@@ -225,6 +237,26 @@ class ConfigError(SleeperError):
 
 class DamagedState(SleeperError):
     """The file exists but is not a JSON object — as opposed to an I/O failure reading it."""
+
+
+class HerdrError(SleeperError):
+    """A `herdr` call that failed; `code` is Herdr's error code when it sent one (else None)."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# How a CLI call reads when no server listens on the socket: Herdr's own `server_not_running`
+# error, or the raw connect failure (ENOENT for a missing socket, ECONNREFUSED for a stale one).
+SERVER_DOWN = re.compile(r"server_not_running|ConnectionRefused|Connection refused|NotFound"
+                         r"|\(os error (?:2|61|111)\)")
+
+
+def server_down(exc: BaseException) -> bool:
+    """Did this failure come from a Herdr server that is not running (yet)? After a reboot the
+    watcher can come up before the server; that is worth a retry at the poll interval, not a backoff."""
+    return getattr(exc, "code", None) == "server_not_running" or bool(SERVER_DOWN.search(str(exc)))
 
 
 # ------------------------------------------------------------- agent profiles
@@ -341,11 +373,22 @@ def notify(title: str, body: str = "", enabled: bool = True) -> None:
 # ---------------------------------------------------------------- json state
 
 def write_json(path: Path, data: object) -> None:
+    """Atomic and durable: the temp file reaches the disk before it replaces the old one, and the
+    directory entry after. A power cut or a forced reboot otherwise can leave a zero-length journal,
+    which is the one handle to every slept session."""
     ensure_state_dir()
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    with contextlib.suppress(OSError):  # a directory fsync is best effort (not every filesystem allows it)
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 def quarantine(path: Path) -> Path:
@@ -415,12 +458,14 @@ def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dic
 
     Herdr prints `{"error": {...}}` with exit 0 on failure, so the envelope is
     what we trust, not the exit code. With check=False a failure returns {}.
+    A failure raises HerdrError carrying Herdr's error code when one was sent (on
+    stdout, or as the JSON line newer CLIs print to stderr).
     """
     try:
         proc = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         if check:
-            raise SleeperError(f"herdr {' '.join(args[:2])} timed out after {timeout}s")
+            raise HerdrError(f"herdr {' '.join(args[:2])} timed out after {timeout}s")
         return {}
     except FileNotFoundError:
         raise SleeperError(f"`{HERDR_BIN}` not found (set HERDR_BIN_PATH or fix PATH)")
@@ -434,7 +479,7 @@ def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dic
     if payload is None or "error" in payload or proc.returncode != 0:
         if check:
             detail = (payload or {}).get("error") or proc.stderr.strip() or out[:200] or f"exit {proc.returncode}"
-            raise SleeperError(f"herdr {' '.join(args[:2])} failed: {detail}")
+            raise HerdrError(f"herdr {' '.join(args[:2])} failed: {detail}", error_code(payload, proc.stderr))
         return {}
     result = payload.get("result")
     if not isinstance(result, dict):
@@ -442,6 +487,21 @@ def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dic
             raise SleeperError(f"herdr {' '.join(args[:2])}: malformed envelope (result is {type(result).__name__})")
         return {}
     return result
+
+
+def error_code(payload: dict | None, stderr: str) -> str | None:
+    """Herdr's error code from a failed call: the stdout envelope, else a JSON line on stderr."""
+    candidates = [payload] if payload else []
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            with contextlib.suppress(ValueError):
+                candidates.append(json.loads(line))
+    for c in candidates:
+        err = c.get("error") if isinstance(c, dict) else None
+        if isinstance(err, dict) and isinstance(err.get("code"), str):
+            return err["code"]
+    return None
 
 
 def herdr_screen(pane: str) -> str | None:
@@ -1310,11 +1370,30 @@ def snapshot_argv(kind: str, argv: object) -> list[str] | None:
     return replayable_argv([str(a) for a in argv])[0]
 
 
+def native_resume(argv: list[str] | None, uuid: str) -> bool:
+    """Is this the argv Herdr's own restore starts a session with (`claude --resume <uuid>`, nothing
+    else)? Native restore drops every flag the session was started with; the snapshot still has them."""
+    return argv == ["--resume", uuid]
+
+
+def snapshot_flags(pane: str, uuid: str) -> list[str] | None:
+    """The replayable flags panes.json holds for this pane and session, or None (no row, another
+    session, flags unknown, unreadable snapshot)."""
+    try:
+        row = read_json(SNAPSHOT).get(pane)
+    except SleeperError:
+        return None
+    if not isinstance(row, dict) or row.get("uuid") != uuid or not isinstance(row.get("argv"), list):
+        return None
+    return replayable_argv([str(a) for a in row["argv"]])[0]
+
+
 def merge_snapshot(agents: list[dict]) -> None:
     """pane→uuid→argv for every supported pane, merged so that panes currently asleep keep their handle.
 
     A pane now running a different session retires the old row: dropped when it is the same
     terminal (a deliberate replacement), kept under an `orphan:` key when the pane id was reused.
+    A session Herdr restored natively (bare `--resume <uuid>`) keeps the flags the row already had.
     """
     snap = read_json(SNAPSHOT)
     live = {a["pane_id"]: a for a in agents}
@@ -1339,6 +1418,8 @@ def merge_snapshot(agents: list[dict]) -> None:
         present, argv, _pid = agent_process(a["pane_id"], kind)
         if argv is None and present is None and prior.get("uuid") == uuid:
             argv = prior.get("argv")  # process-info hiccup: keep what we knew rather than erase it
+        elif native_resume(argv, uuid) and prior.get("uuid") == uuid and isinstance(prior.get("argv"), list):
+            argv = prior["argv"]  # Herdr restored it as a bare `--resume`: the flags it ran with are still ours
         argv = snapshot_argv(kind, argv)
         snap[a["pane_id"]] = {
             "kind": kind, "uuid": uuid, "name": a.get("name"), "cwd": a.get("cwd"),
@@ -1441,14 +1522,58 @@ def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
 
 # ----------------------------------------------------------------- sidebar
 
-def claim(pane: str, kind: str, done: bool = False) -> bool:
+RESUME_MAX_ARGS = 64          # Herdr's validate_resume_argv (src/agent_resume.rs:58), mirrored
+RESUME_MAX_BYTES = 8192
+RESUME_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")   # Rust char::is_control: the Cc category
+PLAIN_COMMAND = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def resume_argv_problem(argv: list[str]) -> str | None:
+    """Why Herdr would refuse this as a reported resume command, or None. Checked before sending,
+    so a refusal is logged with its reason instead of costing a round trip and the claim."""
+    if not argv:
+        return "empty"
+    if len(argv) > RESUME_MAX_ARGS:
+        return f"more than {RESUME_MAX_ARGS} arguments"
+    if sum(len(a.encode()) for a in argv) > RESUME_MAX_BYTES:
+        return f"more than {RESUME_MAX_BYTES} bytes"
+    if any(RESUME_CONTROL.search(a) for a in argv):
+        return "control characters"
+    if any("'" in a for a in argv):
+        return "an apostrophe (Herdr quotes POSIX-style)"
+    if not PLAIN_COMMAND.fullmatch(argv[0]) or argv[0].startswith("-"):
+        return "the first element is not a plain command name"
+    return None
+
+
+def claim(pane: str, kind: str, done: bool = False, resume: list[str] | None = None) -> bool:
     """Keep the slept pane's sidebar row: report a placeholder agent we own. Best effort.
 
     `done` (finished, unviewed) is carried into the label so sleeping does not hide that cue.
+    `resume`: the wake stub's argv (stub_argv), passed only when the stub runs in the pane. Herdr
+    saves a reported resume command with the pane and types it into the restored shell after a
+    server restart, so the stub comes back with the pane; it drops the command when we release the
+    pane (every wake does) or another agent takes it. A command Herdr would refuse, or a refusal
+    (`resume_not_accepted`, `invalid_resume_argv`, a pre-0.9.2 Herdr), falls back to the plain claim
+    and logs `resume-not-reported`: the pane then comes back as a shell that wakes on focus.
     """
+    report = ("pane", "report-agent", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT, "--state", "unknown")
     with contextlib.suppress(SleeperError):
-        herdr("pane", "report-agent", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT,
-              "--state", "unknown", check=False)
+        sent = False
+        if resume:
+            why = resume_argv_problem(resume)
+            if why is None:
+                try:
+                    herdr(*report, "--", *resume)
+                    sent = True
+                except SleeperError as exc:
+                    why = f"{getattr(exc, 'code', None) or 'error'}: {exc}"
+            if not sent:
+                say(f"WARN {pane}: resume command not reported ({why}); after a Herdr restart the pane comes "
+                    "back as a shell that wakes on focus")
+                event("resume-not-reported", pane=pane, reason=why[:200])
+        if not sent:
+            herdr(*report, check=False)
         herdr("pane", "report-metadata", pane, "--source", "herdr-sleeper",
               "--display-agent", f"{kind} · sleeping" + (" · done" if done else ""), check=False)
         return herdr("pane", "get", pane, check=False).get("pane", {}).get("agent") == CLAIM_AGENT
@@ -1506,6 +1631,9 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         replay, why = replayable_argv(raw_argv)
         if replay is None:
             return False, why or "argv not replayable"
+        if native_resume(raw_argv, uuid):
+            # restored by Herdr after a restart with no flags; wake it with the ones it was started with
+            replay = snapshot_flags(pane, uuid) or replay
 
     journal = read_json(JOURNAL)
     held = journal.get(pane)
@@ -1635,7 +1763,9 @@ def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours
         say(f"WARN {pane}: the pane's foreground is not its shell after the exit; asleep without a wake stub")
     herdr("pane", "rename", pane, SLEEP_MARK + (label or entry["title"] or name), check=False)
     time.sleep(2)  # herdr takes ~2s to drop the exited agent's session; the claim is ignored before that
-    claim(pane, kind, done=entry["status"] == "done")
+    # the stub's argv goes along as the pane's resume command only when it was typed: a restart
+    # must not start a stub in a pane that never had one (focus and `wake` cover those)
+    claim(pane, kind, done=entry["status"] == "done", resume=stub_argv(pane, uuid) if at_shell else None)
     event("slept", pane=pane, name=name, uuid=uuid, kind=kind, title=entry["title"], cwd=entry["cwd"],
           freed_mb=freed_mb or None, how=how, stub=at_shell, helpers_stopped=reaped or None)
     notify(f"{SLEEP_MARK}slept {name}", f"freed ~{freed_mb} MB · wake: focus the pane, press Enter, or "
@@ -1654,22 +1784,31 @@ def stub_command(pane: str, uuid: str, slept_at: str) -> str:
     out: the CLI routes by HERDR_SOCKET_PATH (src/session.rs), and an inherited client
     socket could belong to an outer session.
     """
-    env_args = [f"{var}={os.environ[var]}" for var in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH") if os.environ.get(var)]
-    env_args.append(f"HERDR_SESSION={SESSION}")
     banner = SLEEP_MARK + "slept by herdr-sleeper " + slept_at
     return (f"printf '{MODE_RESET_PRINTF}'; clear; printf '%s\\n' {shlex.quote(banner)}; "
-            + shlex.join(["env", *env_args, str(SELF), "stub", pane, uuid, str(STATE_DIR)]))
+            + shlex.join(stub_argv(pane, uuid)))
+
+
+def stub_argv(pane: str, uuid: str) -> list[str]:
+    """The wake stub as an argv: what stub_command types, and the resume command claim reports to
+    Herdr so a restart brings the stub back. `env` comes first because Herdr's restore wants a
+    plain command name there; the script stays an absolute path behind it (a PATH lookup could find
+    another copy, and stub_argv_index matches the script by its basename either way)."""
+    env_args = [f"{var}={os.environ[var]}" for var in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH") if os.environ.get(var)]
+    env_args.append(f"HERDR_SESSION={SESSION}")
+    return ["env", *env_args, str(SELF), "stub", pane, uuid, str(STATE_DIR)]
 
 
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
-    global MAILBOX, DELIVERED
+    global MAILBOX, DELIVERED, WATCHER_MISSING
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
     WATCHER_LOCK, IDLE_FILE, STOPPED = STATE_DIR / "watcher.lock", STATE_DIR / "idle.json", STATE_DIR / "stopped"
     MAILBOX, DELIVERED = STATE_DIR / "mailbox", STATE_DIR / "delivered.json"
+    WATCHER_MISSING = STATE_DIR / "watcher-missing"
 
 
 def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
@@ -2448,6 +2587,8 @@ def presence_rows() -> list[dict]:
 
 def cmd_presence(args: argparse.Namespace) -> int:
     rows = presence_rows()
+    if watcher_missing():  # on stderr for --json, so the JSON stays parseable
+        print(f"WARNING: {WATCHER_MISSING_TEXT}", file=sys.stderr if args.json else sys.stdout)
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
@@ -2505,13 +2646,19 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
         hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
         if hook_event == "PostToolUse" and tool == "ListAgents":
             asleep = [r for r in presence_rows() if r["state"] == "asleep"]
-            if not asleep:
+            missing = watcher_missing()
+            if not asleep and not missing:
                 return 0
-            lines = [f"- {r.get('claude_name') or r['name']} · {r['cwd'] or '?'} · asleep since {r['slept_at'] or '?'}"
-                     for r in asleep]
-            context = ("Sleeping sessions on this machine (unloaded by herdr-sleeper to save memory; not in the "
-                       "list above). SendMessage to one of these names wakes it and delivers the message:\n"
-                       + "\n".join(lines))
+            context = ""
+            if asleep:
+                lines = [f"- {r.get('claude_name') or r['name']} · {r['cwd'] or '?'} · asleep since "
+                         f"{r['slept_at'] or '?'}" for r in asleep]
+                context = ("Sleeping sessions on this machine (unloaded by herdr-sleeper to save memory; not in the "
+                           "list above). SendMessage to one of these names wakes it and delivers the message:\n"
+                           + "\n".join(lines))
+            if missing:
+                context += (("\n" if context else "") + "Note: herdr-sleeper's watcher is not running, so messages "
+                            "queued for busy sessions are not delivered until it is back; tell the owner.")
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
             return 0
         if hook_event == "PreToolUse" and tool == "SendMessage":
@@ -2581,7 +2728,8 @@ def flush_mail(agents: list[dict]) -> None:
 # --------------------------------------------------------------- reconcile
 
 def reconcile(agents: list[dict]) -> None:
-    """Settle `exit-requested` entries, displaced sessions, reused pane ids, and panes that moved."""
+    """Settle `exit-requested` entries, displaced sessions, reused pane ids, and panes that moved;
+    re-claim a slept pane that a Herdr restart brought back with its stub running."""
     journal = read_json(JOURNAL)
     by_pane = {a["pane_id"]: a for a in agents if a.get("agent")}  # a listed pane with no agent is not live
     panes = {}
@@ -2653,6 +2801,25 @@ def reconcile(agents: list[dict]) -> None:
             entry.pop("seen_running", None)
             event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="asleep")
             changed = True
+        elif ((not live or live.get("agent") == CLAIM_AGENT) and entry.get("phase", "asleep") == "asleep"
+              and entry.get("stub") is not False and pane in panes and identity(entry, panes[pane]) == "restarted"
+              and stub_running(pane, entry["uuid"]) is True):
+            # A Herdr restart: the pane kept our 💤 label and Herdr typed the stub back in from the
+            # resume command we reported, but the claim (hook authority) is not restored (should Herdr
+            # list the restored pane under our placeholder anyway, claiming again does no harm). Our stub
+            # for this pane and session in the foreground is the proof the pane is ours, so claim it
+            # again (sidebar row, resume command for the next restart) and record the new terminal
+            # in the same step — never one without the other (LESSONS 2.3).
+            new_terminal = panes[pane].get("terminal_id")
+            if claim(pane, kind, done=entry.get("status") == "done", resume=stub_argv(pane, entry["uuid"])):
+                say(f"reconcile {pane}: re-claimed after a Herdr restart (terminal {entry['terminal_id']} -> "
+                    f"{new_terminal}, stub running)")
+                event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"],
+                      outcome="reclaimed-after-restart", terminal_id=new_terminal)
+                entry["terminal_id"] = new_terminal
+                changed = True
+            else:
+                note_skip(pane, "could not re-claim the pane after a Herdr restart; the next tick retries")
         elif not live and entry.get("terminal_id"):
             # pane gone or moved: follow a terminal that still exists under a new pane id, else keep the handle
             moved = next((p for p, info in panes.items() if info.get("terminal_id") == entry["terminal_id"]
@@ -2777,17 +2944,49 @@ def ensure_watcher(replace_changed: bool = True, heal: bool = False) -> str:
     return f"watcher spawned (pid {child.pid})"
 
 
+WATCHER_MISSING_EVERY_SECONDS = 3600
+WATCHER_MISSING_TEXT = ("the external herdr-sleeper watcher is not running (nothing holds watcher.lock): "
+                        "nothing is slept or reconciled and mail to busy agents waits; check its service")
+
+
+def watcher_missing() -> bool:
+    """A service manager owns the watcher (`watcher = "external"`), `stop` was not run, and no
+    watcher holds the lock. Hooks never spawn one in that mode, so without this nothing would say
+    so: sleeping, reconcile and mail flushing just stop."""
+    try:
+        return watcher_mode() == "external" and not STOPPED.exists() and not watcher_lock_held()
+    except Exception:
+        return False  # a check for a notice must never fail its caller
+
+
+def report_watcher_missing(via: str, rate_limited: bool = True) -> None:
+    """Log a WARN and a `watcher-missing` event; rate_limited: at most once an hour (WATCHER_MISSING's mtime)."""
+    with contextlib.suppress(OSError):
+        if rate_limited and time.time() - WATCHER_MISSING.stat().st_mtime < WATCHER_MISSING_EVERY_SECONDS:
+            return
+    say(f"WARN {WATCHER_MISSING_TEXT}")
+    event("watcher-missing", via=via)
+    with contextlib.suppress(OSError):
+        ensure_state_dir()
+        os.close(open_private(WATCHER_MISSING, os.O_WRONLY))
+        os.utime(WATCHER_MISSING)
+
+
 def heal_watcher() -> None:
     """Called from every plugin activity: respawn a missing watcher. Never fails the caller.
 
     A healed watcher does not inherit HERDR_SLEEPER_* overrides from whatever invoked the
     command (a test's `HERDR_SLEEPER_IDLE=0s` must not become the service's window). A
     pre-watcher.lock watcher (v0.1.0) is replaced, so a plugin update takes effect on the
-    next focus, not the next server start.
+    next focus, not the next server start. An externally supervised watcher is never spawned
+    here; a missing one is reported (rate limited) instead.
     """
     try:
         if watcher_lock_held() or STOPPED.exists():
             return  # a v0.1.1+ watcher runs (code changes are startup's business), or `stop` was meant
+        if watcher_missing():
+            report_watcher_missing("heal")
+            return
         # nothing holds the lock: no watcher, or one older than watcher.lock (v0.1.0), whose recorded
         # stamp differs — replaced the way startup does it (SIGTERM, wait), not left running old code
         msg = ensure_watcher(replace_changed=True, heal=True)
@@ -3096,6 +3295,7 @@ def watch_loop() -> None:
         say(f"watcher start session={SESSION}")
         clocks = load_clocks()
         failures = 0
+        down = 0  # consecutive ticks that found no Herdr server (after a reboot the watcher may be first)
         while not STOP["requested"]:
             if STOPPED.exists():
                 say("watcher stopped by `stop`; idling until `start`")
@@ -3115,13 +3315,26 @@ def watch_loop() -> None:
                 continue
             try:
                 watch_tick(clocks, config)
-                if failures:
+                if down:
+                    say(f"herdr server reachable again after {down} tick(s)")
+                elif failures:
                     say(f"tick recovered after {failures} failure(s)")
-                failures = 0
+                failures = down = 0
             except SleeperError as exc:
+                if server_down(exc):
+                    # not a failure to back off from: retry at the poll interval so the watcher
+                    # catches up as soon as the server is up (logged once per outage)
+                    if not down:
+                        say(f"herdr server not reachable ({exc}); retrying every {poll:g}s")
+                    down += 1
+                    failures = 0
+                    pause(poll)
+                    continue
+                down = 0
                 failures += 1
                 say(f"tick-error: {exc}")
             except Exception as exc:  # a bug must cost one tick, never the service
+                down = 0
                 failures += 1
                 where = " | ".join(traceback.format_exc().strip().splitlines()[-3:-1])
                 say(f"tick-error: {type(exc).__name__}: {exc} ({where})")
@@ -3290,6 +3503,8 @@ def cmd_startup() -> int:
     migrate_legacy()
     migrate_legacy_config()
     print(ensure_watcher())
+    if watcher_missing():  # at server start the service should be up already: say so every time
+        report_watcher_missing("startup", rate_limited=False)
     return 0
 
 
@@ -3427,6 +3642,8 @@ def cmd_uninstall(_args: argparse.Namespace) -> int:
 
 def cmd_list(_args: argparse.Namespace) -> int:
     heal_watcher()
+    if watcher_missing():
+        print(f"WARNING: {WATCHER_MISSING_TEXT}")
     try:
         journal = read_json(JOURNAL)
     except DamagedState as exc:
