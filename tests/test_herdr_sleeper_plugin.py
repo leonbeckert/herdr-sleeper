@@ -233,9 +233,11 @@ class FakeHerdr:
                 self.resumes[args[2]] = resume
             return {}
         if args[:2] == ("pane", "release-agent"):
-            self.resumes.pop(args[2], None)   # Herdr forgets the releasing reporter's resume command
             a = by_pane[args[2]]
             if a.get("agent") == sleeper.CLAIM_AGENT:
+                # Herdr forgets the releasing reporter's resume command, but only from a holder: a
+                # release with no claim (none survives a restart) leaves the saved command (lab, v0.9.5)
+                self.resumes.pop(args[2], None)
                 a.pop("agent", None)
             return {}
         if args[:2] in (("pane", "run"), ("pane", "rename"), ("pane", "report-metadata"),
@@ -2705,6 +2707,9 @@ def test_server_down_retries_at_poll_interval(fake: FakeHerdr, monkeypatch: pyte
 
 @pytest.mark.parametrize("exc, down", [
     (sleeper.HerdrError("x", "server_not_running"), True),
+    (sleeper.HerdrError("x", "server_unavailable"), True),     # lab: a tick during `server stop`
+    (sleeper.SleeperError('herdr agent list failed: {"error":{"code":"server_unavailable",'
+                          '"message":"server is shutting down"}}'), True),
     (sleeper.SleeperError("herdr agent list failed: Connection refused (os error 61)"), True),
     (sleeper.SleeperError("herdr agent list failed: No such file or directory (os error 2)"), True),
     (sleeper.HerdrError("herdr pane get failed", "pane_not_found"), False),
@@ -2741,3 +2746,153 @@ def test_write_json_fsyncs(state: Path, monkeypatch: pytest.MonkeyPatch) -> None
     sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {"uuid": UUID}})
     assert order == ["file", "replace", "dir"]            # data on disk before it replaces the old file
     assert sleeper.read_json(sleeper.JOURNAL) == {"w1:p1": {"uuid": UUID}}
+
+
+# ------------------------------------------- the real CLI's output shapes (lab finding, v0.1.2)
+
+class CliShape:
+    """subprocess.run as the real Herdr v0.9.5 CLI answers: `send_ok_request` commands (report-agent,
+    release-agent, report-metadata, send-keys …) print nothing and exit 0 on success, or print the
+    error JSON on stderr and exit 1; everything else prints a `{"result": …}` envelope."""
+
+    def __init__(self, reject_resume: str | None = None) -> None:
+        self.reject_resume = reject_resume
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd: list[str], **_kw: Any) -> types.SimpleNamespace:
+        args = list(cmd[1:])
+        self.calls.append(args)
+        if tuple(args[:2]) in sleeper.OK_ONLY_COMMANDS:
+            if args[:2] == ["pane", "report-agent"] and "--" in args and self.reject_resume:
+                err = json.dumps({"id": "cli:request", "error": {"code": self.reject_resume, "message": "no"}})
+                return types.SimpleNamespace(stdout="", stderr=err + "\n", returncode=1)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        if args[:2] == ["pane", "get"]:
+            envelope = {"id": "cli:pane:get",
+                        "result": {"type": "pane_info", "pane": {"pane_id": args[2], "agent": sleeper.CLAIM_AGENT}}}
+            return types.SimpleNamespace(stdout=json.dumps(envelope) + "\n", stderr="", returncode=0)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+
+RESUME = ["env", "HERDR_SESSION=default", "/x/herdr-sleeper", "stub", "w1:p1", UUID]
+REPORT = ("pane", "report-agent", "w1:p1", "--source", "x", "--agent", "y", "--state", "unknown")
+
+
+def test_ok_only_commands_succeed_without_output(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper.subprocess, "run", CliShape())
+    assert sleeper.herdr(*REPORT, "--", *RESUME) == {}
+    assert sleeper.herdr("pane", "release-agent", "w1:p1", "--source", "x", "--agent", "y") == {}
+    with pytest.raises(sleeper.SleeperError):   # a command that answers with an envelope still needs one
+        sleeper.herdr("agent", "list")
+
+
+def test_ok_only_command_error_on_stderr_raises_with_code(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper.subprocess, "run", CliShape(reject_resume="resume_not_accepted"))
+    with pytest.raises(sleeper.HerdrError) as info:
+        sleeper.herdr(*REPORT, "--", *RESUME)
+    assert info.value.code == "resume_not_accepted"
+
+
+def test_claim_reports_resume_against_the_real_cli_shape(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lab, Herdr v0.9.5: the resume report succeeded but was logged `resume-not-reported` (exit 0 with
+    no stdout read as a failure), and the claim was sent a second time without it."""
+    cli = CliShape()
+    monkeypatch.setattr(sleeper.subprocess, "run", cli)
+    assert sleeper.claim("w1:p1", "claude", resume=RESUME)
+    reports = [c for c in cli.calls if c[:2] == ["pane", "report-agent"]]
+    assert len(reports) == 1 and reports[0][reports[0].index("--") + 1:] == RESUME
+    assert "resume-not-reported" not in events()
+
+
+def test_claim_falls_back_on_a_refusal_from_the_real_cli(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = CliShape(reject_resume="resume_not_accepted")
+    monkeypatch.setattr(sleeper.subprocess, "run", cli)
+    assert sleeper.claim("w1:p1", "claude", resume=RESUME)
+    reports = [c for c in cli.calls if c[:2] == ["pane", "report-agent"]]
+    assert len(reports) == 2 and "--" in reports[0] and "--" not in reports[1]
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if "resume-not-reported" in l][-1]
+    assert rec["reason"].startswith("resume_not_accepted")
+
+
+def test_reconcile_labels_and_claims_a_late_exit(fake: FakeHerdr) -> None:
+    """Lab, Herdr v0.9.5: an agent that took longer than EXIT_WAIT_SECONDS to leave was settled to
+    `asleep` with no 💤 label and no claim, so the next Herdr restart orphaned its own pane."""
+    fake.exit_leaves_agent = False
+    fake.agents[0]["label"] = "mylabel"
+    sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    assert journal()["w1:p1"]["phase"] == "exit-requested" and fake.agents[0]["label"] == "mylabel"
+    fake.agents[0].pop("agent"); fake.agents[0].pop("agent_session")
+    sleeper.reconcile(fake.agents)
+    j = journal()["w1:p1"]
+    assert j["phase"] == "asleep" and j["stub"] is False
+    assert fake.agents[0]["label"] == "💤 mylabel" and fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+    assert fake.resumes == {}                       # no stub in the pane, so nothing for a restart to start
+    fake.restart()
+    assert sleeper.identity(journal()["w1:p1"], fake.agents[0]) == "restarted"   # not "reused"
+    sleeper.reconcile(fake.agents)
+    assert not any(k.startswith("orphan:") for k in journal())
+    assert sleeper.wake_entry(journal()["w1:p1"]) is True                        # focus/`wake` start it
+
+
+def test_reconcile_does_not_label_a_late_exit_in_another_terminal(fake: FakeHerdr) -> None:
+    fake.exit_leaves_agent = False
+    sleeper.sleep_agent(agent(), 12, set(), dry_run=False)
+    fake.agents[0].pop("agent"); fake.agents[0].pop("agent_session")
+    fake.agents[0]["terminal_id"] = "term-other"    # the pane id now names another terminal
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)
+    assert not any(c[:2] in (("pane", "rename"), ("pane", "report-agent")) for c in fake.calls[n:])
+
+
+def test_reconcile_clears_the_label_when_herdr_resumed_the_session(fake: FakeHerdr) -> None:
+    """Lab, Herdr v0.9.5: a pane slept without a stub keeps Herdr's own claude resume plan, so a
+    restart brings the session back awake under the 💤 label; dropping the row must clear the label."""
+    fake.agents[0]["label"] = "mylabel"
+    fake.foreground = "sleep"                     # the shell never came back after the exit: no stub
+    assert sleeper.sleep_agent(agent(), 12, set(), dry_run=False)[0]
+    assert journal()["w1:p1"]["stub"] is False and fake.agents[0]["label"] == "💤 mylabel"
+    fake.agents[0].update(agent="claude", agent_session={"value": UUID}, terminal_id="term-1-r")  # native resume
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["seen_running"] == 1 and fake.agents[0]["label"] == "💤 mylabel"
+    sleeper.reconcile(fake.agents)
+    assert journal() == {} and fake.agents[0]["label"] == "mylabel"
+
+
+def test_orphaned_restarted_stub_drops_its_resume_command(fake: FakeHerdr) -> None:
+    """Lab, Herdr v0.9.5: a slept pane whose 💤 label was removed comes back from a restart with our
+    stub (the reported resume command) but no label: orphaned, and the stale command is dropped so
+    the next restart does not type a stub for an orphan again."""
+    slept_entry(fake)
+    fake.agents[0]["label"] = None                # the owner renamed the pane
+    fake.restart()
+    assert fake.stub_panes == {"w1:p1"} and "w1:p1" in fake.resumes
+    sleeper.reconcile(fake.agents)
+    assert list(journal()) == ["orphan:" + UUID[:8]] and fake.resumes == {}
+    assert "agent" not in fake.agents[0]          # claimed only to release it
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)                # orphans are by hand only: nothing more happens
+    assert not any(c[:2] in (("pane", "report-agent"), ("pane", "release-agent")) for c in fake.calls[n:])
+
+
+def test_orphaned_pane_drops_the_resume_even_when_the_stub_already_left(fake: FakeHerdr) -> None:
+    """Lab race: the watcher orphaned the row before the restored stub read the journal; the stub
+    found no row and left a shell, but Herdr still had the command saved for the next restart."""
+    slept_entry(fake)
+    fake.agents[0]["label"] = None
+    fake.restart()
+    fake.stub_panes.clear()                       # the stub already exited back to the shell
+    assert "w1:p1" in fake.resumes
+    sleeper.reconcile(fake.agents)
+    assert list(journal()) == ["orphan:" + UUID[:8]] and fake.resumes == {}
+
+
+def test_orphan_slept_without_a_stub_is_not_claimed(fake: FakeHerdr) -> None:
+    fake.foreground = "sleep"                     # no stub, so no resume command was ever reported
+    slept_entry(fake)
+    fake.foreground = None
+    fake.agents[0]["label"] = None
+    fake.restart()
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)
+    assert list(journal()) == ["orphan:" + UUID[:8]]
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])

@@ -114,9 +114,20 @@ a path, a control character, over 64 arguments or 8 KiB; checked locally
 first, mirroring `validate_resume_argv`) or a refusal from Herdr
 (`resume_not_accepted`, `invalid_resume_argv`, an older Herdr) falls back to
 the plain claim and logs `resume-not-reported`; such a pane comes back as a
-shell that wakes on focus. This path is unit-tested against a fake `herdr`;
-whether a real headless server starts the restored command with no client
-attached is still to be checked in a lab (LESSONS.md, 10.4).
+shell that wakes on focus. A lab against a real, headless Herdr 0.9.5 server
+(no client attached) confirmed all of this: the stub comes back after a
+restart, the next tick re-claims the pane with its new terminal id, and Enter
+(before or after that tick), focus and `wake` resume the same session, after
+which Herdr's saved plan for the pane is Claude's own again (LESSONS.md, 10.9).
+
+A slept pane whose 💤 label was removed before a restart is orphaned (by hand
+only), even though Herdr types the stub back in; reconcile then claims and
+releases the pane, which drops the saved command, so later restarts type
+nothing there. A pane slept without a stub because its shell did not come back
+after the exit keeps Herdr's own Claude session: a restart resumes it awake,
+and reconcile drops the row and the 💤 label once it sees the session running
+twice. A late exit (the agent left after the exit wait) is labelled and claimed
+when reconcile settles it, so a restart does not orphan it.
 
 Sessions that were awake are Herdr's: it restores them natively as a bare
 `claude --resume <session>`, without the flags they were started with. The
@@ -124,7 +135,8 @@ crash-recovery snapshot keeps the flags of a row whose session comes back
 that way, and a later sleep of that session replays them on wake.
 
 After a reboot the watcher may start before the Herdr server. A tick that
-finds no server (`server_not_running`, or a refused or missing socket) is
+finds no server (`server_not_running`, `server_unavailable` while it shuts
+down, or a refused or missing socket) is
 retried every poll interval instead of backing off, and logged once per
 outage. State files are written with an fsync of the file and then of the
 directory, so a power cut does not leave an empty journal.
@@ -320,7 +332,9 @@ introduces are marked.
    crash-recovery snapshot keeps an orphan copy the same way. *v0.1.2:* a
    restarted pane that runs our stub for this pane and session (brought back
    by the reported resume command) is re-claimed, and only then is its new
-   terminal id recorded.
+   terminal id recorded; a row orphaned after a restart has its saved resume
+   command dropped (claim, then release), so no later restart types a stub
+   for it.
 5. Wake refuses if the session id is live in any pane or any process that
    selects it (our own stub is recognised by its argv structure, never by
    substring), when that cannot be verified, when an `exit-requested`
@@ -367,14 +381,15 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 257 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 269 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
-migration, against a fake `herdr`. v0.1.2 was run on Python 3.9 (Apple's
+migration, against a fake `herdr`, and the CLI's real output shapes (the
+"ok" calls answer success with nothing). v0.1.2 was run on Python 3.9 (Apple's
 `/usr/bin/python3`) and 3.12. The fake does not prove what a real Herdr
-restores; see LESSONS.md, section 10.
+restores; the lab in LESSONS.md, 10.9 does.
 
 ## Credits
 

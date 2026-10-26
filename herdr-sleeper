@@ -248,15 +248,17 @@ class HerdrError(SleeperError):
 
 
 # How a CLI call reads when no server listens on the socket: Herdr's own `server_not_running`
-# error, or the raw connect failure (ENOENT for a missing socket, ECONNREFUSED for a stale one).
-SERVER_DOWN = re.compile(r"server_not_running|ConnectionRefused|Connection refused|NotFound"
+# error, `server_unavailable` while it shuts down (seen in the lab when the watcher ticked during a
+# `server stop`), or the raw connect failure (ENOENT for a missing socket, ECONNREFUSED for a stale one).
+SERVER_DOWN_CODES = ("server_not_running", "server_unavailable")
+SERVER_DOWN = re.compile(r"server_not_running|server_unavailable|ConnectionRefused|Connection refused|NotFound"
                          r"|\(os error (?:2|61|111)\)")
 
 
 def server_down(exc: BaseException) -> bool:
     """Did this failure come from a Herdr server that is not running (yet)? After a reboot the
     watcher can come up before the server; that is worth a retry at the poll interval, not a backoff."""
-    return getattr(exc, "code", None) == "server_not_running" or bool(SERVER_DOWN.search(str(exc)))
+    return getattr(exc, "code", None) in SERVER_DOWN_CODES or bool(SERVER_DOWN.search(str(exc)))
 
 
 # ------------------------------------------------------------- agent profiles
@@ -453,13 +455,21 @@ class locked:
 
 # --------------------------------------------------------------- herdr calls
 
+# Commands the CLI answers with nothing on success: exit 0 and empty stdout, or the error JSON on
+# stderr and exit 1 (Herdr v0.9.5 src/cli.rs send_ok_request). No envelope is not a failure for these.
+OK_ONLY_COMMANDS = {("pane", "report-agent"), ("pane", "report-agent-session"), ("pane", "release-agent"),
+                    ("pane", "report-metadata"), ("pane", "send-keys"), ("pane", "send-text"),
+                    ("server", "stop"), ("workspace", "report-metadata")}
+
+
 def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dict:
     """Run a `herdr` CLI command and return its parsed JSON `result`.
 
     Herdr prints `{"error": {...}}` with exit 0 on failure, so the envelope is
     what we trust, not the exit code. With check=False a failure returns {}.
     A failure raises HerdrError carrying Herdr's error code when one was sent (on
-    stdout, or as the JSON line newer CLIs print to stderr).
+    stdout, or as the JSON line newer CLIs print to stderr). An OK_ONLY_COMMANDS
+    call succeeds (returns {}) on exit 0 with nothing on stdout and no error on stderr.
     """
     try:
         proc = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True, timeout=timeout)
@@ -470,6 +480,9 @@ def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dic
     except FileNotFoundError:
         raise SleeperError(f"`{HERDR_BIN}` not found (set HERDR_BIN_PATH or fix PATH)")
     out = proc.stdout.strip()
+    if (tuple(args[:2]) in OK_ONLY_COMMANDS and proc.returncode == 0 and not out
+            and error_code(None, proc.stderr) is None):
+        return {}
     payload: dict | None = None
     if out.startswith("{"):
         try:
@@ -2779,6 +2792,11 @@ def reconcile(agents: list[dict]) -> None:
                 continue
             say(f"reconcile {pane}: session {entry['uuid']} is running again (seen twice); dropping journal entry")
             event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="running")
+            shown = panes.get(pane) or {}  # `agent list` rows carry no label; `pane list` rows do
+            if carries_sleep_label(shown):
+                # e.g. Herdr resumed it natively after a restart (a pane slept without a stub keeps
+                # Herdr's own resume plan): the session is awake, so the 💤 label must go
+                restore_label(pane, entry, shown.get("label"))
             journal.pop(pane)
             changed = True
         elif live and live_uuid and live_uuid != entry["uuid"] and (entry.get("wake_got") or entry.get("wake_pending")):
@@ -2799,6 +2817,16 @@ def reconcile(agents: list[dict]) -> None:
         elif entry.get("phase") == "exit-requested" and not live and agent_process(pane, kind)[0] is False:
             entry["phase"] = "asleep"
             entry.pop("seen_running", None)
+            if pane in panes and identity(entry, panes[pane]) == "same":
+                # The sleep transaction stopped waiting for the exit before it could label and claim the
+                # pane. Without the 💤 label a Herdr restart would make this pane look reused (orphaned),
+                # so finish that part now: no stub (focus and `wake` start the agent into the shell),
+                # hence no resume command either.
+                entry["stub"] = False
+                if not carries_sleep_label(panes[pane]):
+                    herdr("pane", "rename", pane, SLEEP_MARK + (entry.get("label") or entry.get("title")
+                                                                or wake_name(entry)), check=False)
+                claim(pane, kind, done=entry.get("status") == "done")
             event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="asleep")
             changed = True
         elif ((not live or live.get("agent") == CLAIM_AGENT) and entry.get("phase", "asleep") == "asleep"
@@ -2833,6 +2861,15 @@ def reconcile(agents: list[dict]) -> None:
                 orphan_entry(journal, pane, f"pane id now belongs to terminal {panes[pane].get('terminal_id')} "
                                             f"in {panes[pane].get('cwd')}")
                 changed = True
+                if entry.get("stub") is not False:
+                    # A slept pane with a stub may have our resume command saved: a restart then types the
+                    # stub back in (or did already; it finds no row now and leaves a shell), but without
+                    # the 💤 label the row is an orphan (by hand only). Herdr keeps that command across
+                    # restarts and drops it only on a release by its holder, so claim and release (no agent
+                    # runs here, `live` is empty): the next restart must not type a stub here again.
+                    claim(pane, kind)
+                    release(pane)
+                    say(f"reconcile {pane}: dropped our resume command from the orphaned pane")
     if changed:
         write_json(JOURNAL, journal)
 
