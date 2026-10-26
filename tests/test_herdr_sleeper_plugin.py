@@ -2629,6 +2629,130 @@ def test_merge_snapshot_keeps_flags_after_native_resume(fake: FakeHerdr) -> None
     assert slept_entry(fake)["argv"] == ["--dangerously-skip-permissions"]   # and its wake gets them back
 
 
+def test_reconcile_reports_resume_for_a_row_slept_without_one(fake: FakeHerdr) -> None:
+    """A row slept by v0.1.1: claimed, stub running, but no resume command reported (and no
+    `resume_reported` on the row). Reconcile reports it once, so a restart brings the stub back."""
+    slept_entry(fake)
+    j = journal()
+    j["w1:p1"].pop("resume_reported")
+    sleeper.write_json(sleeper.JOURNAL, j)
+    fake.resumes.clear()
+    fake.stub_panes = {"w1:p1"}
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+    sleeper.reconcile(fake.agents)
+    assert fake.resumes["w1:p1"] == sleeper.stub_argv("w1:p1", UUID)
+    row = journal()["w1:p1"]
+    assert row["resume_reported"] is True and row["terminal_id"] == "term-1" and row["phase"] == "asleep"
+    rec = json.loads(sleeper.EVENTS.read_text().splitlines()[-1])
+    assert rec["event"] == "reconciled" and rec["outcome"] == "resume-reported"
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)                                  # settled: no claim every tick
+    assert not any(c[:2] in (("pane", "report-agent"), ("pane", "process-info")) for c in fake.calls[n:])
+    fake.restart()                                                  # and the stub now survives a restart
+    assert fake.stub_panes == {"w1:p1"}
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["terminal_id"] == "term-1-r" and fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+
+
+def test_sleep_records_whether_the_resume_command_was_accepted(fake: FakeHerdr) -> None:
+    assert slept_entry(fake)["resume_reported"] is True
+
+
+def test_reconcile_leaves_a_slept_row_without_stub_process_alone(fake: FakeHerdr) -> None:
+    """No stub in the foreground (ctrl-c'd, or never typed): nothing to report as a resume command."""
+    slept_entry(fake)
+    j = journal()
+    j["w1:p1"].pop("resume_reported")
+    sleeper.write_json(sleeper.JOURNAL, j)
+    fake.resumes.clear()
+    fake.stub_panes = set()
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:]) and fake.resumes == {}
+    assert "resume_reported" not in journal()["w1:p1"]
+
+
+def test_refused_wake_gets_its_claim_and_resume_back(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    """wake_entry releases our claim before its checks; Herdr drops the resume command with it. A
+    refusal after that leaves the stub without either, until reconcile claims it again."""
+    slept_entry(fake)
+    fake.stub_panes = {"w1:p1"}
+    monkeypatch.setattr(sleeper, "uuid_live_elsewhere", lambda uuid, except_pane=None, cwd=None: "w9:p9")
+    assert sleeper.wake_entry(journal()["w1:p1"]) is False
+    assert "agent" not in fake.agents[0] and "w1:p1" not in fake.resumes   # released, command dropped
+    sleeper.reconcile(fake.agents)
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+    assert fake.resumes["w1:p1"] == sleeper.stub_argv("w1:p1", UUID)
+    assert journal()["w1:p1"]["resume_reported"] is True
+
+
+def test_refused_resume_is_not_retried_every_tick(fake: FakeHerdr) -> None:
+    fake.reject_resume = "resume_not_accepted"
+    assert slept_entry(fake)["resume_reported"] is False
+    fake.stub_panes = {"w1:p1"}
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)                     # claimed, refusal on record: nothing to do
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])
+    sleeper.release("w1:p1")                           # a refused wake released it: one more attempt
+    sleeper.reconcile(fake.agents)
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT and journal()["w1:p1"]["resume_reported"] is False
+    n = len(fake.calls)
+    sleeper.reconcile(fake.agents)
+    assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])
+
+
+def test_put_back_drops_the_resume_marker(fake: FakeHerdr) -> None:
+    """A waking stub released the pane (Herdr dropped the command); the row it returns to says so."""
+    row = {**slept_entry(fake), "phase": "waking", "waking_pid": 1, "waking_at": "x"}
+    j: dict[str, Any] = {}
+    sleeper.put_back(j, "w1:p1", row, "test")
+    assert j["w1:p1"]["phase"] == "asleep" and "resume_reported" not in j["w1:p1"]
+
+
+def test_merge_snapshot_drops_flags_on_a_manual_bare_resume(fake: FakeHerdr) -> None:
+    """`claude --resume <uuid>` typed by hand in the terminal that ran the session is not Herdr's
+    restore: the flags the user left out (here --dangerously-skip-permissions) stay out."""
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == ["--dangerously-skip-permissions"]
+    fake.argv = ["--resume", UUID]                       # same terminal: a manual restart without flags
+    fake.agents[0]["pid_hint"] = 202
+    sleeper.merge_snapshot(fake.agents)
+    row = sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]
+    assert row["argv"] == [] and "flags_inherited" not in row
+    entry = slept_entry(fake)
+    assert entry["argv"] == []                           # and its wake does not bring them back
+    assert sleeper.wake_entry(entry)
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert "--dangerously-skip-permissions" not in start
+
+
+def test_sleep_ignores_snapshot_flags_for_a_manual_bare_resume(fake: FakeHerdr) -> None:
+    """sleep-pane can run before the watcher refreshed panes.json: the same rule applies there."""
+    sleeper.merge_snapshot(fake.agents)
+    fake.argv = ["--resume", UUID]
+    assert slept_entry(fake)["argv"] == []
+
+
+def test_inherited_flags_stay_until_another_process_resumes_by_hand(fake: FakeHerdr) -> None:
+    sleeper.merge_snapshot(fake.agents)
+    fake.argv = ["--resume", UUID]
+    fake.agents[0]["terminal_id"] = "term-1-r"           # Herdr's restore: a new terminal
+    sleeper.merge_snapshot(fake.agents)
+    row = sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]
+    assert row["argv"] == ["--dangerously-skip-permissions"] and row["flags_inherited"] is True
+    assert row["inherited_pid"] == 101
+    sleeper.merge_snapshot(fake.agents)                  # later ticks, same process: kept
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["argv"] == ["--dangerously-skip-permissions"]
+    fake.process_info_broken = True                      # a hiccup keeps the row and its marker
+    sleeper.merge_snapshot(fake.agents)
+    assert sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]["flags_inherited"] is True
+    fake.process_info_broken = False
+    fake.agents[0]["pid_hint"] = 303                     # exited and resumed by hand in that terminal
+    sleeper.merge_snapshot(fake.agents)
+    row = sleeper.read_json(sleeper.SNAPSHOT)["w1:p1"]
+    assert row["argv"] == [] and "flags_inherited" not in row
+
+
 def test_merge_snapshot_still_updates_on_real_argv_change(fake: FakeHerdr) -> None:
     sleeper.merge_snapshot(fake.agents)
     fake.argv = ["--model", "opus", "--resume", UUID]       # flags of its own: what runs is what counts
@@ -2745,23 +2869,46 @@ def test_herdr_error_carries_the_code(state: Path, monkeypatch: pytest.MonkeyPat
     assert sleeper.herdr("agent", "list", check=False) == {}
 
 
-def test_write_json_fsyncs(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("full", [True, False], ids=["F_FULLFSYNC", "fsync-fallback"])
+def test_write_json_syncs_to_the_drive(state: Path, monkeypatch: pytest.MonkeyPatch, full: bool) -> None:
+    """File, then replace, then directory. On macOS fsync stops at the drive's write cache, so the
+    sync is F_FULLFSYNC; where that is missing or refused, plain fsync."""
     order: list[str] = []
-    real_fsync, real_replace = os.fsync, os.replace
+    real_replace = os.replace
+
+    def kind(fd: int) -> str:
+        return "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
 
     def fsync(fd: int) -> None:
-        order.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
-        real_fsync(fd)
+        order.append("fsync:" + kind(fd))
+
+    def fcntl_call(fd: int, cmd: int, *rest: Any) -> int:
+        assert cmd == 51                                # F_FULLFSYNC (sys/fcntl.h)
+        if not full:
+            raise OSError(45, "Operation not supported")
+        order.append("full:" + kind(fd))
+        return 0
 
     def replace(a: Any, b: Any) -> None:
         order.append("replace")
         real_replace(a, b)
 
+    monkeypatch.setattr(sleeper.fcntl, "F_FULLFSYNC", 51, raising=False)
+    monkeypatch.setattr(sleeper.fcntl, "fcntl", fcntl_call)
     monkeypatch.setattr(sleeper.os, "fsync", fsync)
     monkeypatch.setattr(sleeper.os, "replace", replace)
     sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {"uuid": UUID}})
-    assert order == ["file", "replace", "dir"]            # data on disk before it replaces the old file
+    how = "full" if full else "fsync"
+    assert order == [f"{how}:file", "replace", f"{how}:dir"]   # data on disk before it replaces the old file
     assert sleeper.read_json(sleeper.JOURNAL) == {"w1:p1": {"uuid": UUID}}
+
+
+def test_write_json_without_f_fullfsync_uses_fsync(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    monkeypatch.delattr(sleeper.fcntl, "F_FULLFSYNC", raising=False)   # another platform
+    monkeypatch.setattr(sleeper.os, "fsync", calls.append)
+    sleeper.write_json(sleeper.JOURNAL, {"a": 1})
+    assert len(calls) == 2 and sleeper.read_json(sleeper.JOURNAL) == {"a": 1}
 
 
 # ------------------------------------------- the real CLI's output shapes (lab finding, v0.1.2)

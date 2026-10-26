@@ -102,7 +102,7 @@ rounds, the live-deployment iteration, and the v0.1.1 review (Fable, Grok):
    hooks never spawn a watcher, so a missing one is reported instead: WARN
    and a `watcher-missing` event at startup and (hourly at most) from any
    plugin activity, a header in `list`/`presence`, a note in the ListAgents
-   hook. State files are fsync'd (file, then directory) before they count.
+   hook. State files are synced (file, then directory; F_FULLFSYNC on macOS) before they count.
 
 Ideas adopted from the two community plugins studied before writing this
 (dalogax/herdr-agent-hibernate, prabhatgmp/herdr-park): the SIGTERM exit
@@ -374,21 +374,37 @@ def notify(title: str, body: str = "", enabled: bool = True) -> None:
 
 # ---------------------------------------------------------------- json state
 
+def full_sync(fd: int) -> None:
+    """Flush fd to stable storage. On macOS fsync(2) only hands the data to the drive, which may
+    keep it in its write cache through a power cut; F_FULLFSYNC asks the drive to flush that cache
+    too (fsync(2), fcntl(2) man pages). Where F_FULLFSYNC is missing or refused (another platform,
+    a filesystem that does not support it), plain fsync."""
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        try:
+            fcntl.fcntl(fd, full)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def write_json(path: Path, data: object) -> None:
     """Atomic and durable: the temp file reaches the disk before it replaces the old one, and the
-    directory entry after. A power cut or a forced reboot otherwise can leave a zero-length journal,
-    which is the one handle to every slept session."""
+    directory entry after (full_sync: F_FULLFSYNC on macOS, where fsync alone stops at the drive's
+    write cache). A power cut or a forced reboot otherwise can leave a zero-length journal, which is
+    the one handle to every slept session."""
     ensure_state_dir()
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
         fh.flush()
-        os.fsync(fh.fileno())
+        full_sync(fh.fileno())
     os.replace(tmp, path)
-    with contextlib.suppress(OSError):  # a directory fsync is best effort (not every filesystem allows it)
+    with contextlib.suppress(OSError):  # a directory sync is best effort (not every filesystem allows it)
         dfd = os.open(path.parent, os.O_RDONLY)
         try:
-            os.fsync(dfd)
+            full_sync(dfd)
         finally:
             os.close(dfd)
 
@@ -1362,8 +1378,8 @@ def waking_alive(entry: dict) -> bool | None:
 def put_back(journal: dict, pane: str, row: dict, why: str) -> None:
     """Return a woken-but-not-running row to `asleep` under pane. Never `setdefault`: if the
     pane's row now names another session, ours goes to an orphan key instead of vanishing."""
-    back = {k: v for k, v in row.items() if k not in WAKING_FIELDS}
-    back["phase"] = "asleep"
+    back = {k: v for k, v in row.items() if k not in WAKING_FIELDS and k != "resume_reported"}
+    back["phase"] = "asleep"  # the stub released the pane before its exec: Herdr dropped our resume command
     cur = journal.get(pane)
     if isinstance(cur, dict) and cur.get("uuid") != row["uuid"]:
         key = orphan_key(journal, row["uuid"])
@@ -1389,16 +1405,37 @@ def native_resume(argv: list[str] | None, uuid: str) -> bool:
     return argv == ["--resume", uuid]
 
 
-def snapshot_flags(pane: str, uuid: str) -> list[str] | None:
-    """The replayable flags panes.json holds for this pane and session, or None (no row, another
-    session, flags unknown, unreadable snapshot)."""
+def inherits_flags(prior: object, uuid: str, argv: list[str] | None, terminal_id: object,
+                   pid: object) -> bool:
+    """May a bare `--resume <uuid>` keep the flags panes.json recorded (`prior`: the pane's row)?
+
+    Only when it is Herdr's own restore, and the evidence for that is a new terminal: Herdr
+    re-allocates every terminal id on restore (src/persist/restore.rs:574). The same bare form in
+    the terminal that already ran the session is someone resuming it by hand without flags (to drop
+    --dangerously-skip-permissions, say): what runs is what counts there. Once inherited, the row
+    carries `flags_inherited` with the pid it was decided for, so later looks at the restored
+    session keep the flags, until another process runs the bare form in that terminal (an unknown
+    pid on either side keeps them: losing the flags is the worse mistake).
+    """
+    if not native_resume(argv, uuid) or not isinstance(prior, dict) or prior.get("uuid") != uuid \
+            or not isinstance(prior.get("argv"), list):
+        return False
+    then = prior.get("terminal_id")
+    if then and terminal_id and then != terminal_id:
+        return True
+    if not prior.get("flags_inherited"):
+        return False
+    was = prior.get("inherited_pid")
+    return was is None or pid is None or was == pid
+
+
+def snapshot_row(pane: str) -> dict | None:
+    """panes.json's row for this pane, or None (no row, unreadable snapshot)."""
     try:
         row = read_json(SNAPSHOT).get(pane)
     except SleeperError:
         return None
-    if not isinstance(row, dict) or row.get("uuid") != uuid or not isinstance(row.get("argv"), list):
-        return None
-    return replayable_argv([str(a) for a in row["argv"]])[0]
+    return row if isinstance(row, dict) else None
 
 
 def merge_snapshot(agents: list[dict]) -> None:
@@ -1406,7 +1443,8 @@ def merge_snapshot(agents: list[dict]) -> None:
 
     A pane now running a different session retires the old row: dropped when it is the same
     terminal (a deliberate replacement), kept under an `orphan:` key when the pane id was reused.
-    A session Herdr restored natively (bare `--resume <uuid>`) keeps the flags the row already had.
+    A session Herdr restored natively (bare `--resume <uuid>` in a new terminal) keeps the flags the
+    row already had; see inherits_flags.
     """
     snap = read_json(SNAPSHOT)
     live = {a["pane_id"]: a for a in agents}
@@ -1428,17 +1466,21 @@ def merge_snapshot(agents: list[dict]) -> None:
         if isinstance(prior, dict) and prior.get("uuid") and prior.get("uuid") != uuid:
             retire(a["pane_id"])
             prior = {}
-        present, argv, _pid = agent_process(a["pane_id"], kind)
+        present, argv, pid = agent_process(a["pane_id"], kind)
+        inherited: dict = {}
         if argv is None and present is None and prior.get("uuid") == uuid:
             argv = prior.get("argv")  # process-info hiccup: keep what we knew rather than erase it
-        elif native_resume(argv, uuid) and prior.get("uuid") == uuid and isinstance(prior.get("argv"), list):
+            inherited = {k: prior[k] for k in ("flags_inherited", "inherited_pid") if k in prior}
+        elif inherits_flags(prior, uuid, argv, a.get("terminal_id"), pid):
             argv = prior["argv"]  # Herdr restored it as a bare `--resume`: the flags it ran with are still ours
+            inherited = {"flags_inherited": True, "inherited_pid": pid if pid is not None else prior.get("inherited_pid")}
         argv = snapshot_argv(kind, argv)
         snap[a["pane_id"]] = {
             "kind": kind, "uuid": uuid, "name": a.get("name"), "cwd": a.get("cwd"),
             "title": a.get("terminal_title_stripped"), "argv": argv,
             "terminal_id": a.get("terminal_id"),
             "seen_at": dt.datetime.now().isoformat(timespec="seconds"),
+            **inherited,
         }
     for pane in list(snap):  # a live pane whose agent (of any kind) runs another session
         now = ((live.get(pane) or {}).get("agent_session") or {}).get("value")
@@ -1560,7 +1602,14 @@ def resume_argv_problem(argv: list[str]) -> str | None:
 
 
 def claim(pane: str, kind: str, done: bool = False, resume: list[str] | None = None) -> bool:
-    """Keep the slept pane's sidebar row: report a placeholder agent we own. Best effort.
+    """Keep the slept pane's sidebar row: report a placeholder agent we own. Best effort; True when
+    the pane is claimed afterwards. See claim_reporting."""
+    return claim_reporting(pane, kind, done, resume)[0]
+
+
+def claim_reporting(pane: str, kind: str, done: bool = False,
+                    resume: list[str] | None = None) -> tuple[bool, bool]:
+    """claim(), answering (claimed, resume command accepted by Herdr).
 
     `done` (finished, unviewed) is carried into the label so sleeping does not hide that cue.
     `resume`: the wake stub's argv (stub_argv), passed only when the stub runs in the pane. Herdr
@@ -1589,8 +1638,8 @@ def claim(pane: str, kind: str, done: bool = False, resume: list[str] | None = N
             herdr(*report, check=False)
         herdr("pane", "report-metadata", pane, "--source", "herdr-sleeper",
               "--display-agent", f"{kind} · sleeping" + (" · done" if done else ""), check=False)
-        return herdr("pane", "get", pane, check=False).get("pane", {}).get("agent") == CLAIM_AGENT
-    return False
+        return herdr("pane", "get", pane, check=False).get("pane", {}).get("agent") == CLAIM_AGENT, sent
+    return False, False
 
 
 def release(pane: str) -> None:
@@ -1638,15 +1687,16 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
 
     replay: list[str] = []
     if profile["argv_after_binary"]:
-        _present, raw_argv, _pid = agent_process(pane, kind)
+        _present, raw_argv, pid = agent_process(pane, kind)
         if raw_argv is None:
             return False, "could not read agent argv from pane"
         replay, why = replayable_argv(raw_argv)
         if replay is None:
             return False, why or "argv not replayable"
-        if native_resume(raw_argv, uuid):
+        row = snapshot_row(pane)
+        if row is not None and inherits_flags(row, uuid, raw_argv, agent.get("terminal_id"), pid):
             # restored by Herdr after a restart with no flags; wake it with the ones it was started with
-            replay = snapshot_flags(pane, uuid) or replay
+            replay = replayable_argv([str(a) for a in row["argv"]])[0] or replay
 
     journal = read_json(JOURNAL)
     held = journal.get(pane)
@@ -1778,7 +1828,15 @@ def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours
     time.sleep(2)  # herdr takes ~2s to drop the exited agent's session; the claim is ignored before that
     # the stub's argv goes along as the pane's resume command only when it was typed: a restart
     # must not start a stub in a pane that never had one (focus and `wake` cover those)
-    claim(pane, kind, done=entry["status"] == "done", resume=stub_argv(pane, uuid) if at_shell else None)
+    _claimed, reported = claim_reporting(pane, kind, done=entry["status"] == "done",
+                                         resume=stub_argv(pane, uuid) if at_shell else None)
+    if at_shell:
+        # Herdr's saved resume command cannot be read back: the row says whether it holds ours, so
+        # reconcile can report it again to a pane that has the stub but not the command
+        journal = read_json(JOURNAL)
+        if isinstance(journal.get(pane), dict) and journal[pane].get("uuid") == uuid:
+            journal[pane]["resume_reported"] = reported
+            write_json(JOURNAL, journal)
     event("slept", pane=pane, name=name, uuid=uuid, kind=kind, title=entry["title"], cwd=entry["cwd"],
           freed_mb=freed_mb or None, how=how, stub=at_shell, helpers_stopped=reaped or None)
     notify(f"{SLEEP_MARK}slept {name}", f"freed ~{freed_mb} MB · wake: focus the pane, press Enter, or "
@@ -2839,15 +2897,38 @@ def reconcile(agents: list[dict]) -> None:
             # again (sidebar row, resume command for the next restart) and record the new terminal
             # in the same step — never one without the other (LESSONS 2.3).
             new_terminal = panes[pane].get("terminal_id")
-            if claim(pane, kind, done=entry.get("status") == "done", resume=stub_argv(pane, entry["uuid"])):
+            ok, reported = claim_reporting(pane, kind, done=entry.get("status") == "done",
+                                           resume=stub_argv(pane, entry["uuid"]))
+            if ok:
                 say(f"reconcile {pane}: re-claimed after a Herdr restart (terminal {entry['terminal_id']} -> "
                     f"{new_terminal}, stub running)")
                 event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"],
                       outcome="reclaimed-after-restart", terminal_id=new_terminal)
                 entry["terminal_id"] = new_terminal
+                entry["resume_reported"] = reported
                 changed = True
             else:
                 note_skip(pane, "could not re-claim the pane after a Herdr restart; the next tick retries")
+        elif (entry.get("phase", "asleep") == "asleep" and entry.get("stub") is not False
+              and (not live or (live.get("agent") == CLAIM_AGENT and "resume_reported" not in entry))
+              and pane in panes and identity(entry, panes[pane]) == "same"
+              and stub_running(pane, entry["uuid"]) is True):
+            # Our stub waits in the terminal it was typed into, but Herdr may hold no resume command
+            # for it, and then a restart brings the pane back as a bare shell: a row slept by v0.1.1
+            # (claimed without one; no `resume_reported` on the row), or a claim released by a wake
+            # that was refused afterwards (a release by the holder drops the command too). Claim it
+            # with the stub's argv; Herdr ignores a command identical to the one it holds.
+            ok, reported = claim_reporting(pane, kind, done=entry.get("status") == "done",
+                                           resume=stub_argv(pane, entry["uuid"]))
+            if ok:
+                entry["resume_reported"] = reported
+                changed = True
+                say(f"reconcile {pane}: claimed with the stub's resume command "
+                    f"({'reported' if reported else 'not accepted; plain claim'})")
+                event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"],
+                      outcome="resume-reported" if reported else "reclaimed")
+            else:
+                note_skip(pane, "could not claim the slept pane with its resume command; the next tick retries")
         elif not live and entry.get("terminal_id"):
             # pane gone or moved: follow a terminal that still exists under a new pane id, else keep the handle
             moved = next((p for p, info in panes.items() if info.get("terminal_id") == entry["terminal_id"]

@@ -109,7 +109,13 @@ records the new terminal id in the same step (event `reconciled`, outcome
 `reclaimed-after-restart`). A restarted pane without a stub is left alone:
 focus and `wake` start the agent into the bare shell as before. Herdr drops
 the command when the pane is released, which every wake does, or when
-another agent takes the pane. A command Herdr would refuse (an apostrophe in
+another agent takes the pane. Herdr's saved command cannot be read back, so
+the journal row records whether Herdr accepted ours (`resume_reported`). A
+pane whose stub runs in the terminal it was typed into but whose row has no
+such record (slept by v0.1.1), or whose claim a refused wake released, is
+claimed again with the stub's argv on the next tick (outcome
+`resume-reported`), so it survives a restart too. A refusal is recorded and
+not retried every tick. A command Herdr would refuse (an apostrophe in
 a path, a control character, over 64 arguments or 8 KiB; checked locally
 first, mirroring `validate_resume_argv`) or a refusal from Herdr
 (`resume_not_accepted`, `invalid_resume_argv`, an older Herdr) falls back to
@@ -132,14 +138,21 @@ when reconcile settles it, so a restart does not orphan it.
 Sessions that were awake are Herdr's: it restores them natively as a bare
 `claude --resume <session>`, without the flags they were started with. The
 crash-recovery snapshot keeps the flags of a row whose session comes back
-that way, and a later sleep of that session replays them on wake.
+that way in a new terminal (Herdr re-allocates terminal ids on restore), and
+a later sleep of that session replays them on wake. The same bare form in the
+terminal that already ran the session, or from another process there later,
+is a resume by hand without flags, and the snapshot records it as such.
 
 After a reboot the watcher may start before the Herdr server. A tick that
 finds no server (`server_not_running`, `server_unavailable` while it shuts
 down, or a refused or missing socket) is
 retried every poll interval instead of backing off, and logged once per
-outage. State files are written with an fsync of the file and then of the
-directory, so a power cut does not leave an empty journal.
+outage. State files are written to a temp file that is synced to the drive
+before it replaces the old one, and the directory after; on macOS the sync is
+`F_FULLFSYNC`, because `fsync` there leaves the data in the drive's write cache
+(plain `fsync` elsewhere, or where `F_FULLFSYNC` is refused). That is meant to
+keep a power cut from leaving an empty journal; it has not been tested with a
+real power cut.
 
 With `watcher = "external"`, hooks never start a watcher, so nothing would
 notice a service that did not come up. A missing one (no `stop`, and nothing

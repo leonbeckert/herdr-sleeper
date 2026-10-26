@@ -424,6 +424,15 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
   foreground is our stub for this pane and this session, is ours: claim it again with the same resume command,
   and record the new terminal id in the same step (2.3). Leave a restarted pane without the stub alone; focus
   and `wake` handle it as before.
+- *Trap 2 (review):* those were the only two places that reported the command: the sleep and the re-claim after
+  a restart. A pane slept by a version that claimed without one (v0.1.1), and a pane whose claim a refused wake
+  released (a release by the holder drops the command, `src/terminal/state.rs:1859`), keep their stub but come
+  back from the next restart as a bare labelled shell. Herdr's saved command cannot be read back through the API.
+- *Instead:* record on the journal row whether Herdr accepted the command (`resume_reported`). In reconcile, a row
+  that is asleep, in the same terminal, with our stub in the foreground, and either not claimed or claimed with
+  no record, is claimed again with the stub's argv (Herdr ignores an identical command). Record a refusal too, so
+  it is not retried every tick; drop the record when a waking stub's row goes back to asleep (its release dropped
+  the command).
 
 **10.3 Native restore drops the flags a session was started with.**
 - *Trap:* Herdr's own restore plan for Claude is `claude --resume <id>` and nothing else
@@ -431,6 +440,12 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
   it had with nothing on the first tick after a restart, and a later sleep of that session would replay none.
 - *Instead:* when the live argv after the binary is exactly `--resume <same session>`, keep the flags the
   snapshot already had, and let a sleep of such a session take its flags from the snapshot.
+- *Trap 2 (review):* "exactly `--resume <id>`" is also what a user types to resume a session by hand without
+  the flags it had (to drop `--dangerously-skip-permissions`, say). Keeping the old flags then replays them on
+  the next wake, against the user's choice.
+- *Instead:* keep them only with restart evidence: the snapshot row's terminal id differs from the live one
+  (Herdr re-allocates terminal ids on restore). Mark the row (`flags_inherited`, with the pid) so later ticks in
+  the restored terminal keep them, and stop when another process runs the bare form there.
 
 **10.4 Plan for the service coming up before, after, or without the multiplexer.**
 - *Trap 1:* with an externally supervised watcher (launchd), nothing in the plugin starts one, and nothing said
@@ -438,10 +453,13 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
   of the deployment host did not start after an OS update; the cause was outside the plugin.
 - *Trap 2:* a watcher that starts before the server sees every call fail and backs off exponentially, so it
   catches up minutes after the server is there.
-- *Trap 3:* an atomic `os.replace` without an fsync can leave an empty file after a power cut.
+- *Trap 3:* an atomic `os.replace` without an fsync can leave an empty file after a power cut. On macOS,
+  `fsync(2)` alone does not help: it hands the data to the drive, which may keep it in its write cache
+  (fsync(2), fcntl(2) man pages); only `fcntl(F_FULLFSYNC)` asks the drive to flush that cache.
 - *Instead:* report a missing external watcher wherever someone looks (a WARN and an event at startup, rate
   limited from hooks, a header in `list`, a note in the agents' peer list). Treat "no server" as a reason to
-  retry at the poll interval, not as a failure. fsync the file, then the directory.
+  retry at the poll interval, not as a failure. Sync the file, then the directory, with `F_FULLFSYNC` where it
+  exists and plain `fsync` as the fallback. Not tested with a real power cut.
 - *Lab (10.9):* a headless server with no client attached does start a restored resume command, also one whose
   agent label it does not know (`sleeper`). It types the command into the restored login shell before its first
   prompt, so it runs under the pane shell's `PATH` and Python (keep the script an absolute path behind `env`),
