@@ -48,6 +48,20 @@ def agent(
     return a
 
 
+@pytest.fixture(autouse=True)
+def no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spawned `watch` or `deliver-pending` is a fresh interpreter: none of the monkeypatching applies,
+    so it would use the real state dir, the real config and whatever HERDR_SOCKET_PATH the test run
+    inherited (a live server). Tests that expect a spawn patch Popen themselves."""
+    real = sleeper.subprocess.Popen
+
+    def refuse(argv: Any, *a: Any, **k: Any) -> Any:
+        if isinstance(argv, (list, tuple)) and str(sleeper.SELF) in [str(x) for x in argv]:
+            pytest.fail(f"a unit test tried to start the plugin for real: {argv!r}")
+        return real(argv, *a, **k)   # subprocess.run (ps, lsof) goes through Popen too
+    monkeypatch.setattr(sleeper.subprocess, "Popen", refuse)
+
+
 @pytest.fixture
 def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
@@ -2638,8 +2652,10 @@ def external_watcher(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_external_watcher_missing_warns_rate_limited(state: Path, monkeypatch: pytest.MonkeyPatch,
                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    spawned: list[Any] = []
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or types.SimpleNamespace(pid=1))
     REAL_HEAL()
-    assert "watcher-missing" not in events()                 # plugin mode heals instead (Popen below fails)
+    assert "watcher-missing" not in events() and spawned   # plugin mode heals instead (spawns, never for real)
     external_watcher(state, monkeypatch)
     monkeypatch.setattr(sleeper.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned a watcher"))
     REAL_HEAL(); REAL_HEAL()

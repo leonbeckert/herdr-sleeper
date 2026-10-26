@@ -378,6 +378,17 @@ label, or leave `done` panes alone for longer. (Review v0.1.0 F22.)
   highest workspace, restart, create a workspace), and sleep a focused pane. Small trap: a new directory can hold
   `agent start` on Claude Code's folder-trust prompt, so run lab agents in directories that are already trusted.
 
+**9.5 A unit test that reaches a real spawn runs outside every monkeypatch.**
+- *Live (2026-10-26):* one watcher-missing test called the real heal path in plugin mode before it patched
+  `subprocess.Popen`, so every suite run started a real `herdr-sleeper watch`. A fresh interpreter sees none of
+  the fixtures: it took the default state dir (the live one), the live config, and the `HERDR_SOCKET_PATH` the
+  test run inherited from its Herdr pane. It only waited on `watcher.lock` and exited after 120 s, because the
+  live watcher held the lock; with the live watcher down (the situation a reboot fix is about) it would have
+  taken over the live state with development code.
+- *Instead:* an autouse fixture that fails any `Popen` of the plugin itself, leaving `subprocess.run` (`ps`,
+  `lsof`) alone; tests that expect a spawn patch `Popen` themselves. After a test run, check that no
+  `herdr-sleeper watch` from the development copy is left.
+
 ## 10. Reboots
 
 These come from the first reboot of the deployment host (2026-10-26) and from reading Herdr **0.9.5** (tag
