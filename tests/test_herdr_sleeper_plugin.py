@@ -66,12 +66,12 @@ def no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
 def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
     d = tmp_path / "state"
-    for name in ("STATE_DIR", "JOURNAL", "SNAPSHOT", "EVENTS", "LOGFILE", "LOCK", "WATCHER_PID",
-                 "IDLE_FILE", "WATCHER_LOCK", "STOPPED", "MAILBOX", "DELIVERED", "WATCHER_MISSING"):
-        base = getattr(sleeper, name, None)
-        if base is None:
-            continue
-        monkeypatch.setattr(sleeper, name, d / base.name if name != "STATE_DIR" else d)
+    # every module-level path in the state dir, so a new state file can never reach the live one
+    live = sleeper.STATE_DIR
+    for name, base in list(vars(sleeper).items()):
+        if isinstance(base, Path) and (base == live or base.parent == live):
+            monkeypatch.setattr(sleeper, name, d / base.name if base != live else d)
+    assert "SPAWNED" in vars(sleeper) and sleeper.SPAWNED.parent == d and sleeper.INSOMNIA.parent == d
     monkeypatch.setattr(sleeper, "LEGACY_STATE_DIR", tmp_path / "legacy")
     monkeypatch.setattr(sleeper, "CONFIG_FILE", tmp_path / "absent.toml")
     monkeypatch.setattr(sleeper, "LEGACY_CONFIG_FILES", [tmp_path / "legacy-config.toml"], raising=False)
@@ -79,7 +79,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
-    for name in ("RESTART_TRIED", "CRON_SCAN"):   # per-process watcher memory
+    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS"):   # per-process watcher memory
         monkeypatch.setattr(sleeper, name, {})
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
         monkeypatch.delenv(var, raising=False)
@@ -130,6 +130,9 @@ class FakeHerdr:
         self.execvps: list[tuple[str, list[str]]] = []
         self.resumes: dict[str, list[str]] = {}  # pane -> the resume command its claim reported (Herdr saves it)
         self.reject_resume: str | None = None    # error code a report-agent carrying a resume command gets
+        self.spawn_uuid = "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f"  # what a fresh `agent start` (no --resume) reports
+        self.start_error: str | None = None      # error code `agent start` fails with
+        self.tabs_made = 0
 
     def restart(self, keep_resume: bool = True) -> None:
         """A Herdr server restart: every terminal gets a new id, saved labels come back, claims (hook
@@ -209,7 +212,7 @@ class FakeHerdr:
                     raise sleeper.SleeperError("no such pane")
                 return {}
             pane = {"pane_id": args[2], "label": a.get("label"), "cwd": a.get("cwd"),
-                    "terminal_id": a.get("terminal_id")}
+                    "terminal_id": a.get("terminal_id"), "tab_id": a.get("tab_id")}
             if a.get("agent"):
                 pane["agent"] = a["agent"]
                 pane["agent_session"] = a.get("agent_session")
@@ -219,13 +222,36 @@ class FakeHerdr:
             if self.process_info_broken:
                 return {}
             return {"process_info": {"foreground_processes": self._procs(pane, by_pane.get(pane))}}
+        if args[:2] == ("tab", "create"):
+            self.tabs_made += 1
+            ws = args[args.index("--workspace") + 1] if "--workspace" in args else "w1"
+            n = 7 + self.tabs_made
+            row = {"pane_id": f"{ws}:p{n}", "tab_id": f"{ws}:t{n}", "workspace_id": ws, "focused": False,
+                   "cwd": args[args.index("--cwd") + 1], "terminal_id": f"term-new-{n}", "state_change_seq": 1,
+                   "label": args[args.index("--label") + 1]}
+            self.agents.append(row)
+            return {"root_pane": dict(row), "tab": {"tab_id": row["tab_id"], "workspace_id": ws, "pane_count": 1}}
+        if args[:2] == ("tab", "get"):
+            return {"tab": {"tab_id": args[2], "pane_count": sum(a.get("tab_id") == args[2] for a in self.agents)}}
+        if args[:2] in (("tab", "close"), ("pane", "close")):
+            field = "tab_id" if args[0] == "tab" else "pane_id"
+            for a in self.agents:
+                if a.get(field) == args[2]:
+                    self.resumes.pop(a["pane_id"], None)   # a closed pane is not restored, nor its command
+            self.agents = [a for a in self.agents if a.get(field) != args[2]]
+            return {}
         if args[:2] == ("agent", "start"):
             pane = args[args.index("--pane") + 1]
             if args[2] in self.taken_names:
                 raise sleeper.SleeperError(f"herdr agent start failed: {{'code': 'agent_name_taken', 'name': '{args[2]}'}}")
-            uuid = self.start_uuid or args[args.index("--resume") + 1]
+            if self.start_error:
+                raise sleeper.HerdrError(f"herdr agent start failed: {{'code': '{self.start_error}'}}", self.start_error)
+            uuid = self.start_uuid or (args[args.index("--resume") + 1] if "--resume" in args else self.spawn_uuid)
             kind = args[args.index("--kind") + 1]
             a = by_pane[pane]
+            if "--resume" not in args:
+                a["name"] = args[2]
+                a["agent_status"] = "idle"
             a.update(agent=kind, agent_session={"value": uuid} if self.start_session_appears else None)
             if not self.start_session_appears:
                 a.pop("agent_session")
@@ -247,7 +273,9 @@ class FakeHerdr:
                 self.resumes[args[2]] = resume
             return {}
         if args[:2] == ("pane", "release-agent"):
-            a = by_pane[args[2]]
+            a = by_pane.get(args[2])
+            if a is None:   # a closed pane: real herdr answers an error (callers pass check=False)
+                return {}
             if a.get("agent") == sleeper.CLAIM_AGENT:
                 # Herdr forgets the releasing reporter's resume command, but only from a holder: a
                 # release with no claim (none survives a restart) leaves the saved command (lab, v0.9.5)
@@ -3059,3 +3087,493 @@ def test_orphan_slept_without_a_stub_is_not_claimed(fake: FakeHerdr) -> None:
     sleeper.reconcile(fake.agents)
     assert list(journal()) == ["orphan:" + UUID[:8]]
     assert not any(c[:2] == ("pane", "report-agent") for c in fake.calls[n:])
+
+
+# ------------------------------------------------------- B-244: insomnia
+
+def _claim(monkeypatch: pytest.MonkeyPatch, reason: str | None = "ssh master", duration: str | None = None,
+           pane: str = "w1:p1", parent_chain: list[int] | None = None) -> int:
+    """`insomnia claim` from inside the agent in `pane` (its pid 101 is our ancestor unless told otherwise)."""
+    monkeypatch.setenv("HERDR_PANE_ID", pane)
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1] if parent_chain is None else parent_chain)
+    return sleeper.cmd_insomnia(types.SimpleNamespace(action="claim", reason=reason, duration=duration))
+
+
+def _release(monkeypatch: pytest.MonkeyPatch, pane: str | None = None, force: bool = False,
+             caller: str | None = "w1:p1") -> int:
+    if caller:
+        monkeypatch.setenv("HERDR_PANE_ID", caller)
+    else:
+        monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1])
+    return sleeper.cmd_insomnia(types.SimpleNamespace(action="release", pane=pane, force=force))
+
+
+def _event_rows(name: str) -> list[dict[str, Any]]:
+    return [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if f'"{name}"' in l] \
+        if sleeper.EVENTS.exists() else []
+
+
+def test_ancestors_walks_up_and_stops_on_cycles() -> None:
+    table = {900: (800, "zsh"), 800: (101, "bash"), 101: (50, "claude"), 50: (1, "zsh"), 1: (0, "launchd")}
+    assert sleeper.ancestors(table, 900) == [800, 101, 50, 1]
+    assert sleeper.ancestors({5: (6, "a"), 6: (5, "b")}, 5) == [6, 5]
+    assert sleeper.ancestors({}, 900) == []
+
+
+def test_insomnia_claim_writes_a_claim_keyed_by_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch, duration="4h") == 0
+    rec = sleeper.read_json(sleeper.INSOMNIA)[UUID]
+    assert rec["reason"] == "ssh master" and rec["until"] == 1_000_000.0 + 4 * 3600 and rec["pane"] == "w1:p1"
+    assert oct(sleeper.INSOMNIA.stat().st_mode & 0o777) == "0o600"
+    assert _event_rows("insomnia-claimed")[-1]["renewed"] is False
+    token = [c for c in fake.calls if c[:2] == ("pane", "report-metadata") and sleeper.INSOMNIA_SOURCE in c]
+    assert token and "insomnia=ssh master" in token[-1]
+    assert _claim(monkeypatch, reason=None) == 0                         # renewing keeps the start, drops --for
+    rec2 = sleeper.read_json(sleeper.INSOMNIA)[UUID]
+    assert rec2["at"] == rec["at"] and rec2["until"] is None and _event_rows("insomnia-claimed")[-1]["renewed"]
+
+
+@pytest.mark.parametrize("kw, code, needle", [
+    ({"reason": "a\x1b[2Jb"}, 2, "control characters"),
+    ({"reason": "x" * 121}, 2, "longer than"),
+    ({"reason": "  "}, 2, "empty"),
+    ({"duration": "soon"}, 2, "not a duration"),
+    ({"duration": "0m"}, 2, "longer than zero"),
+    ({"parent_chain": [7, 1]}, 1, "does not run under the agent"),
+    ({"pane": "w9:p9"}, 1, "runs no agent"),
+])
+def test_insomnia_claim_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+                                 kw: dict[str, Any], code: int, needle: str) -> None:
+    assert _claim(monkeypatch, **kw) == code
+    assert needle in capsys.readouterr().err and not sleeper.INSOMNIA.exists()
+
+
+def test_insomnia_claim_needs_a_herdr_pane_and_a_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101])
+    assert sleeper.cmd_insomnia(types.SimpleNamespace(action="claim", reason=None, duration=None)) == 1
+    assert "no HERDR_PANE_ID" in capsys.readouterr().err
+    fake.agents[0].pop("agent_session")
+    assert _claim(monkeypatch) == 1 and "no session id" in capsys.readouterr().err
+    fake.agents[0]["agent"] = "codex"
+    assert _claim(monkeypatch) == 1 and "never slept" in capsys.readouterr().err
+    assert not sleeper.INSOMNIA.exists()
+
+
+def test_insomnia_keeps_a_due_session_awake_until_released(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch) == 0
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 13 * 3600}}
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert journal() == {} and fake.signals == []
+    ok, reason, _ = sleeper.assess(fake.agents[0], fake.agents, 12, {}, idle_since=0.0)
+    assert not ok and reason == "insomnia (ssh master)"
+    assert sleeper.sleep_agent(fake.agents[0], 12, set(), dry_run=False, allow_focused=True)[1] == \
+        "refused: insomnia (ssh master)"                                 # sleep-pane honours it too
+    assert _release(monkeypatch) == 0 and _event_rows("insomnia-released")[-1]["forced"] is False
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert list(journal()) == ["w1:p1"]
+
+
+def test_insomnia_is_passed_over_by_max_live_and_pressure(fake: FakeHerdr, state: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    clocks = _three_idle_agents(fake, state)                             # w1 longest idle, then w2, then w3
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch) == 0                                      # w1 holds insomnia
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "max_live": 1})
+    assert sorted(journal()) == ["w2:p1"]                                # w3 is under pressure_idle
+    monkeypatch.setattr(sleeper, "memory_pressure", lambda: 4)
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert "w1:p1" not in journal() and (101, signal.SIGTERM) not in fake.signals
+
+
+def test_insomnia_claim_survives_a_herdr_restart(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch) == 0
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    tokens = len([c for c in fake.calls if sleeper.INSOMNIA_SOURCE in c])
+    fake.restart()                                                       # new terminal id, the name is gone
+    fake.agents[0].pop("name")
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 13 * 3600}}
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert journal() == {}
+    assert len([c for c in fake.calls if sleeper.INSOMNIA_SOURCE in c]) == tokens + 1   # the token comes back
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert len([c for c in fake.calls if sleeper.INSOMNIA_SOURCE in c]) == tokens + 1   # once, not every tick
+
+
+def test_damaged_insomnia_file_holds_every_session_and_stays(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.ensure_state_dir()
+    for text in ("{not json", '{"' + UUID + '": "x"}', '{"../x": {"at": 1}}', '{"' + UUID + '": {"at": 1, "until": "soon"}}'):
+        sleeper.INSOMNIA.write_text(text)
+        ok, reason, _ = sleeper.assess(fake.agents[0], fake.agents, 12, {}, idle_since=0.0)
+        assert not ok and reason.startswith("insomnia claims unreadable")
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": time.time() - 13 * 3600}}
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert journal() == {} and fake.signals == []
+    assert _claim(monkeypatch) == 1 and _release(monkeypatch) == 1      # never written over
+    assert sleeper.INSOMNIA.read_text() == '{"' + UUID + '": {"at": 1, "until": "soon"}}'
+    assert not list(sleeper.STATE_DIR.glob("insomnia.json.damaged-*"))  # never quarantined
+    assert sleeper.cmd_insomnia(types.SimpleNamespace(action="list", json=False)) == 2
+    capsys.readouterr()
+    sleeper.cmd_presence(types.SimpleNamespace(json=False))
+    assert "malformed claim" in capsys.readouterr().out
+
+
+def test_insomnia_expires_with_an_event(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: now["t"])
+    assert _claim(monkeypatch, duration="1h") == 0
+    now["t"] += 2 * 3600
+    assert sleeper.insomnia_reason(UUID) is None                         # expired: no longer holds
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert sleeper.read_json(sleeper.INSOMNIA) == {} and _event_rows("insomnia-expired")
+    clears = [c for c in fake.calls if "--clear-token" in c]
+    assert clears and clears[-1][2] == "w1:p1"
+
+
+def test_stale_insomnia_is_reported_daily_and_kept(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: now["t"])
+    assert _claim(monkeypatch) == 0
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": now["t"] - 23 * 3600}}
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert not _event_rows("insomnia-stale")
+    now["t"] += 2 * 3600
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert [r["state"] for r in _event_rows("insomnia-stale")] == ["idle 25h"]
+    now["t"] += 24 * 3600
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert len(_event_rows("insomnia-stale")) == 2 and UUID in sleeper.read_json(sleeper.INSOMNIA)
+    assert journal() == {}
+
+
+def test_insomnia_of_a_session_that_is_gone_is_reported_stale(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: now["t"])
+    assert _claim(monkeypatch) == 0
+    fake.agents[0].pop("agent"); fake.agents[0].pop("agent_session")    # the user quit the agent
+    now["t"] += 25 * 3600
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert [r["state"] for r in _event_rows("insomnia-stale")] == ["session not running"]
+    assert _release(monkeypatch, pane=UUID) == 1                          # not the caller's own: needs --force
+    assert _release(monkeypatch, pane=UUID, force=True, caller=None) == 0
+    assert sleeper.read_json(sleeper.INSOMNIA) == {} and _event_rows("insomnia-released")[-1]["forced"] is True
+
+
+def test_insomnia_release_of_another_session_needs_force(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents.append({**agent(pane="w2:p1", uuid="u2-session", name="orc", terminal="term-2"), "pid_hint": 102})
+    assert _claim(monkeypatch) == 0                                      # w1 ("a") claims
+    assert _release(monkeypatch, pane="a", caller="w2:p1") == 1
+    assert "--force" in capsys.readouterr().err and UUID in sleeper.read_json(sleeper.INSOMNIA)
+    assert _release(monkeypatch, pane="a", force=True, caller="w2:p1") == 0
+    assert sleeper.read_json(sleeper.INSOMNIA) == {}
+    assert _event_rows("insomnia-released")[-1]["by"] == "orc"
+    assert "released by orc (--force)" in sleeper.LOGFILE.read_text()
+    assert _release(monkeypatch) == 0 and "nothing to release" in capsys.readouterr().out
+
+
+def test_restart_outdated_still_restarts_an_insomniac(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.305")
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch) == 0
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 13 * 3600}}  # due, too
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == [(101, signal.SIGTERM)] and "w1:p1" not in journal()
+    assert _event_rows("restarted")[-1]["woke"] is True and UUID in sleeper.read_json(sleeper.INSOMNIA)
+
+
+def test_scan_presence_and_list_show_the_claim(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    assert _claim(monkeypatch, reason="tunnel to db") == 0
+    capsys.readouterr()
+    sleeper.cmd_scan(types.SimpleNamespace(dry_run=False, exclude=None))
+    out = capsys.readouterr().out
+    assert "keep  w1:p1" in out and "insomnia (tunnel to db)" in out and journal() == {}
+    sleeper.cmd_presence(types.SimpleNamespace(json=True))
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["insomnia"] == "tunnel to db"
+    assert sleeper.cmd_insomnia(types.SimpleNamespace(action="list", json=True)) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed[0]["session"] == UUID and listed[0]["state"] == "idle" and listed[0]["reason"] == "tunnel to db"
+
+
+# ------------------------------------------------- B-244: spawn and close
+
+SPAWNED_UUID = "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f"
+
+
+@pytest.fixture
+def checkout(state: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = state / "development"
+    repo = root / "proj-wt"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "sub").mkdir()
+    (root / "not-a-repo").mkdir()
+    monkeypatch.setattr(sleeper, "SPAWN_ROOT", root)
+    return repo
+
+
+def _spawn(monkeypatch: pytest.MonkeyPatch, cwd: Path | str, name: str = "impl-1", prompt: str = "build B-1",
+           extra: list[str] | None = None, kind: str = "claude", sender: str | None = "orc", json_out: bool = False) -> int:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(prompt))
+    return sleeper.cmd_spawn(types.SimpleNamespace(cwd=str(cwd), name=name, kind=kind, sender=sender, workspace=None,
+                                                   json=json_out, agent_args=extra))
+
+
+def _close(monkeypatch: pytest.MonkeyPatch, target: str, force: bool = False, caller: str | None = None) -> int:
+    if caller:
+        monkeypatch.setenv("HERDR_PANE_ID", caller)
+        monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1])
+    return sleeper.cmd_close(types.SimpleNamespace(target=target, force=force, sender="orc"))
+
+
+def test_spawn_starts_a_named_session_and_types_its_first_prompt(fake: FakeHerdr, checkout: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch,
+                                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout / "sub", extra=["--", "--model", "haiku"], json_out=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"name": "impl-1", "pane": "w1:p8", "tab": "w1:t8", "session": SPAWNED_UUID, "prompt": "delivered"}
+    create = next(c for c in fake.calls if c[:2] == ("tab", "create"))
+    assert "--no-focus" in create and create[create.index("--label") + 1] == "impl-1"
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert start[2] == "impl-1" and list(start[start.index("--") + 1:]) == ["-n", "impl-1", "--model", "haiku"]
+    typed = next(c for c in fake.calls if c[:2] == ("agent", "prompt"))
+    assert typed[2] == "w1:p8" and typed[3].startswith("[relayed from orc via herdr-sleeper") and typed[3].endswith("build B-1")
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    assert rec["by"] == "orc" and rec["uuid"] == SPAWNED_UUID and rec["cwd"] == os.path.realpath(checkout / "sub")
+    assert "spawned" in events() and "delivered" in events()
+    rows = sleeper.presence_rows()
+    assert next(r for r in rows if r["session"] == SPAWNED_UUID)["spawned_by"] == "orc"
+
+
+def test_spawn_codex_gets_no_session_name_flag(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _spawn(monkeypatch, checkout, kind="codex") == 0
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert start[start.index("--kind") + 1] == "codex" and start[-1] == "--"
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"cwd": "/tmp"}, "checkout below"),
+    ({"cwd": "ROOT"}, "checkout below"),
+    ({"cwd": "ROOT/not-a-repo"}, "not inside a git checkout"),
+    ({"cwd": "ROOT/missing"}, "not a directory"),
+    ({"name": "-n"}, "--name must match"),
+    ({"name": "a b"}, "--name must match"),
+    ({"prompt": ""}, "first prompt: empty"),
+    ({"prompt": "go\x1b[2J"}, "control characters"),
+    ({"extra": ["--resume", UUID]}, "select a session"),
+    ({"extra": ["--continue"]}, "select a session"),
+    ({"extra": ["-n", "other"]}, "drop -n/--name"),
+    ({"extra": ["--name=other"]}, "drop -n/--name"),
+    ({"extra": ["-n=other"]}, "drop -n/--name"),
+    ({"extra": ["--verbose", "do the thing"]}, "would not survive a sleep"),
+    ({"extra": ["--print"]}, "would not survive a sleep"),
+    ({"sender": "bad sender"}, "--from"),
+])
+def test_spawn_refusals(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                        capsys: pytest.CaptureFixture[str], kw: dict[str, Any], needle: str) -> None:
+    cwd = str(kw.pop("cwd", checkout)).replace("ROOT", str(sleeper.SPAWN_ROOT))
+    assert _spawn(monkeypatch, cwd, **kw) == 2
+    assert needle in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+
+
+def test_spawn_refuses_a_taken_name(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                    capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout, name="a") == 1                 # the live agent's Herdr name
+    assert "live in w1:p1" in capsys.readouterr().err
+    slept_entry(fake)
+    assert _spawn(monkeypatch, checkout, name="a") == 1                 # now asleep under that name
+    assert "asleep in w1:p1" in capsys.readouterr().err
+    assert not any(c[:2] == ("tab", "create") for c in fake.calls)
+
+
+def test_spawn_that_does_not_start_closes_its_tab(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    fake.start_error = "agent_not_ready"
+    assert _spawn(monkeypatch, checkout) == 1
+    err = capsys.readouterr().err
+    assert "folder-trust" in err and "tab w1:t8 closed" in err
+    assert ("tab", "close", "w1:t8") in fake.calls and not any(a["pane_id"] == "w1:p8" for a in fake.agents)
+    assert "spawn-failed" in events() and not sleeper.SPAWNED.exists()
+
+
+def test_close_shuts_an_idle_spawned_session_down_and_closes_its_tab(fake: FakeHerdr, checkout: Path,
+                                                                      monkeypatch: pytest.MonkeyPatch,
+                                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout) == 0
+    fake.agents[-1]["pid_hint"] = 202
+    capsys.readouterr()
+    assert _close(monkeypatch, "impl-1") == 0
+    assert (202, signal.SIGTERM) in fake.signals and ("tab", "close", "w1:t8") in fake.calls
+    assert "closed impl-1 (tab w1:t8)" in capsys.readouterr().out
+    assert sleeper.read_json(sleeper.SPAWNED) == {}
+    rec = _event_rows("closed")[-1]
+    assert rec["by"] == "orc" and rec["forced"] is False and rec["exited"] is True
+
+
+@pytest.mark.parametrize("setup, needle", [
+    (lambda f: f.agents[0].update(agent_status="working"), "is busy (status working)"),
+    (lambda f: setattr(f, "screen", CLAUDE_SCREEN.format(composer="half a thought")), "composer draft"),
+    (lambda f: setattr(f, "helpers", {300: "zsh"}), "shell process"),
+])
+def test_close_refuses_what_would_lose_work_unless_forced(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str], setup: Any,
+                                                         needle: str) -> None:
+    setup(fake)
+    assert _close(monkeypatch, "a") == 1
+    assert needle in capsys.readouterr().err and fake.signals == [] and len(fake.agents) == 1
+    assert _close(monkeypatch, "a", force=True) == 0
+    assert fake.agents == [] and _event_rows("closed")[-1]["forced"] is True
+    assert "forced by orc" in sleeper.LOGFILE.read_text()
+
+
+def test_close_refuses_insomnia_and_mail_and_force_drops_the_claim(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    assert _claim(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    with sleeper.mailbox_lock(UUID):
+        sleeper.queue_message(UUID, "orc", "later", None)
+    assert _close(monkeypatch, "a") == 1
+    err = capsys.readouterr().err
+    assert "holds insomnia (ssh master)" in err and "undelivered mail" in err
+    assert _close(monkeypatch, "a", force=True) == 0
+    assert sleeper.read_json(sleeper.INSOMNIA) == {} and _event_rows("insomnia-released")[-1]["via"] == "close"
+
+
+def test_close_refuses_the_calling_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                           capsys: pytest.CaptureFixture[str]) -> None:
+    assert _close(monkeypatch, "a", force=True, caller="w1:p1") == 1
+    assert "calling session" in capsys.readouterr().err and fake.agents
+
+
+def test_close_of_one_pane_in_a_shared_tab_closes_only_the_pane(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents.append({"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_id": "t2"})
+    assert _close(monkeypatch, "a") == 0
+    assert ("pane", "close", "w1:p1") in fake.calls and not any(c[:2] == ("tab", "close") for c in fake.calls)
+    assert [a["pane_id"] for a in fake.agents] == ["w1:p2"]
+
+
+def test_close_of_a_sleeping_session_releases_closes_and_drops_the_row(fake: FakeHerdr,
+                                                                        monkeypatch: pytest.MonkeyPatch,
+                                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    fake.stub_panes.add("w1:p1")                                       # the stub waits for Enter
+    assert "w1:p1" in fake.resumes
+    assert _close(monkeypatch, "a") == 0
+    assert journal() == {} and "w1:p1" not in fake.resumes            # no stub typed back after a restart
+    assert ("tab", "close", "w1:t1") in fake.calls
+    assert f"--resume {UUID}" in capsys.readouterr().out
+
+
+def test_close_never_touches_a_reused_pane(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    fake.agents[0]["terminal_id"] = "term-reused"                      # same pane id, new terminal, no label
+    fake.agents[0]["label"] = None
+    assert _close(monkeypatch, UUID, force=True) == 1
+    assert "is asleep and its pane is not provably its own" in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls) and journal()
+
+
+def test_close_never_touches_a_pane_whose_row_is_orphaned(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    rows = journal()
+    sleeper.write_json(sleeper.JOURNAL, {ORPHAN: {**rows["w1:p1"], "phase": "orphaned"}})
+    assert _close(monkeypatch, UUID, force=True) == 1
+    assert "neither live nor asleep" in capsys.readouterr().err   # an orphan is no session's handle to act on
+    assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls) and ORPHAN in journal()
+
+
+def test_close_refuses_a_slept_pane_that_now_runs_someone_elses_work(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    fake.agents[0].pop("agent")                                        # ctrl-c in the stub: claim released
+    fake.foreground = "ssh"                                            # ... and the owner works in the pane
+    assert _close(monkeypatch, "a", force=True) == 1
+    assert "other than its wake stub" in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls) and journal()
+    fake.foreground = None                                             # a bare shell again: nothing to lose
+    assert _close(monkeypatch, "a") == 0 and journal() == {}
+
+
+def test_close_waits_for_a_waking_row_to_settle(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    rows = journal()
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {**rows["w1:p1"], "phase": "waking", "waking_pid": 4242}})
+    fake.agents[0].update(agent="claude", agent_session={"value": UUID})   # the woken agent is back already
+    before = list(fake.signals)
+    assert _close(monkeypatch, "a", force=True) == 1
+    assert "still being settled" in capsys.readouterr().err and fake.signals == before and journal()
+
+
+def test_insomnia_follows_a_new_session_id_in_the_same_terminal(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _claim(monkeypatch) == 0
+    new = "9a9a9a9a-0000-4000-8000-000000000001"
+    fake.agents[0]["agent_session"] = {"value": new}                   # /clear: same process, new session id
+    transcript(Path(str(sleeper.TRANSCRIPTS.parent)), new, 30)
+    ok, reason, _ = sleeper.assess(fake.agents[0], fake.agents, 12, {}, idle_since=0.0)
+    assert not ok and reason == "insomnia (ssh master)"               # holds before the watcher re-keys it
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 13 * 3600}}
+    sleeper.watch_tick(clocks, dict(sleeper.DEFAULTS))
+    assert journal() == {} and list(sleeper.read_json(sleeper.INSOMNIA)) == [new]
+    assert _event_rows("insomnia-carried")[-1]["old"] == UUID
+    fake.agents[0]["terminal_id"] = "term-elsewhere"                   # another terminal: no carry-over
+    assert sleeper.insomnia_reason("other-uuid", "w1:p1", "term-elsewhere") is None
+    assert _release(monkeypatch) == 0 and sleeper.read_json(sleeper.INSOMNIA) == {}
+
+
+def test_spawn_never_types_into_a_pane_that_shows_no_shell(fake: FakeHerdr, checkout: Path,
+                                                          monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    fake.foreground = "zsh-config-wizard"
+    assert _spawn(monkeypatch, checkout) == 1
+    assert "never showed a bare shell" in capsys.readouterr().err
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls) and ("tab", "close", "w1:t8") in fake.calls
+
+
+def test_damaged_bytes_in_a_state_file_are_damage_not_a_crash(state: Path) -> None:
+    sleeper.ensure_state_dir()
+    sleeper.INSOMNIA.write_bytes(b"\xff\xfe{}")
+    with pytest.raises(sleeper.DamagedState):
+        sleeper.read_json(sleeper.INSOMNIA)
+    assert sleeper.insomnia_reason(UUID).startswith("insomnia claims unreadable")
+
+
+def test_watcher_prunes_spawn_records_of_sessions_that_are_gone(fake: FakeHerdr, checkout: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _spawn(monkeypatch, checkout) == 0
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "impl-1" in sleeper.read_json(sleeper.SPAWNED)               # live: kept
+    fake.agents = [a for a in fake.agents if a["pane_id"] != "w1:p8"]   # its tab closed by hand
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "impl-1" in sleeper.read_json(sleeper.SPAWNED)               # within the grace period
+    later = time.time() + 2 * 3600
+    monkeypatch.setattr(sleeper.time, "time", lambda: later)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert sleeper.read_json(sleeper.SPAWNED) == {} and "spawn-record-dropped" in events()
+
+
+def test_spawn_record_follows_a_cleared_session(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout) == 0
+    new = "9a9a9a9a-0000-4000-8000-000000000002"
+    fake.agents[-1]["agent_session"] = {"value": new}                  # /clear in the spawned session
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert sleeper.read_json(sleeper.SPAWNED)["impl-1"]["uuid"] == new and "spawn-record-moved" in events()
+    sleeper.record_spawned("impl-1", {**sleeper.read_json(sleeper.SPAWNED)["impl-1"], "uuid": SPAWNED_UUID})
+    assert _close(monkeypatch, "impl-1") == 0                          # a stale record still closes by name
+    assert "closed impl-1" in capsys.readouterr().out

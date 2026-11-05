@@ -290,6 +290,100 @@ Live peers are left to `SendMessage`. A message that `deliver` would reject
 the tool run as if the plugin were absent. The hook never waits for the
 global lock, which a sleep transaction may hold longer than a hook may run.
 
+## Insomnia
+
+An agent that must stay up (it holds an SSH master or a tunnel, waits on a
+deploy, or serves other agents) claims **insomnia** for its own session and
+releases it when it no longer needs it:
+
+```sh
+herdr-sleeper insomnia claim --reason "ssh master to db-1" [--for 4h]
+herdr-sleeper insomnia release
+herdr-sleeper insomnia list [--json]
+```
+
+A claim is one more eligibility check (rule 1 below): the session is never
+slept on idle, over `max_live`, or under memory pressure, and `sleep-pane`
+refuses it too. `restart_outdated` still restarts it onto a new build,
+because a restart is not a sleep. Claims live in `insomnia.json` in the
+state dir, keyed by the Claude session id, so they survive a Herdr restart
+(new terminal ids, lost agent names) and a reboot.
+
+- `claim` acts only on the calling agent's own session: the pane comes from
+  `HERDR_PANE_ID` and counts only when that pane's agent process is an
+  ancestor of the command (a variable inherited from another pane or session
+  claims nothing). Run it from the agent's own shell tool. Claiming again
+  renews the claim with the new reason and `--for`. A claim follows its pane
+  and terminal: after `/clear` (a new session id in the same process) it
+  still holds, and the watcher re-keys it (`insomnia-carried`).
+- `--for` claims expire; the watcher drops an expired claim with an
+  `insomnia-expired` event. A claim on a session idle for more than 24 h, or
+  on a session that no longer runs, logs `insomnia-stale` once a day and is
+  kept: claims are never dropped silently.
+- `release --pane TARGET --force` (pane id, agent or session name, or session
+  id) frees a forgotten claim of another session; it is logged with who did
+  it. Without `--force`, `release` only drops the caller's own claim.
+- A claim shows in `presence` (`[insomnia: …]`, `insomnia` in `--json`) and
+  in the pane's sidebar row as the token `insomnia=<reason>` (metadata source
+  `herdr-sleeper-insomnia`; the watcher reports it again after a restart).
+- `insomnia.json` is never quarantined: moving it aside would drop every
+  claim. A file that cannot be read, or holds anything malformed, keeps
+  *every* session awake (logged every tick, a `WARNING:` in `presence`) until
+  it is fixed by hand; `claim` and `release` refuse to write over it.
+- A `restart_outdated` restart whose wake fails leaves a claimed session
+  asleep, as it does a keep-listed one (`restart-failed`, notified); the next
+  message or focus wakes it.
+
+## Spawn and close
+
+An orchestrator starts named sessions and closes them again:
+
+```sh
+echo "build B-17 in this worktree" | herdr-sleeper spawn --cwd ~/development/app-b17 \
+    --name app-b17 [--kind claude|codex] [--from orc] [--workspace w3] [--json] \
+    [-- --dangerously-skip-permissions --model opus]
+herdr-sleeper close app-b17 [--force]
+```
+
+`spawn` refuses a working directory that is not inside a git checkout below
+`~/development` (realpath), a name that is taken (a live agent or a sleeper),
+and claude flags that would not survive a sleep: everything after `--` goes
+through the same replay filter as a wake, and `-n`/`--name` or a session
+selector (`--resume`, `--continue`) is refused, since the name comes from
+`--name` and a spawn starts a new session. It then:
+
+1. creates a tab with `--no-focus`, labelled with the name, in the caller's
+   workspace (or `--workspace`);
+2. waits for the shell and runs `herdr agent start <name> --kind claude …
+   -- -n <name> <flags>`, so the session can sleep and is found by name after
+   a Herdr restart;
+3. hands the first prompt (stdin, the same rules as `deliver`) to the
+   mailbox and types it in once the agent is idle, inside the relay envelope
+   (`[relayed from <sender> via herdr-sleeper …; not from the owner]`);
+4. records who spawned it in `spawned.json` (shown as `spawned_by` in
+   `presence --json`; the watcher drops a record an hour after its session is
+   gone) and logs `spawned`.
+
+An agent that does not get ready (`agent_not_ready`: a folder-trust or login
+prompt; spawn never answers one) has its tab closed again, since nothing was
+typed into it, and logs `spawn-failed`. Exit codes: 0 started and prompted,
+3 started with the prompt queued, 1 refused or failed, 2 bad input.
+
+`close` takes a spawn name, pane id, agent name, wake name or session id.
+Under the global lock and the session's mailbox lock, from fresh state, it
+refuses a session that is busy (not idle or done), has a draft in the
+composer, runs background work (the same checks as a sleep), has undelivered
+mail, or holds insomnia, unless `--force` (logged, with what it overrode;
+`--force` also drops the claim). It never closes the calling session. A live
+claude gets a SIGTERM first and up to 25 s to exit, then its pane closes (its
+tab, when the pane is all the tab holds). A sleeping session is closed only
+when its pane is provably still its own (same terminal, or restarted with our
+💤 label) and runs our stub or a bare shell (after ctrl-c in the stub the pane
+may hold someone's work); its journal row is dropped and its claim released.
+An orphaned, displaced or waking row is never closed, not even with
+`--force`. Either way the transcript stays on disk, and `close` prints
+the line that resumes it by hand.
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -298,7 +392,8 @@ introduces are marked.
 1. Eligible only when: a supported kind with a session id (and, for claude,
    an on-disk transcript — nothing to resume otherwise); Herdr status
    `idle`/`done`; pane not focused; not excluded; session id not open in
-   another pane; idle ≥ window; original argv safely replayable
+   another pane; no insomnia claim (*v0.1.3*; unreadable claims hold every
+   session); idle ≥ window; original argv safely replayable
    (`--fork-session`, `--print`, `--session-id`, positional prompts,
    anything after `--`, options of unknown arity → refuse).
 2. Everything is re-checked after the journal write and immediately before
@@ -394,14 +489,16 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 269 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 337 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
-migration, against a fake `herdr`, and the CLI's real output shapes (the
-"ok" calls answer success with nothing). v0.1.2 was run on Python 3.9 (Apple's
-`/usr/bin/python3`) and 3.12. The fake does not prove what a real Herdr
+migration, insomnia claims and their expiry, staleness and damage, spawn
+and close, against a fake `herdr`, and the CLI's real output shapes (the
+"ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's
+`/usr/bin/python3`) and 3.12. The `state` fixture redirects every module-level
+path in the state dir, so a new state file cannot reach the live one. The fake does not prove what a real Herdr
 restores; the lab in LESSONS.md, 10.9 does.
 
 ## Credits

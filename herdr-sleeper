@@ -31,6 +31,9 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper stop / start            stop the watcher and keep it stopped / undo that
   herdr-sleeper deliver TARGET --from SENDER   message on stdin to a live or sleeping agent (wakes it)
   herdr-sleeper presence [--json]       live and sleeping agents, for agents looking for peers
+  herdr-sleeper insomnia claim|release|list   keep the calling agent's own session awake
+  herdr-sleeper spawn --cwd DIR --name NAME [-- FLAGS]   new tab + named agent, first prompt on stdin
+  herdr-sleeper close NAME [--force]    close a session's pane (refuses busy, draft, insomnia)
   herdr-sleeper claude-hook             Claude Code hook: ListAgents shows sleepers, SendMessage wakes them
   herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
 
@@ -186,6 +189,7 @@ STOPPED = STATE_DIR / "stopped"                # `stop` was run: no watcher tick
 WATCHER_MISSING = STATE_DIR / "watcher-missing"  # mtime: when a missing external watcher was last reported
 MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
 DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
+INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
 
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
@@ -423,6 +427,8 @@ def read_json(path: Path) -> dict:
         text = path.read_text()
     except OSError as exc:
         raise SleeperError(f"{path} could not be read ({exc}); refusing to act without it")
+    except UnicodeDecodeError as exc:
+        raise DamagedState(f"{path} is not UTF-8 ({exc.reason}); refusing to act on a damaged state file")
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -1504,13 +1510,15 @@ DRY_RUN_OUTCOME = "would sleep (dry run)"
 
 def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict,
            exclude: set[str] | None = None, idle_since: float | None = None,
-           allow_focused: bool = False) -> tuple[bool, str, float | None]:
+           allow_focused: bool = False, restart: bool = False) -> tuple[bool, str, float | None]:
     """Decide whether one agent may be slept. Returns (ok, reason, idle_hours).
 
     The idle clock itself lives in the watcher (seq movement); `idle_since`
     is the wall-clock start (time.time()) of this pane's current idle
     stretch. Manual `sleep-pane` passes idle_since=None to skip the window,
     and allow_focused=True: an explicit request may sleep the focused pane.
+    restart=True: a sleep that is woken at once onto a new build, which an
+    insomnia claim does not stop (a restart is not a sleep).
     """
     pane = agent["pane_id"]
     kind = agent.get("agent")
@@ -1525,6 +1533,10 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, "no session uuid (cannot resume)", None
     if not valid_session_id(uuid):
         return False, "session id has an unexpected shape (refusing to use it in a glob or argv)", None
+    if not restart:
+        held = insomnia_reason(uuid, pane, agent.get("terminal_id"))
+        if held:
+            return False, held, None
     # A restarted claude pane loses its Herdr name; the Claude session name and the title it sets survive.
     if exclude and kind == "claude" and (agent.get("terminal_title_stripped") in exclude
                                          or claude_session_name(transcript_for(uuid)) in exclude):
@@ -1550,7 +1562,8 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
 
 
 def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
-            idle_since: float | None = None, allow_focused: bool = False) -> tuple[str | None, dict | None]:
+            idle_since: float | None = None, allow_focused: bool = False,
+            restart: bool = False) -> tuple[str | None, dict | None]:
     """Re-run every check against live state right before acting. Returns (reason_to_stop, live_agent)."""
     fresh = {a["pane_id"]: a for a in list_agents() if a.get("agent")}
     now = fresh.get(agent["pane_id"])
@@ -1560,7 +1573,8 @@ def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
         return f"state changed since scan ({agent.get('agent_status')} → {now.get('agent_status')})", now
     if (now.get("agent_session") or {}).get("value") != (agent.get("agent_session") or {}).get("value"):
         return "session changed since scan", now
-    ok, reason, _ = assess(now, list(fresh.values()), idle_hours, journal, exclude, idle_since, allow_focused)
+    ok, reason, _ = assess(now, list(fresh.values()), idle_hours, journal, exclude, idle_since, allow_focused,
+                           restart)
     if not ok:
         return reason, now
     profile = PROFILES.get(now.get("agent"), {})
@@ -1667,12 +1681,13 @@ def restore_label(pane: str, entry: dict, current: str | None) -> None:
 
 def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool,
                 idle_since: float | None = None, allow_focused: bool = False,
-                notify_enabled: bool = True) -> tuple[bool, str]:
+                notify_enabled: bool = True, restart: bool = False) -> tuple[bool, str]:
     """Try to sleep one agent. Returns (slept, outcome). Caller holds the lock.
 
     allow_focused: an explicit request may sleep the focused pane (threaded
     through to the final recheck, which re-reads `focused` live); it still has
-    to be idle.
+    to be idle. restart: restart_onto_new_build's sleep, which wakes at once
+    (an insomnia claim does not stop it).
     """
     pane = agent["pane_id"]
     kind = agent.get("agent")
@@ -1706,7 +1721,7 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         return False, (f"refused: pane holds a kept handle for {held.get('uuid')} ({held.get('phase', 'asleep')}); "
                        "wake or resolve it first")
     if dry_run:  # no event: the dry-run watcher asks this every tick; its log records changes only
-        stop, _ = recheck(agent, idle_hours, journal, exclude, idle_since, allow_focused)
+        stop, _ = recheck(agent, idle_hours, journal, exclude, idle_since, allow_focused, restart)
         if stop:
             return False, f"refused: {stop}"
         return False, DRY_RUN_OUTCOME
@@ -1718,11 +1733,12 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         if not free:
             return False, "refused: a message to this session is being delivered"
         return _sleep_transaction(agent, profile, replay, idle_hours, exclude, idle_since, allow_focused,
-                                  notify_enabled)
+                                  notify_enabled, restart)
 
 
 def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours: float, exclude: set[str],
-                       idle_since: float | None, allow_focused: bool, notify_enabled: bool) -> tuple[bool, str]:
+                       idle_since: float | None, allow_focused: bool, notify_enabled: bool,
+                       restart: bool = False) -> tuple[bool, str]:
     """sleep_agent past its checks: journal, last recheck, exit, stub. Caller holds both locks."""
     pane, kind = agent["pane_id"], agent.get("agent")
     uuid = agent["agent_session"]["value"]
@@ -1750,7 +1766,7 @@ def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours
     # 2. the last look before acting — after the journal write, so nothing happens between
     #    check and act but the exit itself. Targets the pane id: names can be renamed under us.
     stop, _ = recheck(agent, idle_hours, {k: v for k, v in journal.items() if k != pane}, exclude, idle_since,
-                      allow_focused)
+                      allow_focused, restart)
     if stop:
         journal = read_json(JOURNAL)
         journal.pop(pane, None)
@@ -2632,17 +2648,704 @@ def cmd_deliver_pending(args: argparse.Namespace) -> int:
     return code
 
 
+# --------------------------------------------------------------- insomnia
+
+# An agent that must stay up (it holds an SSH master or a tunnel, waits on a deploy, serves other
+# agents) claims insomnia for its own Claude session: one more eligibility check, so the session is
+# never slept on idle, over max_live or under memory pressure. restart_outdated still restarts it
+# (a restart is not a sleep). Claims are keyed by session id, so they survive a Herdr restart (new
+# terminal ids, lost agent names) and a reboot. insomnia.json is never quarantined: moving it aside
+# would drop every claim without a word, so a damaged file holds every session awake until it is
+# fixed by hand.
+INSOMNIA_STALE_SECONDS = 24 * 3600   # a claim on a session idle this long is reported once a day, never dropped
+INSOMNIA_REASON_MAX = 120
+INSOMNIA_SOURCE = "herdr-sleeper-insomnia"  # its own metadata source: the sleep label keeps "herdr-sleeper"
+INSOMNIA_TOKEN = "insomnia"
+INSOMNIA_TOKENS: dict[str, tuple[str, object]] = {}  # session id -> (pane, terminal id) the token went to (watcher memory)
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def read_insomnia() -> dict[str, dict]:
+    """Every claim on disk, expired ones included. DamagedState for anything malformed (never
+    quarantined, see above); callers that sleep read that as "every session holds insomnia"."""
+    data = read_json(INSOMNIA)
+    for uuid, rec in data.items():
+        if (not valid_session_id(uuid) or not isinstance(rec, dict) or not _number(rec.get("at"))
+                or not (rec.get("until") is None or _number(rec.get("until")))
+                or not (rec.get("reason") is None or isinstance(rec.get("reason"), str))):
+            raise DamagedState(f"{INSOMNIA} holds a malformed claim; nothing sleeps until it is fixed by hand")
+    return data
+
+
+def insomnia_claims(now: float | None = None) -> dict[str, dict]:
+    """The claims in force: an expired `--for` claim no longer holds (the watcher drops it, logged)."""
+    now = time.time() if now is None else now
+    return {u: r for u, r in read_insomnia().items() if r.get("until") is None or r["until"] > now}
+
+
+def claim_for(claims: dict[str, dict], uuid: str | None, pane: str | None = None,
+              terminal: object = None) -> str | None:
+    """The claim (its session id) that holds this agent: its own, or one made in the same pane and
+    terminal under another session id. `/clear` starts a new session id in the same process, and a
+    claim must not quietly stop holding then; the watcher re-keys such a claim (`insomnia-carried`)."""
+    if uuid in claims:
+        return uuid
+    if pane and terminal:
+        return next((u for u, r in claims.items() if r.get("pane") == pane and r.get("terminal_id") == terminal), None)
+    return None
+
+
+def insomnia_reason(uuid: str, pane: str | None = None, terminal: object = None) -> str | None:
+    """Why this session may not sleep, or None. Fail closed: unreadable claims hold every session."""
+    try:
+        claims = insomnia_claims()
+    except SleeperError as exc:
+        return f"insomnia claims unreadable: {exc}"
+    key = claim_for(claims, uuid, pane, terminal)
+    if key is None:
+        return None
+    rec = claims[key]
+    return "insomnia" + (f" ({rec['reason']})" if rec.get("reason") else "")
+
+
+def insomnia_label(rec: dict) -> str:
+    until = rec.get("until")
+    return (rec.get("reason") or "claimed") + (f" until {_iso(until)}" if until else "")
+
+
+def _iso(stamp: float) -> str:
+    return dt.datetime.fromtimestamp(stamp).isoformat(timespec="seconds")
+
+
+def reason_problem(text: str | None) -> str | None:
+    if text is None:
+        return None
+    if not text.strip():
+        return "--reason is empty"
+    if len(text) > INSOMNIA_REASON_MAX:
+        return f"--reason is longer than {INSOMNIA_REASON_MAX} characters"
+    if RESUME_CONTROL.search(text):
+        return "--reason has control characters"
+    return None
+
+
+def ancestors(table: dict[int, tuple[int, str]], pid: int) -> list[int]:
+    """pid's parent, grandparent, … up to init, from a process table (cycles and gaps end the walk)."""
+    chain: list[int] = []
+    while pid in table and len(chain) < 128:
+        pid = table[pid][0]
+        if pid <= 0 or pid in chain:
+            break
+        chain.append(pid)
+    return chain
+
+
+def calling_agent(agents: list[dict]) -> tuple[dict | None, str | None]:
+    """The live agent this command runs under, or (None, why). The pane comes from HERDR_PANE_ID and
+    is believed only when that pane's agent process is an ancestor of this one: a variable inherited
+    from another pane or session must not claim for someone else's session."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return None, "not run inside a Herdr pane (no HERDR_PANE_ID)"
+    hit = next((a for a in agents if a["pane_id"] == pane and a.get("agent")
+                and a.get("agent") != CLAIM_AGENT), None)
+    if hit is None:
+        return None, f"{pane} runs no agent"
+    if hit.get("agent") not in PROFILES:
+        return None, f"{pane} runs {hit.get('agent')}, which is never slept; no claim needed"
+    if not valid_session_id((hit.get("agent_session") or {}).get("value")):
+        return None, f"{pane} reports no session id yet; try again in a moment"
+    present, _argv, pid = agent_process(pane, hit["agent"])
+    if present is not True or not isinstance(pid, int) or pid <= 1:
+        return None, f"the agent process in {pane} cannot be identified"
+    if pid not in ancestors(process_table(), os.getpid()):
+        return None, f"this command does not run under the agent in {pane} (HERDR_PANE_ID from elsewhere?)"
+    return hit, None
+
+
+def report_insomnia_token(pane: str, rec: dict | None) -> None:
+    """Show (rec) or clear (None) the claim in the pane's sidebar row. Best effort: display only."""
+    with contextlib.suppress(SleeperError):
+        if rec is None:
+            herdr("pane", "report-metadata", pane, "--source", INSOMNIA_SOURCE, "--clear-token", INSOMNIA_TOKEN,
+                  check=False)
+        else:
+            herdr("pane", "report-metadata", pane, "--source", INSOMNIA_SOURCE,
+                  "--token", f"{INSOMNIA_TOKEN}={(rec.get('reason') or 'on')[:40]}", check=False)
+
+
+def claim_insomnia(args: argparse.Namespace) -> int:
+    problem = reason_problem(args.reason)
+    hours = None
+    if args.duration is not None:
+        try:
+            hours = parse_duration(args.duration)
+        except ConfigError:
+            problem = problem or f"--for {args.duration!r} is not a duration (90m, 4h, 2d)"
+        else:
+            if not 0 < hours < math.inf:
+                problem = problem or "--for must be longer than zero"
+    if problem:
+        print(f"insomnia: {problem}", file=sys.stderr)
+        return 2
+    agents = list_agents()
+    me, why = calling_agent(agents)
+    if me is None:
+        print(f"insomnia: {why}; an agent claims only for its own session, from inside it", file=sys.stderr)
+        return 1
+    uuid = me["agent_session"]["value"]
+    name = me.get("name") or (claude_session_name(transcript_for(uuid)) if me.get("agent") == "claude" else None)
+    now = time.time()
+    with locked():
+        try:
+            claims = read_insomnia()
+        except SleeperError as exc:
+            print(f"insomnia: {exc}", file=sys.stderr)
+            return 1
+        key = claim_for(claims, uuid, me["pane_id"], me.get("terminal_id"))
+        old = claims.pop(key, None) if key else None
+        rec = {"at": old["at"] if old else now, "since": (old or {}).get("since") or _iso(now),
+               "reason": args.reason, "until": now + hours * 3600 if hours else None,
+               "pane": me["pane_id"], "terminal_id": me.get("terminal_id"), "name": name,
+               "kind": me.get("agent"), "stale_reported": None}
+        claims[uuid] = rec
+        write_json(INSOMNIA, claims)
+    event("insomnia-claimed", uuid=uuid, pane=me["pane_id"], name=name, reason=args.reason,
+          until=_iso(rec["until"]) if rec["until"] else None, renewed=old is not None)
+    report_insomnia_token(me["pane_id"], rec)
+    print(f"insomnia claimed for {name or me['pane_id']} ({uuid}): {insomnia_label(rec)}; "
+          "release it with `herdr-sleeper insomnia release` when you no longer need it")
+    return 0
+
+
+def claim_target(target: str, claims: dict[str, dict], agents: list[dict]) -> str:
+    """The session id a release --pane names: a claimed session id, or a live/sleeping agent's
+    pane id, agent name, wake name or Claude session name."""
+    if target in claims:
+        return target
+    named = [u for u, r in claims.items() if target in (r.get("name"), r.get("pane"))]
+    try:
+        state, hit, _key = resolve_target(target, agents, read_json(JOURNAL))
+    except SleeperError:
+        if len(named) == 1:
+            return named[0]
+        raise
+    return (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
+
+
+def release_insomnia(args: argparse.Namespace) -> int:
+    agents = list_agents()
+    me, why = calling_agent(agents)
+    mine = me["agent_session"]["value"] if me else None
+    if me:  # a claim made before a /clear is still the caller's own
+        mine = claim_for(insomnia_claims_or_empty(), mine, me["pane_id"], me.get("terminal_id")) or mine
+    if args.pane:
+        try:
+            uuid = claim_target(args.pane, insomnia_claims_or_empty(), agents)
+        except SleeperError as exc:
+            print(f"insomnia: {exc}", file=sys.stderr)
+            return 1
+        if uuid != mine and not args.force:
+            print(f"insomnia: {args.pane} is another session's claim; agents release only their own. "
+                  "To free memory from a forgotten claim, pass --force (logged)", file=sys.stderr)
+            return 1
+    elif mine is None:
+        print(f"insomnia: {why}; pass --pane TARGET --force to release another session's claim", file=sys.stderr)
+        return 1
+    else:
+        uuid = mine
+    with locked():
+        try:
+            claims = read_insomnia()
+        except SleeperError as exc:
+            print(f"insomnia: {exc}", file=sys.stderr)
+            return 1
+        rec = claims.pop(str(uuid), None)
+        if rec is None:
+            print(f"no insomnia claim for {args.pane or uuid}; nothing to release")
+            return 0
+        write_json(INSOMNIA, claims)
+    forced = uuid != mine
+    by = context_sender(agents) or f"pid {os.getppid()}"
+    event("insomnia-released", uuid=uuid, name=rec.get("name"), by=by, forced=forced)
+    if forced:
+        say(f"insomnia of {rec.get('name') or uuid} released by {by} (--force)")
+    INSOMNIA_TOKENS.pop(str(uuid), None)
+    live = next((a for a in agents if (a.get("agent_session") or {}).get("value") == uuid), None)
+    if live:
+        report_insomnia_token(live["pane_id"], None)
+    print(f"insomnia released for {rec.get('name') or uuid}; it sleeps like the others again")
+    return 0
+
+
+def insomnia_claims_or_empty() -> dict[str, dict]:
+    """For lookups only (never for a sleep decision): a damaged file names no claims here."""
+    try:
+        return read_insomnia()
+    except SleeperError:
+        return {}
+
+
+def insomnia_rows(claims: dict[str, dict], now: float) -> list[dict]:
+    agents = list_agents()
+    clocks = load_clocks()
+    journal = read_json(JOURNAL)
+    rows = []
+    for uuid, rec in sorted(claims.items(), key=lambda kv: kv[1]["at"]):
+        live = next((a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
+                     and (a.get("agent_session") or {}).get("value") == uuid), None)
+        asleep = next((k for k, e in journal.items() if valid_entry(e) and e["uuid"] == uuid), None)
+        clock = clocks.get(live["pane_id"]) if live else None
+        idle = (now - clock["since"]) / 3600 if live and clock and clock.get("uuid") == uuid else None
+        rows.append({"session": uuid, "name": rec.get("name"), "pane": live["pane_id"] if live else asleep,
+                     "state": (live.get("agent_status") or "unknown") if live else "asleep" if asleep else "not running",
+                     "since": rec.get("since"), "until": _iso(rec["until"]) if rec.get("until") else None,
+                     "reason": rec.get("reason"), "idle_hours": round(idle, 1) if idle is not None else None})
+    return rows
+
+
+def list_insomnia(args: argparse.Namespace) -> int:
+    try:
+        claims = insomnia_claims()
+    except SleeperError as exc:
+        print(f"insomnia: {exc}", file=sys.stderr)
+        return 2
+    rows = insomnia_rows(claims, time.time())
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no insomnia claims")
+    for r in rows:
+        idle = f" idle {r['idle_hours']:g}h" if r["idle_hours"] is not None else ""
+        print(f"{str(r['name'] or '-'):30} {str(r['pane'] or '-'):10} {r['state']:12} since {r['since']}"
+              f"{' until ' + r['until'] if r['until'] else ''}{idle}  {r['reason'] or ''}")
+    return 0
+
+
+def cmd_insomnia(args: argparse.Namespace) -> int:
+    return {"claim": claim_insomnia, "release": release_insomnia, "list": list_insomnia}[args.action](args)
+
+
+def tend_insomnia(agents: list[dict], clocks: dict[str, dict], now: float) -> None:
+    """Watcher, under the lock: drop expired claims (logged), report stale ones once a day, and keep
+    the sidebar token on the pane each claimed session runs in (metadata does not survive a restart)."""
+    try:
+        claims = read_insomnia()
+    except SleeperError as exc:
+        note_skip("<insomnia>", f"insomnia claims unreadable, nothing sleeps until fixed by hand: {exc}")
+        return
+    LAST_SKIP.pop("<insomnia>", None)
+    live = {(a.get("agent_session") or {}).get("value"): a for a in agents
+            if a.get("agent") and a.get("agent") != CLAIM_AGENT}
+    changed = False
+    for uuid, rec in list(claims.items()):
+        moved = None if uuid in live else next(
+            (a for u, a in live.items() if valid_session_id(u) and u not in claims and rec.get("terminal_id")
+             and a["pane_id"] == rec.get("pane") and a.get("terminal_id") == rec.get("terminal_id")), None)
+        if moved is not None:  # same pane and terminal, new session id (/clear): the claim follows it
+            new = moved["agent_session"]["value"]
+            claims[new] = claims.pop(uuid)
+            changed = True
+            event("insomnia-carried", old=uuid, uuid=new, pane=moved["pane_id"], name=rec.get("name"))
+            say(f"insomnia of {rec.get('name') or uuid} carried over to session {new} (same pane and terminal)")
+            INSOMNIA_TOKENS.pop(uuid, None)
+            uuid = new
+        agent = live.get(uuid)
+        name = rec.get("name") or uuid
+        if rec.get("until") is not None and rec["until"] <= now:
+            claims.pop(uuid)
+            changed = True
+            event("insomnia-expired", uuid=uuid, name=rec.get("name"), reason=rec.get("reason"))
+            say(f"insomnia of {name} expired (--for); it sleeps like the others again")
+            INSOMNIA_TOKENS.pop(uuid, None)
+            if agent:
+                report_insomnia_token(agent["pane_id"], None)
+            continue
+        clock = clocks.get(agent["pane_id"]) if agent else None
+        idle = now - clock["since"] if clock and clock.get("uuid") == uuid else None
+        stale = (idle is not None and idle >= INSOMNIA_STALE_SECONDS) or (
+            agent is None and now - rec["at"] >= INSOMNIA_STALE_SECONDS)
+        reported = rec.get("stale_reported")
+        if stale and not (_number(reported) and now - reported < INSOMNIA_STALE_SECONDS):
+            rec["stale_reported"] = now
+            changed = True
+            what = f"idle {idle / 3600:.0f}h" if idle is not None else "session not running"
+            event("insomnia-stale", uuid=uuid, name=rec.get("name"), reason=rec.get("reason"), state=what)
+            say(f"WARN insomnia of {name} looks forgotten ({what}); kept. Release: herdr-sleeper insomnia "
+                f"release --pane {uuid} --force")
+        if agent and INSOMNIA_TOKENS.get(uuid) != (agent["pane_id"], agent.get("terminal_id")):
+            report_insomnia_token(agent["pane_id"], rec)
+            INSOMNIA_TOKENS[uuid] = (agent["pane_id"], agent.get("terminal_id"))
+    if changed:
+        write_json(INSOMNIA, claims)
+
+
+# ------------------------------------------------------------- spawn, close
+
+# An orchestrator creates a named agent session in a new tab, hands it its first prompt, and closes it
+# once the work is done. Spawned claude sessions get `-n <name>`, so they can sleep, are found again by
+# that name after a Herdr restart, and their extra flags must pass the same replay filter a wake uses.
+SPAWN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+SPAWN_KINDS = ("claude", "codex")
+SPAWN_ROOT = Path(os.path.expanduser("~/development"))  # spawned sessions work in checkouts below this
+SPAWN_READY_MS = 120_000
+SPAWN_SHELL_SECONDS = 20         # how long a new tab may take to show its shell prompt
+SPAWNED = STATE_DIR / "spawned.json"  # session name -> who spawned it and where (close, presence)
+
+
+def spawn_cwd_problem(raw: str) -> tuple[Path | None, str | None]:
+    """(resolved cwd, None) when raw is a directory inside a git checkout below SPAWN_ROOT."""
+    cwd = Path(os.path.realpath(os.path.expanduser(raw)))
+    root = Path(os.path.realpath(SPAWN_ROOT))
+    if not cwd.is_dir():
+        return None, f"--cwd {raw} is not a directory"
+    if cwd == root or root not in cwd.parents:
+        return None, f"--cwd must be a checkout below {SPAWN_ROOT}"
+    for d in (cwd, *cwd.parents):
+        if d == root:
+            break
+        if (d / ".git").exists():
+            return cwd, None
+    return None, f"--cwd {raw} is not inside a git checkout"
+
+
+def spawn_args_problem(kind: str, extra: list[str]) -> str | None:
+    """Why these agent flags may not go to a spawned session, or None. Values are never echoed."""
+    if any(RESUME_CONTROL.search(a) for a in extra):
+        return "agent arguments contain control characters"
+    if kind != "claude":
+        return None
+    if any(a.startswith("-n") or a.startswith("--name") for a in extra):
+        return "the session name comes from --name; drop -n/--name from the agent arguments"
+    replay, why = replayable_argv(extra)
+    if replay is None:
+        return f"agent arguments would not survive a sleep: {why}"
+    if replay != extra:
+        return "agent arguments select a session (--resume, --continue); a spawn starts a new one"
+    return None
+
+
+def name_taken(name: str, agents: list[dict]) -> str | None:
+    """Where a session or agent called name already is, or None."""
+    for a in agents:
+        if a.get("agent") and a.get("agent") != CLAIM_AGENT and name in (a.get("name"), a.get("terminal_title_stripped")):
+            return f"live in {a['pane_id']}"
+    for key, e in read_json(JOURNAL).items():
+        if valid_entry(e) and name in (e.get("name"), e.get("claude_name"), wake_name(e)):
+            return f"asleep in {key}"
+    return None
+
+
+def caller_workspace(agents: list[dict]) -> str | None:
+    pane = os.environ.get("HERDR_PANE_ID")
+    hit = next((a for a in agents if a["pane_id"] == pane), None) if pane else None
+    return (hit or {}).get("workspace_id")
+
+
+def record_spawned(name: str, rec: dict | None) -> None:
+    """Add (rec) or drop (None) a spawn record. Caller holds the global lock."""
+    try:
+        spawned = read_json(SPAWNED)
+    except DamagedState as exc:
+        say(f"WARN {exc}; damaged spawn records moved to {quarantine(SPAWNED)}")
+        spawned = {}
+    if rec is None:
+        if spawned.pop(name, None) is None:
+            return
+    else:
+        spawned[name] = rec
+    write_json(SPAWNED, spawned)
+
+
+SPAWN_RECORD_GRACE_SECONDS = 3600  # a record whose session is gone this long is dropped (attribution only)
+
+
+def prune_spawned(agents: list[dict], journal: dict, now: float) -> None:
+    """Watcher, under the lock: drop spawn records whose session is neither live nor asleep (its tab
+    was closed by hand, the agent quit). They only say who spawned a session; the journal, not this
+    file, is the handle to a sleeping one."""
+    records = spawned_records()
+    if not records:
+        return
+    present = {(a.get("agent_session") or {}).get("value") for a in agents if a.get("agent")}
+    present |= {e["uuid"] for e in journal.values() if valid_entry(e)}
+    gone = []
+    for name, rec in records.items():
+        if rec.get("uuid") not in present:  # /clear: the same pane runs a new session under that name
+            same = next((a for a in agents if a["pane_id"] == rec.get("pane") and a.get("name") == name
+                         and valid_session_id((a.get("agent_session") or {}).get("value"))), None)
+            if same is None and isinstance(journal.get(rec.get("pane")), dict):
+                row = journal[rec["pane"]]
+                same = {"agent_session": {"value": row["uuid"]}} if valid_entry(row) and row.get("name") == name else None
+            if same is not None:
+                record_spawned(name, {**rec, "uuid": same["agent_session"]["value"]})
+                event("spawn-record-moved", name=name, old=rec.get("uuid"), uuid=same["agent_session"]["value"])
+                continue
+        try:
+            age = now - dt.datetime.fromisoformat(str(rec.get("at"))).timestamp()
+        except ValueError:
+            age = math.inf
+        if rec.get("uuid") not in present and age >= SPAWN_RECORD_GRACE_SECONDS:
+            gone.append(name)
+    for name in gone:
+        record_spawned(name, None)
+        event("spawn-record-dropped", name=name, uuid=records[name].get("uuid"), reason="session gone")
+
+
+def spawned_records() -> dict[str, dict]:
+    try:
+        return {k: v for k, v in read_json(SPAWNED).items() if isinstance(v, dict)}
+    except SleeperError:
+        return {}
+
+
+def close_tab_or_pane(pane: str, tab: str | None) -> str:
+    """Close the pane's tab when the pane is all it holds, else just the pane. Returns what closed."""
+    count = herdr("tab", "get", tab, check=False).get("tab", {}).get("pane_count") if tab else None
+    if tab and count == 1:
+        herdr("tab", "close", tab)
+        return f"tab {tab}"
+    herdr("pane", "close", pane)
+    return f"pane {pane}"
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    """Create a tab, start a named agent in it, type its first prompt (stdin). Exit 0 started and
+    prompted, 3 started with the prompt queued, 1 refused or failed, 2 bad input."""
+    body = sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    extra = list(args.agent_args or [])
+    if extra[:1] == ["--"]:
+        extra = extra[1:]
+    cwd, cwd_problem = spawn_cwd_problem(args.cwd)
+    problems = [f"first prompt: {body_problem(body)}" if body_problem(body) else None,
+                None if SPAWN_NAME_RE.fullmatch(args.name) else "--name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}",
+                spawn_args_problem(args.kind, extra), cwd_problem]
+    problem = next((p for p in problems if p), None)
+    agents = list_agents()
+    sender = args.sender or context_sender(agents)
+    if not problem and (not sender or not SENDER_RE.fullmatch(sender)):
+        problem = "pass --from NAME (letters, digits, _.:@-; up to 64)"
+    if problem:
+        print(f"spawn: {problem}", file=sys.stderr)
+        return 2
+    try:
+        load_config()
+        taken = name_taken(args.name, agents)
+    except SleeperError as exc:
+        print(f"spawn: {exc}", file=sys.stderr)
+        return 1
+    if taken:
+        print(f"spawn: a session named {args.name} is {taken}; pick another name", file=sys.stderr)
+        return 1
+    workspace = args.workspace or caller_workspace(agents)
+    try:
+        made = herdr("tab", "create", "--cwd", str(cwd), "--label", args.name, "--no-focus",
+                     *(["--workspace", workspace] if workspace else []))
+        pane, tab = made["root_pane"]["pane_id"], made["tab"]["tab_id"]
+    except (SleeperError, KeyError, TypeError) as exc:
+        print(f"spawn: could not create a tab: {exc}", file=sys.stderr)
+        return 1
+    for _ in range(SPAWN_SHELL_SECONDS * 2):
+        if pane_at_shell(pane) is True:
+            break
+        time.sleep(0.5)
+    else:  # agent start would type into whatever holds the terminal
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="no-shell")
+        print(f"spawn: the new pane never showed a bare shell within {SPAWN_SHELL_SECONDS}s; tab {tab} closed",
+              file=sys.stderr)
+        return 1
+    argv = (["-n", args.name] if args.kind == "claude" else []) + extra
+    try:
+        started = herdr("agent", "start", args.name, "--kind", args.kind, "--pane", pane,
+                        "--timeout", str(SPAWN_READY_MS), "--", *argv, timeout=SPAWN_READY_MS / 1000 + 30)
+    except SleeperError as exc:
+        code = getattr(exc, "code", None)
+        hint = (" (a folder-trust or login prompt? Start it once by hand in that checkout)"
+                if code == "agent_not_ready" else "")
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)  # nothing was typed into it: no session worth keeping
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code=code)
+        print(f"spawn: {args.name} did not start ({code or exc}){hint}; tab {tab} closed", file=sys.stderr)
+        return 1
+    uuid = ((started.get("agent") or {}).get("agent_session") or {}).get("value")
+    for _ in range(WAKE_CONFIRM_SECONDS):
+        if valid_session_id(uuid):
+            break
+        time.sleep(1)
+        uuid = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session") or {}).get("value")
+    from_pane = os.environ.get("HERDR_PANE_ID")
+    rec = {"pane": pane, "tab": tab, "workspace": made["tab"].get("workspace_id"), "kind": args.kind,
+           "cwd": str(cwd), "by": sender, "from_pane": from_pane, "uuid": uuid if valid_session_id(uuid) else None,
+           "at": dt.datetime.now().isoformat(timespec="seconds")}
+    with locked():
+        record_spawned(args.name, rec)
+    event("spawned", name=args.name, pane=pane, tab=tab, uuid=rec["uuid"], kind=args.kind, cwd=str(cwd),
+          by=sender, from_pane=from_pane)
+    if not rec["uuid"]:
+        print(f"spawned {args.name} in {pane} (tab {tab}), but it reports no session id; first prompt not "
+              f"typed (send it with `herdr agent prompt {pane} …`)", file=sys.stderr)
+        return 1
+    config, _src = load_config()
+    with mailbox_lock(uuid):
+        msg, _status = queue_message(uuid, sender, body, None)
+        event("deliver-queued", id=msg["id"], sender=sender, from_pane=from_pane, to=args.name, uuid=uuid,
+              target_state="spawned", bytes=len(body.encode()))
+        code, text = finish_delivery(uuid, msg["id"], sender, from_pane, config)
+    out = {"name": args.name, "pane": pane, "tab": tab, "session": uuid, "prompt": "delivered" if code == 0 else "queued"}
+    print(json.dumps(out) if args.json else f"spawned {args.name} in {pane} (tab {tab}, session {uuid}); {text}")
+    return code
+
+
+def close_refusals(state: str, hit: dict, uuid: str) -> list[str]:
+    """Why closing this session would lose something (each overridable by --force)."""
+    why = []
+    held = insomnia_reason(uuid)
+    if held:
+        why.append(f"holds {held}")
+    if pending_mail(uuid):
+        why.append("has undelivered mail")
+    if state == "live":
+        status = hit.get("agent_status")
+        if status not in SLEEPABLE_STATUSES:
+            why.append(f"is busy (status {status})")
+        elif hit.get("agent") == "claude":
+            busy = busy_reason(hit)
+            if busy:
+                why.append(busy)
+        else:
+            why.append(f"runs {hit.get('agent')}, whose composer cannot be checked for a draft")
+    return why
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    """Close a live or sleeping session's pane (its tab when that is all the tab holds). Refuses a
+    busy session, a draft, background work, undelivered mail or insomnia unless --force; never acts
+    on a pane whose sleep row is not provably ours (orphaned, displaced, waking)."""
+    agents = list_agents()
+    by = args.sender or context_sender(agents) or f"pid {os.getppid()}"
+    try:
+        journal = read_json(JOURNAL)
+        record = spawned_records().get(args.target)
+        try:
+            state, hit, key = resolve_target((record or {}).get("uuid") or args.target, agents, journal)
+        except SleeperError:
+            if not record:
+                raise
+            # the recorded session id is out of date (/clear started a new one): try the name itself
+            state, hit, key = resolve_target(args.target, agents, journal)
+    except SleeperError as exc:
+        print(f"close: {exc}", file=sys.stderr)
+        return 1
+    uuid = (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
+    if not valid_session_id(uuid):
+        print(f"close: {args.target} reports no session id; close its pane with `herdr pane close`", file=sys.stderr)
+        return 1
+    me, _why = calling_agent(agents)
+    if me and me["agent_session"]["value"] == uuid:
+        print("close: refusing to close the calling session", file=sys.stderr)
+        return 1
+    with locked(), mailbox_lock(uuid, wait=False) as free:
+        if not free:
+            print("close: a message to this session is being delivered; try again", file=sys.stderr)
+            return 1
+        where = session_state(uuid)  # fresh, under both locks
+        if where is None:
+            print(f"close: {args.target} is neither live nor asleep any more", file=sys.stderr)
+            return 1
+        state, hit, key = where
+        name = (hit.get("name") or hit["pane_id"]) if state == "live" else wake_name(hit)
+        if state == "asleep":
+            info = herdr("pane", "get", str(hit["pane_id"]), check=False).get("pane") or {}
+            phase = "orphaned" if is_orphan(str(key), hit) else hit.get("phase", "asleep")
+            if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
+                    or info.get("agent") not in (None, CLAIM_AGENT):
+                print(f"close: the sleep row for {name} is {phase} and its pane is not provably its own; "
+                      f"resolve it by hand (`herdr-sleeper list`)", file=sys.stderr)
+                return 1
+            # our stub, or nothing but the shell: anything else is someone's work (the stub was left
+            # with ctrl-c and the pane reused by hand), and --force does not override that
+            if stub_running(str(hit["pane_id"]), uuid) is not True and pane_at_shell(str(hit["pane_id"])) is not True:
+                print(f"close: {name}'s pane runs something other than its wake stub or a bare shell; "
+                      "close it by hand if that is meant", file=sys.stderr)
+                return 1
+        elif any(valid_entry(e) and e["uuid"] == uuid for e in read_json(JOURNAL).values()):
+            print(f"close: {name} has a sleep row still being settled (waking); try again in a minute",
+                  file=sys.stderr)
+            return 1
+        refusals = close_refusals(state, hit, uuid)
+        if refusals and not args.force:
+            print(f"close: {name} " + "; ".join(refusals) + ". Pass --force to close it anyway", file=sys.stderr)
+            return 1
+        pane = hit["pane_id"]
+        tab = hit.get("tab_id") if state == "live" else (herdr("pane", "get", pane, check=False).get("pane") or {}).get("tab_id")
+        cwd, kind = hit.get("cwd"), hit.get("agent") if state == "live" else hit.get("kind")
+        exited, helpers = None, {}
+        if state == "live" and kind in PROFILES and PROFILES[kind]["exit"] == "signal":
+            present, _argv, pid = agent_process(pane, str(kind))
+            table = process_table()
+            if present is True and signalable(pid, str(kind), table) is None:
+                helpers = {child: comm for child, (parent, comm) in table.items() if parent == int(pid)}
+                os.kill(int(pid), signal.SIGTERM)  # a clean shutdown first; closing the pane would SIGHUP it
+                exited = False
+                for _ in range(EXIT_WAIT_SECONDS):
+                    time.sleep(1)
+                    if agent_process(pane, str(kind))[0] is False:
+                        exited = True
+                        break
+        try:
+            closed = close_tab_or_pane(pane, tab)
+        except SleeperError as exc:
+            print(f"close: closing {pane} failed: {exc}", file=sys.stderr)
+            return 1
+        reap_helpers(helpers)
+        if state == "asleep":
+            release(pane)  # best effort: a closed pane takes its claim and saved resume command along
+        if state == "asleep":
+            journal = read_json(JOURNAL)
+            if isinstance(journal.get(str(key)), dict) and journal[str(key)].get("uuid") == uuid:
+                journal.pop(str(key))
+                write_json(JOURNAL, journal)
+        claims = insomnia_claims_or_empty()
+        if uuid in claims:
+            claims.pop(uuid)
+            write_json(INSOMNIA, claims)
+            event("insomnia-released", uuid=uuid, name=name, by=by, forced=True, via="close")
+        for spawned_name, rec in spawned_records().items():
+            if rec.get("uuid") == uuid:
+                record_spawned(spawned_name, None)
+    event("closed", name=name, pane=pane, uuid=uuid, state=state, closed=closed, by=by, forced=bool(refusals),
+          overridden=refusals or None, exited=exited)
+    if refusals:
+        say(f"close {name}: forced by {by} past: {'; '.join(refusals)}")
+    resume = manual_command({"cwd": cwd, "argv": hit.get("argv") or [], "uuid": uuid, "kind": kind or "claude"})
+    print(f"closed {name} ({closed}); its transcript stays: {resume}")
+    return 0
+
+
 # --------------------------------------------------------------- presence
 
 def presence_rows() -> list[dict]:
-    """Every live agent and every sleeping one: who can be messaged, and how. No argv."""
+    """Every live agent and every sleeping one: who can be messaged, and how. No argv. `insomnia`
+    is the claim's reason (or "claimed") for a session that holds one."""
     rows: list[dict] = []
+    try:
+        claims = insomnia_claims()
+    except SleeperError:
+        claims = {}  # cmd_presence prints the warning
+    spawners = {r.get("uuid"): r.get("by") for r in spawned_records().values() if r.get("uuid")}
     for a in list_agents():
         if not a.get("agent") or a.get("agent") == CLAIM_AGENT:
             continue
         rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name"), "pane": a["pane_id"],
                      "kind": a.get("agent"), "cwd": a.get("cwd"),
                      "session": (a.get("agent_session") or {}).get("value"), "slept_at": None})
+        rows[-1]["insomnia"] = insomnia_label(claims[rows[-1]["session"]]) if rows[-1]["session"] in claims else None
     for key, e in sorted(read_json(JOURNAL).items()):
         if not valid_entry(e):
             continue
@@ -2652,7 +3355,10 @@ def presence_rows() -> list[dict]:
             claude_name = claude_session_name(transcript_for(e["uuid"]))
         rows.append({"state": "asleep" if phase == "asleep" else phase, "name": wake_name(e),
                      "claude_name": claude_name, "pane": key, "kind": e.get("kind"), "cwd": e.get("cwd"),
-                     "session": e["uuid"], "slept_at": e.get("slept_at")})
+                     "session": e["uuid"], "slept_at": e.get("slept_at"),
+                     "insomnia": insomnia_label(claims[e["uuid"]]) if e["uuid"] in claims else None})
+    for r in rows:
+        r["spawned_by"] = spawners.get(r["session"])
     return rows
 
 
@@ -2660,14 +3366,19 @@ def cmd_presence(args: argparse.Namespace) -> int:
     rows = presence_rows()
     if watcher_missing():  # on stderr for --json, so the JSON stays parseable
         print(f"WARNING: {WATCHER_MISSING_TEXT}", file=sys.stderr if args.json else sys.stdout)
+    try:
+        read_insomnia()
+    except SleeperError as exc:
+        print(f"WARNING: {exc}", file=sys.stderr if args.json else sys.stdout)
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     for r in rows:
         alias = f" ({r['claude_name']})" if r.get("claude_name") and r["claude_name"] != r["name"] else ""
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
+        awake = f"  [insomnia: {r['insomnia']}]" if r.get("insomnia") else ""
         print(f"{r['state']:14} {str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
-              f"{r['cwd'] or ''}{since}")
+              f"{r['cwd'] or ''}{since}{awake}")
     print("message any of them: echo TEXT | herdr-sleeper deliver <name> --from <you>  (wakes a sleeper)")
     return 0
 
@@ -3199,8 +3910,8 @@ def outdated_build(agent: dict) -> tuple[str, str] | None:
 def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: set[str], journal: dict,
                            config: dict, now: float) -> dict | None:
     """Restart at most one idle, outdated claude session per tick: sleep it, wake it at once.
-    It has to pass every check a sleep needs (the keep-list excepted: a restart is not a sleep),
-    idle at least pressure_idle. Returns the entry to confirm when the wake went to the stub."""
+    It has to pass every check a sleep needs (the keep-list and insomnia excepted: a restart is not
+    a sleep), idle at least pressure_idle. Returns the entry to confirm when the wake went to the stub."""
     window = config["pressure_idle_hours"]
     for agent in sorted((a for a in agents if a.get("agent") == "claude" and a["pane_id"] in clocks
                          and a["pane_id"] not in skip), key=lambda a: clocks[a["pane_id"]]["since"]):
@@ -3208,7 +3919,7 @@ def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: se
         uuid = (agent.get("agent_session") or {}).get("value")
         if (now - since) / 3600 < window or now - RESTART_TRIED.get(str(uuid), -math.inf) < RESTART_COOLDOWN_SECONDS:
             continue
-        ok, _reason, _ = assess(agent, agents, window, journal, None, idle_since=since)
+        ok, _reason, _ = assess(agent, agents, window, journal, None, idle_since=since, restart=True)
         builds = outdated_build(agent) if ok else None
         if not builds:
             continue
@@ -3216,7 +3927,8 @@ def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: se
         if config["dry_run"]:
             note_skip(pane, f"would restart onto {new} (runs {old}; dry run)")
             return None
-        did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False)
+        did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False,
+                                   restart=True)
         if not did:
             note_skip(pane, f"restart onto {new} refused: {outcome}")
             return None
@@ -3257,12 +3969,13 @@ def memory_pressure() -> int:
 
 
 def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict], config: dict,
-                   now: float) -> tuple[list[dict], int, str]:
+                   now: float, held: set[str] | None = None) -> tuple[list[dict], int, str]:
     """Candidates to sleep before their window, longest idle first, each idle >= pressure_idle,
     and how many of them should sleep. Over max_live, as many as bring the live count back to
     the cap; under memory pressure (warn or critical), one per tick, so the next tick sees what
     that freed. The caller walks the list until that many slept: one refusing pane (a draft, a
-    background shell) must not hold the cap up for good.
+    background shell) must not hold the cap up for good. `held`: session ids with insomnia, never
+    candidates (assess refuses them too; leaving them out keeps them open for restart_outdated).
     """
     window = config["pressure_idle_hours"] * 3600
     live = sum(1 for a in agents if a.get("agent") in config["agents"])
@@ -3274,6 +3987,7 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
     taken = {a["pane_id"] for a in due} | set(config["exclude"])
     ready = sorted((a for a in agents if a["pane_id"] in clocks and a["pane_id"] not in taken
                     and a.get("name") not in config["exclude"]
+                    and (a.get("agent_session") or {}).get("value") not in (held or set())
                     and now - clocks[a["pane_id"]]["since"] >= window),
                    key=lambda a: clocks[a["pane_id"]]["since"])
     why = (f"{live} live > max_live {config['max_live']}" if over else "") + \
@@ -3298,6 +4012,10 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     exclude = set(config["exclude"])
     before = json.dumps(clocks, sort_keys=True)
     restarting: dict | None = None
+    try:  # unreadable claims: everything goes on to assess, which refuses every sleep
+        held = set(insomnia_claims(now))
+    except SleeperError:
+        held = set()
     with locked():
         try:
             merge_snapshot(agents)
@@ -3323,8 +4041,10 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
                 continue
             if clock_since(clocks, agent, now) is None:
                 clocks[pane] = {**clock_key(agent), "since": now}
-            # excluded panes keep a clock (restart_outdated may move them to a new build) but never sleep
-            excluded = bool(exclude) and (pane in exclude or agent.get("name") in exclude)
+            # excluded and insomniac panes keep a clock (restart_outdated may move them to a new build)
+            # but never sleep; assess refuses them as well
+            excluded = bool(exclude) and (pane in exclude or agent.get("name") in exclude) or \
+                (agent.get("agent_session") or {}).get("value") in held
             if not excluded and now - clocks[pane]["since"] >= config["idle_hours"] * 3600:
                 due.append(agent)
         for pane in [p for p in clocks if p not in seen]:
@@ -3332,7 +4052,12 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
         if json.dumps(clocks, sort_keys=True) != before:
             persist_clocks(clocks)
             before = json.dumps(clocks, sort_keys=True)
-        early, want_early, why_early = early_sleepers(agents, clocks, due, config, now)
+        try:
+            tend_insomnia(agents, clocks, now)
+            prune_spawned(agents, journal, now)
+        except (SleeperError, OSError) as exc:
+            say(f"WARN insomnia/spawn upkeep: {exc}")
+        early, want_early, why_early = early_sleepers(agents, clocks, due, config, now, held)
         if early and why_early != LAST_SKIP.get("<early>"):
             LAST_SKIP["<early>"] = why_early
             say(f"early sleep ({why_early}): {want_early} of {', '.join(a['pane_id'] for a in early)}")
@@ -3829,6 +4554,31 @@ def main(argv: list[str] | None = None) -> int:
     pp = sub.add_parser("presence", help="live and sleeping agents")
     pp.add_argument("--json", action="store_true")
     pp.set_defaults(fn=cmd_presence)
+    spp = sub.add_parser("spawn", help="new tab + named agent, first prompt on stdin")
+    spp.add_argument("--cwd", required=True, help=f"a checkout below {SPAWN_ROOT}")
+    spp.add_argument("--name", required=True, help="the session name (claude -n), also the Herdr agent name")
+    spp.add_argument("--kind", choices=SPAWN_KINDS, default="claude")
+    spp.add_argument("--from", dest="sender", help="who spawns it (default: the calling pane's agent name)")
+    spp.add_argument("--workspace", help="Herdr workspace for the tab (default: the caller's)")
+    spp.add_argument("--json", action="store_true")
+    spp.add_argument("agent_args", nargs=argparse.REMAINDER, help="-- then extra agent flags (claude: must be replayable)")
+    spp.set_defaults(fn=cmd_spawn)
+    clp = sub.add_parser("close", help="close a live or sleeping session's pane/tab (refuses busy, draft, insomnia)")
+    clp.add_argument("target", help="session name, pane id, agent name, wake name, or session id")
+    clp.add_argument("--force", action="store_true", help="close past a busy turn, a draft, mail or insomnia (logged)")
+    clp.add_argument("--from", dest="sender", help="who closes it (default: the calling pane's agent name)")
+    clp.set_defaults(fn=cmd_close)
+    ip = sub.add_parser("insomnia", help="keep the calling agent's own session awake (claim/release/list)")
+    isub = ip.add_subparsers(dest="action", required=True)
+    icp = isub.add_parser("claim", help="never sleep the calling agent's session until released")
+    icp.add_argument("--reason", help="why, shown in presence and the sidebar (up to 120 characters)")
+    icp.add_argument("--for", dest="duration", help="expire after this long (90m, 4h, 2d); default: until released")
+    irp = isub.add_parser("release", help="drop the calling agent's claim (or --pane TARGET --force)")
+    irp.add_argument("--pane", help="pane id, agent or session name, or session id of the claim to release")
+    irp.add_argument("--force", action="store_true", help="release another session's claim (logged)")
+    ilp = isub.add_parser("list", help="every claim, with state and idle time")
+    ilp.add_argument("--json", action="store_true")
+    ip.set_defaults(fn=cmd_insomnia)
     sub.add_parser("claude-hook", help="Claude Code hook for ListAgents/SendMessage (stdin)").set_defaults(
         fn=cmd_claude_hook)
     sub.add_parser("stop", help="stop the watcher and keep it stopped").set_defaults(fn=cmd_stop)

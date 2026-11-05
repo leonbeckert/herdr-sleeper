@@ -389,6 +389,13 @@ label, or leave `done` panes alone for longer. (Review v0.1.0 F22.)
   `lsof`) alone; tests that expect a spawn patch `Popen` themselves. After a test run, check that no
   `herdr-sleeper watch` from the development copy is left.
 
+**9.6 A list of paths to isolate goes stale with the first new state file.**
+- *Live (2026-11-05):* the `state` fixture redirected the state files it named. The spawn work added
+  `spawned.json` without adding it there, so the first spawn test wrote its record into the live state dir. The
+  next test noticed only because it asserted that the file was absent. No live code read the file yet.
+- *Instead:* redirect every module-level path whose parent is the state dir, found by walking the module, and
+  assert that a new file is among them. A list someone has to remember to extend fails silently.
+
 ## 10. Reboots
 
 These come from the first reboot of the deployment host (2026-10-26) and from reading Herdr **0.9.5** (tag
@@ -551,6 +558,40 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
 - *Not covered:* a real macOS reboot or loginwindow restart; an awake session busy at the restart; opencode;
   Python 3.12 for the in-pane stub. A best-effort `agent rename` back to the slept name failed once right after a
   stub wake (`agent_not_found`, the agent was not registered yet); logged, not retried.
+
+**10.10 Lab: insomnia, spawn and close (2026-11-05, Herdr 0.9.5, Claude Code 2.1.306, v0.1.3).**
+- *Setup:* as in 10.9 (`env -i` whitelist, `/tmp` XDG dirs, `herdr --session sleeper-test server`, never
+  attached), config `idle = "24h"`, `watcher = "external"`, `poll_seconds = 3`, `pressure_idle = "1m"`. Both
+  sessions were started with the real `spawn` (`--model haiku --dangerously-skip-permissions`) in a throwaway
+  worktree below `~/development`. Memory pressure was simulated by one real `watch_tick` from a harness that
+  replaced only `memory_pressure()` (critical); everything else ran against the lab server.
+- *Spawn:* tab created unfocused, `agent start … -- -n <name> …` ready with the session id in its answer, the
+  first prompt typed inside the relay envelope and answered. In a directory Claude had never trusted, `agent
+  start` answered `agent_not_ready` (blocked at the folder-trust prompt) after about 4 s; spawn closes that tab
+  and never answers the prompt. Checkouts below `~/development` were trusted already.
+- *A relayed instruction is not obeyed:* asked through `deliver` to run `insomnia claim`, the haiku agent
+  refused, because the envelope said it came from another agent and not from the owner. That is the envelope
+  doing its job. The lab claims were typed in by the operator with `herdr agent prompt`.
+- *Insomnia:* the agent's own Bash tool claimed (the ancestor check passed); the same command from outside with
+  a copied `HERDR_PANE_ID` was refused. `pane get` showed `tokens: {insomnia: <reason>}`. With `max_live = 1`
+  the watcher's candidate list held only the unclaimed session, which slept; three pressure ticks slept the
+  other session and passed over the claimed one; `scan` with a 1 min window printed `keep … insomnia (…)`.
+  After `release` from the agent, the token cleared and the next pressure tick slept it. A second claim
+  survived `server stop` + start: the session came back natively on a new terminal without its Herdr name,
+  `insomnia list` still had it (keyed by session id), the restarted watcher reported the token again, and
+  `scan` and a pressure tick kept it.
+- *Close:* refused for insomnia (`close <spawn name>` resolved through the spawn record although the Herdr name
+  was gone) and for a real draft typed with `pane send-text`; `release --pane <name>` refused without `--force`
+  and logged `by` with it. After the draft was cleared, a live close: SIGTERM, exit in about 1 s, tab closed,
+  no process left. A close of a slept session: claim released, tab closed with its stub, journal row dropped,
+  manual resume line printed with the session's flags. `spawned.json` was empty at the end.
+- *`/clear` changes the session id:* typed into a claimed session, `/clear` made Herdr report a new session id
+  for the same pane and terminal within seconds. A claim keyed only by session id would have stopped holding,
+  and so did the spawn record's session id (`close <name>` refused). Both now follow the pane and terminal
+  (`insomnia-carried`, `spawn-record-moved`), and `close` falls back to the name. Found by review, confirmed
+  in the lab: `scan` kept the cleared session, and the watcher re-keyed the claim on its next tick.
+- *Not covered:* a real reboot with a claim; `--for` expiry and `insomnia-stale` against a real server (unit
+  tests only); codex spawn.
 
 ---
 
