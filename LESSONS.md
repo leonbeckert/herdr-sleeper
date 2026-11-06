@@ -557,7 +557,10 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
   tick. Pass (after counting `server_unavailable`).
 - *Not covered:* a real macOS reboot or loginwindow restart; an awake session busy at the restart; opencode;
   Python 3.12 for the in-pane stub. A best-effort `agent rename` back to the slept name failed once right after a
-  stub wake (`agent_not_found`, the agent was not registered yet); logged, not retried.
+  stub wake (`agent_not_found`, the agent was not registered yet); logged, not retried. Live on 2026-11-06 it
+  failed for both agents woken by `deliver`, so they could no longer be addressed by name. Since v0.1.4 the
+  rename is retried, and when it can't wait (under the lock) the name stays owed until the watcher can hand it
+  over (README, wake paths).
 
 **10.10 Lab: insomnia, spawn and close (2026-11-05, Herdr 0.9.5, Claude Code 2.1.306, v0.1.3).**
 - *Setup:* as in 10.9 (`env -i` whitelist, `/tmp` XDG dirs, `herdr --session sleeper-test server`, never

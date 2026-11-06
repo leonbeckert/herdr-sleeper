@@ -138,7 +138,7 @@ import tempfile
 import termios
 import time
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 try:
@@ -190,6 +190,7 @@ WATCHER_MISSING = STATE_DIR / "watcher-missing"  # mtime: when a missing externa
 MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
 DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
 INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
+NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names a woken agent gets once Herdr lists it
 
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
@@ -2183,15 +2184,82 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
     return True
 
 
-def give_name_back(pane: str, entry: dict, live_name: str | None) -> None:
-    """A stub-woken agent is detected unnamed: hand it the name it slept with (best effort, logged)."""
+NAME_BACK_SECONDS = 15          # how long a wake outside the lock retries the rename
+NAME_OWED_MAX_SECONDS = 3600    # an owed name the watcher could not hand back by then is given up (logged)
+
+
+def try_rename(pane: str, want: str) -> str:
+    """'ok', 'not-yet' (Herdr has not registered the resumed agent: the session id shows on the pane
+    before the agent does), or 'refused' (anything else, logged; retrying would not help)."""
+    try:
+        herdr("agent", "rename", pane, want)
+        return "ok"
+    except SleeperError as exc:
+        if getattr(exc, "code", None) == "agent_not_found":
+            return "not-yet"
+        say(f"WARN {pane}: could not give the name {want!r} back to the resumed agent ({exc})")
+        return "refused"
+
+
+def owe_names(change: Callable[[dict], None]) -> None:
+    """Read-modify-write names.json under its own lock (callers may or may not hold the global one)."""
+    with flocked(NAMES_OWED.with_name(NAMES_OWED.name + ".lock")):
+        try:
+            owed = read_json(NAMES_OWED)
+        except DamagedState as exc:
+            say(f"WARN {exc}; owed names moved to {quarantine(NAMES_OWED)}")
+            owed = {}
+        before = json.dumps(owed, sort_keys=True)
+        change(owed)
+        if json.dumps(owed, sort_keys=True) != before:
+            write_json(NAMES_OWED, owed)
+
+
+def give_name_back(pane: str, entry: dict, live_name: str | None, wait: float = 0) -> None:
+    """A stub-woken agent is detected unnamed: hand it the name it slept with. Herdr may not list
+    the agent yet (`agent_not_found`), so retry for `wait` seconds (0 under the global lock), then
+    leave the name owed: the watcher hands it over once Herdr lists the agent (settle_owed_names)."""
     want = entry.get("name")
     if not want or live_name == want:
         return
-    try:
-        herdr("agent", "rename", pane, want)
-    except SleeperError as exc:
-        say(f"WARN {pane}: could not give the name {want!r} back to the resumed agent ({exc})")
+    deadline = time.monotonic() + wait
+    while True:
+        outcome = try_rename(pane, want)
+        if outcome != "not-yet":
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    owe_names(lambda owed: owed.__setitem__(pane, {"uuid": entry["uuid"], "name": want, "at": time.time()}))
+    say(f"{pane}: Herdr does not list the resumed agent yet; the watcher gives it the name {want!r} once it does")
+
+
+def settle_owed_names(agents: list[dict], now: float) -> None:
+    """Watcher: hand owed names to agents Herdr now lists; drop a name whose pane runs another
+    session, or that could not be handed over within NAME_OWED_MAX_SECONDS (logged)."""
+    if not NAMES_OWED.exists():
+        return
+    by_pane = {a["pane_id"]: a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT}
+
+    def settle(owed: dict) -> None:
+        for pane, rec in list(owed.items()):
+            if not isinstance(rec, dict) or not isinstance(rec.get("name"), str):
+                owed.pop(pane)
+                continue
+            live = by_pane.get(pane)
+            live_uuid = ((live or {}).get("agent_session") or {}).get("value")
+            if live and live_uuid and live_uuid != rec.get("uuid"):
+                owed.pop(pane)  # another session there now: the name is not its to take
+            elif live and live.get("name") == rec["name"]:
+                owed.pop(pane)
+            elif live and try_rename(pane, rec["name"]) != "not-yet":
+                owed.pop(pane)
+                event("renamed", pane=pane, name=rec["name"], uuid=rec.get("uuid"), via="watcher")
+            elif not _number(rec.get("at")) or now - rec["at"] > NAME_OWED_MAX_SECONDS:
+                owed.pop(pane)
+                say(f"WARN {pane}: gave up handing the name {rec['name']!r} back (Herdr never listed the agent); "
+                    f"rename it by hand: herdr agent rename {pane} {rec['name']}")
+    owe_names(settle)
 
 
 def finish_waking(pane: str, uuid: str, live_name: str | None) -> bool:
@@ -2204,7 +2272,7 @@ def finish_waking(pane: str, uuid: str, live_name: str | None) -> bool:
             return False
         journal.pop(pane)
         write_json(JOURNAL, journal)
-    give_name_back(pane, row, live_name)
+    give_name_back(pane, row, live_name, wait=NAME_BACK_SECONDS)  # outside the lock
     event("reconciled", pane=pane, name=wake_name(row), uuid=uuid, outcome="woken")
     return True
 
@@ -4055,6 +4123,7 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
         try:
             tend_insomnia(agents, clocks, now)
             prune_spawned(agents, journal, now)
+            settle_owed_names(agents, now)
         except (SleeperError, OSError) as exc:
             say(f"WARN insomnia/spawn upkeep: {exc}")
         early, want_early, why_early = early_sleepers(agents, clocks, due, config, now, held)

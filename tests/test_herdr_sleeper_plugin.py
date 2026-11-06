@@ -3577,3 +3577,65 @@ def test_spawn_record_follows_a_cleared_session(fake: FakeHerdr, checkout: Path,
     sleeper.record_spawned("impl-1", {**sleeper.read_json(sleeper.SPAWNED)["impl-1"], "uuid": SPAWNED_UUID})
     assert _close(monkeypatch, "impl-1") == 0                          # a stale record still closes by name
     assert "closed impl-1" in capsys.readouterr().out
+
+
+# ------------------------------------- the name back after a stub wake (B-244 follow-up)
+
+def _rename_not_found(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
+    """`agent rename` answers agent_not_found the first `times` calls (Herdr has not listed the agent yet)."""
+    real, calls = fake.__call__, [0]
+
+    def herdr(*a: str, **k: Any) -> Any:
+        if a[:2] == ("agent", "rename"):
+            calls[0] += 1
+            if calls[0] <= times:
+                raise sleeper.HerdrError("herdr agent rename failed: agent_not_found", "agent_not_found")
+        return real(*a, **k)
+    monkeypatch.setattr(sleeper, "herdr", herdr)
+    return calls
+
+
+def _woken_unnamed(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_ready(fake, monkeypatch)
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    sleeper.cmd_stub("w1:p1", UUID)
+    fake.stub_panes.discard("w1:p1")
+    fake.agents[0].update(agent="claude", agent_session={"value": UUID}, name=None)
+
+
+def test_wake_retries_the_rename_until_herdr_lists_the_agent(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    _woken_unnamed(fake, monkeypatch)
+    calls = _rename_not_found(fake, monkeypatch, times=3)
+    assert sleeper.finish_waking("w1:p1", UUID, None)
+    assert calls[0] == 4 and fake.agents[0]["name"] == "a" and not sleeper.NAMES_OWED.exists()
+    assert "could not give the name" not in (sleeper.LOGFILE.read_text() if sleeper.LOGFILE.exists() else "")
+
+
+def test_a_name_herdr_cannot_take_yet_is_owed_and_the_watcher_hands_it_over(fake: FakeHerdr,
+                                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    _woken_unnamed(fake, monkeypatch)
+    _rename_not_found(fake, monkeypatch, times=1)
+    sleeper.reconcile(fake.agents)                                     # under the lock: no waiting there
+    assert journal() == {} and fake.agents[0].get("name") is None
+    assert sleeper.read_json(sleeper.NAMES_OWED)["w1:p1"]["name"] == "a"
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.agents[0]["name"] == "a" and sleeper.read_json(sleeper.NAMES_OWED) == {}
+    assert _event_rows("renamed")[-1]["via"] == "watcher"
+
+
+def test_an_owed_name_is_dropped_for_another_session_or_after_an_hour(fake: FakeHerdr,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: now["t"])
+    _rename_not_found(fake, monkeypatch, times=10_000)                # Herdr never lists it
+    fake.agents[0]["name"] = None
+    sleeper.give_name_back("w1:p1", {"name": "a", "uuid": UUID}, None)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "w1:p1" in sleeper.read_json(sleeper.NAMES_OWED)            # still trying
+    now["t"] += 2 * 3600
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert sleeper.read_json(sleeper.NAMES_OWED) == {} and "rename it by hand" in sleeper.LOGFILE.read_text()
+    sleeper.give_name_back("w1:p1", {"name": "a", "uuid": UUID}, None)
+    fake.agents[0]["agent_session"] = {"value": "another-session"}     # the pane moved on
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert sleeper.read_json(sleeper.NAMES_OWED) == {} and fake.agents[0]["name"] is None

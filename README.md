@@ -61,6 +61,14 @@ Wake paths:
    session is seen running. A typed line is not a wake request (an
    orchestrator's `pane run` must not be eaten): the stub echoes it as
    ignored and keeps waiting.
+
+   *v0.1.4:* Herdr shows the resumed session id on the pane a moment before it
+   lists the agent, and a rename in between fails with `agent_not_found`. A
+   wake outside the lock therefore retries the rename for up to 15 s; under the
+   lock (the watcher) the name is recorded as owed in `names.json`, and the
+   watcher hands it over on a later tick once Herdr lists the agent (event
+   `renamed`). An owed name is dropped when the pane runs another session, or
+   after an hour with a WARN naming the `herdr agent rename` to run by hand.
 3. **Command** — `herdr plugin action invoke djbclark.herdr-sleeper.wake`
    wakes the context pane (only that pane), or `wake-all` / `list` / `log`
    from anywhere. When the pane's stub does the wake, `wake` waits up to
@@ -198,7 +206,8 @@ missing);
 overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
-idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`.
+idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`,
+`insomnia.json`, `spawned.json`, `names.json` (owed names).
 The directory is 0700 and every file 0600 (files from earlier versions are
 tightened when next written); the two logs rotate to `<name>.1` at 1 MB.
 `panes.json` keeps only the argv a wake would replay, never the raw command
@@ -489,7 +498,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 337 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 340 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
