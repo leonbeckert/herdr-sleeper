@@ -197,7 +197,9 @@ since a restart is not a sleep; event `restarted` with both builds, then
 `restart-failed` if the woken session still runs the old build or the wake
 failed. One try per session every 6 h, so a restart that does not take never
 loops. An npm/bun install shows only its runtime to `lsof`, so it is never
-restarted),
+restarted. With claude-account's launcher (see "Subscription slots") a session
+on another slot than the active one is restarted the same way, already
+2 minutes after it went idle; event `restarted` with `kind` `account`),
 `wake_refuse_from` (see Messages below), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
@@ -455,6 +457,29 @@ Details:
 
 A message from another machine is a peer's message like any other relayed
 one, never the owner's word.
+
+## Subscription slots
+
+ansible-orchestration's `claude-account` (roles/macos_herdr) runs every
+claude on one of two subscription slots: `~/.local/bin/claude` is a launcher
+that reads `~/.claude-accounts/active`, records the slot in
+`~/.claude-accounts/run/<pid>` and execs the build it names on a
+`# real-binary: PATH` line. `installed_build` follows that line, so a
+launcher never reads as a new build.
+
+```
+herdr-sleeper account [--json]              # each live claude session's slot
+herdr-sleeper account --restart [--json]    # restart the idle ones on the other slot now
+```
+
+- A record counts only when it was written after its process started (else
+  the pid was reused); a session without one runs on slot `a`, Claude's
+  default login. `explicit` (a hand-set `CLAUDE_CONFIG_DIR`) is never moved.
+- `--restart` is the owner's switch (`claude-account switch`): every idle
+  session on the other slot is slept and woken at once (`--resume`, the
+  launcher picks the new slot), focused panes included; drafts, background
+  work and busy panes refuse and are reported `pending`. The watcher moves
+  those at their next idle (`restart_outdated`, not in a dry run).
 
 ## Safety rules (all fail closed)
 

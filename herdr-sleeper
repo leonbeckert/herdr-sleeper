@@ -4326,10 +4326,109 @@ def running_build(pid: object) -> str | None:
     return next((ln[1:] for ln in out.splitlines() if ln.startswith("n/")), None)
 
 
+LAUNCHER_REAL = re.compile(r"^# real-binary: (.+)$", re.MULTILINE)
+
+
+def launcher_target(path: str) -> str | None:
+    """The build a wrapper script execs, when it names it on a `# real-binary: PATH` line
+    (claude-account's launcher at ~/.local/bin/claude), else None."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if not head.startswith(b"#!"):
+        return None
+    m = LAUNCHER_REAL.search(head.decode("utf-8", "replace"))
+    return m.group(1).strip() if m else None
+
+
 def installed_build(kind: str) -> str | None:
-    """What a fresh start of kind would run: its PATH entry with symlinks resolved."""
+    """What a fresh start of kind would run: its PATH entry (or the build its launcher names)
+    with symlinks resolved."""
     found = shutil.which(kind, path=os.pathsep.join([os.path.expanduser("~/.local/bin"), SYSTEM_PATH]))
-    return os.path.realpath(found) if found else None
+    if not found:
+        return None
+    return os.path.realpath(launcher_target(found) or found)
+
+
+# claude-account (ansible-orchestration roles/macos_herdr): the owner's two subscriptions are
+# slots; ~/.claude-accounts/active names the one new sessions start on, and the launcher records
+# each session's slot under run/<pid> just before it execs claude (exec keeps the pid).
+ACCOUNTS_DIR = Path.home() / ".claude-accounts"
+ACCOUNT_SLOT = re.compile(r"[a-z]")
+ACCOUNT_RESTART_IDLE_SECONDS = 120  # an account switch moves a session this soon after it went idle
+
+
+def active_account() -> str | None:
+    """The slot new claude sessions start on; None when claude-account's launcher is not installed."""
+    if not (ACCOUNTS_DIR / "run").is_dir():
+        return None
+    try:
+        slot = (ACCOUNTS_DIR / "active").read_text().strip() or "a"
+    except FileNotFoundError:
+        return "a"
+    except OSError:
+        return None
+    return slot if ACCOUNT_SLOT.fullmatch(slot) else None
+
+
+def process_start(pid: int) -> float | None:
+    try:
+        out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+                             env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"}, check=False).stdout.strip()
+        return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y")) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def session_account(pid: object) -> str | None:
+    """The slot a claude process runs on. The launcher's record counts only when written after the
+    process started (else the pid was reused); without one it is slot a, Claude's default login (a
+    start before the launcher). None when unknown, or "explicit" (a hand-set CLAUDE_CONFIG_DIR,
+    never moved)."""
+    try:
+        pid = int(pid)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    start = process_start(pid)
+    if start is None:
+        return None
+    rec = ACCOUNTS_DIR / "run" / str(pid)
+    try:
+        written = rec.stat().st_mtime
+        slot = rec.read_text().strip()
+    except FileNotFoundError:
+        return "a"
+    except OSError:
+        return None
+    if start > written + 2:  # lstart has one-second resolution
+        return "a"
+    return slot if ACCOUNT_SLOT.fullmatch(slot) else None
+
+
+def outdated_account(agent: dict) -> tuple[str, str] | None:
+    """(running slot, active slot) when a claude session runs on another subscription slot."""
+    if agent.get("agent") != "claude":
+        return None
+    active = active_account()
+    if active is None:
+        return None
+    present, _argv, pid = agent_process(agent["pane_id"], "claude")
+    slot = session_account(pid) if present is True else None
+    return (slot, active) if slot and slot != active else None
+
+
+def restart_reason(agent: dict) -> tuple[str, str, str] | None:
+    """(old, new, what) for a session that should be restarted: onto the installed build
+    (what="build") or the active account slot (what="account"), the build first."""
+    builds = outdated_build(agent)
+    if builds:
+        return os.path.basename(builds[0]), os.path.basename(builds[1]), "build"
+    slots = outdated_account(agent)
+    if slots:
+        return f"account {slots[0]}", f"account {slots[1]}", "account"
+    return None
 
 
 RUNTIMES = {"node", "bun", "deno"}
@@ -4353,49 +4452,66 @@ def outdated_build(agent: dict) -> tuple[str, str] | None:
 def restart_onto_new_build(agents: list[dict], clocks: dict[str, dict], skip: set[str], journal: dict,
                            config: dict, now: float) -> dict | None:
     """Restart at most one idle, outdated claude session per tick: sleep it, wake it at once.
-    It has to pass every check a sleep needs (the keep-list and insomnia excepted: a restart is not
-    a sleep), idle at least pressure_idle. Returns the entry to confirm when the wake went to the stub."""
+    Outdated: another build than the installed one (idle at least pressure_idle), or another account
+    slot than the active one (idle ACCOUNT_RESTART_IDLE_SECONDS: the owner switched, the session
+    follows at its next idle). It has to pass every check a sleep needs (the keep-list and insomnia
+    excepted: a restart is not a sleep). Returns the entry to confirm when the wake went to the stub."""
     window = config["pressure_idle_hours"]
+    account_window = min(window, ACCOUNT_RESTART_IDLE_SECONDS / 3600)
     for agent in sorted((a for a in agents if a.get("agent") == "claude" and a["pane_id"] in clocks
                          and a["pane_id"] not in skip), key=lambda a: clocks[a["pane_id"]]["since"]):
         since = clocks[agent["pane_id"]]["since"]
         uuid = (agent.get("agent_session") or {}).get("value")
-        if (now - since) / 3600 < window or now - RESTART_TRIED.get(str(uuid), -math.inf) < RESTART_COOLDOWN_SECONDS:
+        if (now - since) / 3600 < account_window or now - RESTART_TRIED.get(str(uuid), -math.inf) < RESTART_COOLDOWN_SECONDS:
             continue
-        ok, _reason, _ = assess(agent, agents, window, journal, None, idle_since=since, restart=True)
-        builds = outdated_build(agent) if ok else None
-        if not builds:
+        ok, _reason, _ = assess(agent, agents, account_window, journal, None, idle_since=since, restart=True)
+        why = restart_reason(agent) if ok else None
+        if not why:
             continue
-        pane, old, new = agent["pane_id"], os.path.basename(builds[0]), os.path.basename(builds[1])
+        old, new, what = why
+        need = window if what == "build" else account_window
+        if (now - since) / 3600 < need:
+            continue
+        pane = agent["pane_id"]
         if config["dry_run"]:
             note_skip(pane, f"would restart onto {new} (runs {old}; dry run)")
             return None
-        did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False,
-                                   restart=True)
-        if not did:
-            note_skip(pane, f"restart onto {new} refused: {outcome}")
-            return None
-        RESTART_TRIED[str(uuid)] = now  # one try per cooldown: a restart that does not take must not loop
-        entry = read_json(JOURNAL).get(pane)
-        result = wake_entry(entry, via=f"restart:{new}", key=pane) if isinstance(entry, dict) else False
-        name = wake_name(entry or {"pane_id": pane})
-        event("restarted", pane=pane, name=name, uuid=uuid, old=old, new=new, woke=result is True,
-              delegated=result == DELEGATED)
-        if result is True:
-            fresh = next((a for a in list_agents() if a["pane_id"] == pane), None)
-            still = outdated_build(fresh) if fresh and fresh.get("agent") == "claude" else None
-            if still:
-                event("restart-failed", pane=pane, name=name, uuid=uuid, reason=f"still runs {os.path.basename(still[0])}")
-                say(f"WARN restart {pane}: woken, but still on {os.path.basename(still[0])}")
-                return None
-        elif result != DELEGATED:
-            event("restart-failed", pane=pane, name=name, uuid=uuid, reason="wake failed; left asleep")
-            notify(f"{SLEEP_MARK}restart of {name} failed", "left asleep: focus the pane or run `wake`",
-                   enabled=config["notify"])
-        say(f"restart {pane}: {old} -> {new}: " + ("woken" if result is True else "wake delegated to the stub"
-                                                   if result == DELEGATED else "wake failed; left asleep"))
-        return entry if result == DELEGATED else None
+        return restart_agent(agent, since, need, old, new, what, config, now)[1]
     return None
+
+
+def restart_agent(agent: dict, since: float | None, window: float, old: str, new: str, what: str,
+                  config: dict, now: float) -> tuple[str, dict | None]:
+    """Sleep one agent and wake it at once (caller holds the lock). Returns (outcome, the entry to
+    confirm outside the lock when the wake went to the pane's stub)."""
+    pane = agent["pane_id"]
+    uuid = (agent.get("agent_session") or {}).get("value")
+    did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False,
+                               restart=True, allow_focused=since is None)
+    if not did:
+        note_skip(pane, f"restart onto {new} refused: {outcome}")
+        return f"refused: {outcome}", None
+    RESTART_TRIED[str(uuid)] = now  # one try per cooldown: a restart that does not take must not loop
+    entry = read_json(JOURNAL).get(pane)
+    result = wake_entry(entry, via=f"restart:{new}", key=pane) if isinstance(entry, dict) else False
+    name = wake_name(entry or {"pane_id": pane})
+    event("restarted", pane=pane, name=name, uuid=uuid, old=old, new=new, kind=what, woke=result is True,
+          delegated=result == DELEGATED)
+    if result is True:
+        fresh = next((a for a in list_agents() if a["pane_id"] == pane), None)
+        still = restart_reason(fresh) if fresh and fresh.get("agent") == "claude" else None
+        if still and still[2] == what:
+            event("restart-failed", pane=pane, name=name, uuid=uuid, reason=f"still runs {still[0]}")
+            say(f"WARN restart {pane}: woken, but still on {still[0]}")
+            return f"woken, but still on {still[0]}", None
+    elif result != DELEGATED:
+        event("restart-failed", pane=pane, name=name, uuid=uuid, reason="wake failed; left asleep")
+        notify(f"{SLEEP_MARK}restart of {name} failed", "left asleep: focus the pane or run `wake`",
+               enabled=config["notify"])
+    outcome = ("restarted" if result is True else "wake delegated to the stub" if result == DELEGATED
+               else "wake failed; left asleep")
+    say(f"restart {pane}: {old} -> {new}: " + ("woken" if result is True else outcome))
+    return outcome, entry if result == DELEGATED else None
 
 
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
@@ -4927,6 +5043,58 @@ def cmd_uninstall(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_account(args: argparse.Namespace) -> int:
+    """Which subscription slot each live claude session runs on (claude-account), and with
+    --restart: restart the idle ones on another slot than the active one now. Busy ones follow
+    at their next idle through the watcher (restart_outdated)."""
+    heal_watcher()
+    active = active_account()
+    if active is None:
+        msg = f"claude-account's launcher is not installed ({ACCOUNTS_DIR / 'run'} is missing)"
+        print(json.dumps({"error": msg}) if args.json else f"account: {msg}", file=sys.stdout if args.json else sys.stderr)
+        return 1
+    try:
+        config, _src = load_config()
+    except ConfigError as exc:
+        print(json.dumps({"error": f"broken config — {exc}"}) if args.json else f"error: broken config — {exc}",
+              file=sys.stdout if args.json else sys.stderr)
+        return 2
+    follows = config["restart_outdated"] and not config["dry_run"]
+    rows: list[dict] = []
+    for agent in [a for a in list_agents() if a.get("agent") == "claude"]:
+        pane = agent["pane_id"]
+        present, _argv, pid = agent_process(pane, "claude")
+        slot = session_account(pid) if present is True else None
+        row = {"pane": pane, "name": agent.get("name") or agent.get("terminal_title_stripped"),
+               "slot": slot, "status": agent.get("agent_status"), "action": "ok"}
+        if slot is None or slot == "explicit":
+            row["action"] = "unknown slot: left alone"
+        elif slot != active and not args.restart:
+            row["action"] = "on the other slot"
+        elif slot != active:
+            delegated = None
+            with locked():
+                try:
+                    outcome, delegated = restart_agent(agent, None, 0.0, f"account {slot}", f"account {active}",
+                                                       "account", config, time.time())
+                except SleeperError as exc:
+                    outcome = f"refused: {exc}"
+            if delegated is not None:
+                outcome = "restarted" if await_stub_wake(delegated) else "wake delegated to the stub (unconfirmed)"
+            if outcome.startswith("refused"):
+                outcome = ("pending: switches at its next idle" if follows else
+                           "pending: restart it by hand (restart_outdated is off here)") + f" ({outcome[9:]})"
+            row["action"] = outcome
+        rows.append(row)
+    if args.json:
+        print(json.dumps({"active": active, "follows_at_idle": follows, "sessions": rows}))
+    else:
+        print(f"active slot: {active}" + ("" if follows else " (watcher does not restart: restart_outdated off or dry run)"))
+        for r in rows:
+            print(f"  {r['pane']:<10} {str(r['name'] or '-')[:28]:<28} slot {r['slot'] or '?'}  {r['status'] or '?':<8} {r['action']}")
+    return 0
+
+
 def cmd_list(_args: argparse.Namespace) -> int:
     heal_watcher()
     if watcher_missing():
@@ -4984,6 +5152,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("wake-all", help="wake every sleeping agent").set_defaults(fn=lambda a: cmd_wake(
         argparse.Namespace(target=None, all=True, without_flags=False, machine=None, here=False)))
     sub.add_parser("list", help="what is sleeping").set_defaults(fn=cmd_list)
+    acp = sub.add_parser("account", help="each claude session's subscription slot (claude-account)")
+    acp.add_argument("--restart", action="store_true", help="restart idle sessions on the other slot now")
+    acp.add_argument("--json", action="store_true")
+    acp.set_defaults(fn=cmd_account)
     lp = sub.add_parser("log", help="events, newest last")
     lp.add_argument("--tail", type=int, default=None)
     lp.set_defaults(fn=cmd_log)

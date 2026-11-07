@@ -63,6 +63,12 @@ def no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sleeper.subprocess, "Popen", refuse)
 
 
+@pytest.fixture(autouse=True)
+def no_real_accounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """claude-account's dir is the live one otherwise: without the launcher, no slot is active."""
+    monkeypatch.setattr(sleeper, "ACCOUNTS_DIR", tmp_path / "claude-accounts")
+
+
 @pytest.fixture
 def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
@@ -4016,3 +4022,97 @@ def test_an_unreadable_catalog_keeps_slashed_local_names_local(state: Path, tmp_
     assert sleeper.route("feat/x", None) == (None, "feat/x")
     with pytest.raises(sleeper.SleeperError, match="unreadable"):
         sleeper.remote_sleeper("dev2", ["presence"])                      # an explicit --machine still refuses
+
+
+# ------------------------------------------------------------------ claude-account slots
+
+def accounts(tmp_path: Path, active: str | None, records: dict[int, str] | None = None,
+             written: float = 1_000.0) -> Path:
+    d = sleeper.ACCOUNTS_DIR
+    (d / "run").mkdir(parents=True, exist_ok=True)
+    if active is not None:
+        (d / "active").write_text(active + "\n")
+    for pid, slot in (records or {}).items():
+        rec = d / "run" / str(pid)
+        rec.write_text(slot + "\n")
+        os.utime(rec, (written, written))
+    return d
+
+
+def test_installed_build_follows_the_account_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    build = tmp_path / "versions" / "2.1.306"
+    build.parent.mkdir()
+    build.write_text("")
+    real = tmp_path / "bin" / "claude"
+    real.parent.mkdir()
+    real.symlink_to(build)
+    launcher = tmp_path / "local" / "claude"
+    launcher.parent.mkdir()
+    launcher.write_text(f"#!/bin/zsh -f\n# claude-account launcher\n# real-binary: {real}\nexec -a claude $real\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(sleeper.shutil, "which", lambda kind, path=None: str(launcher))
+    assert sleeper.installed_build("claude") == os.path.realpath(build)
+    launcher.write_text("#!/bin/sh\nexec /elsewhere \"$@\"\n")             # no marker: the script itself
+    assert sleeper.installed_build("claude") == os.path.realpath(launcher)
+
+
+def test_session_account_reads_the_launcher_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert sleeper.active_account() is None                                # no launcher installed
+    accounts(tmp_path, None, {101: "b", 102: "explicit"})
+    assert sleeper.active_account() == "a"                                 # installed, never switched
+    (sleeper.ACCOUNTS_DIR / "active").write_text("b\n")
+    assert sleeper.active_account() == "b"
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: 999.5)
+    assert sleeper.session_account(101) == "b"                             # written as it started
+    assert sleeper.session_account(102) is None                            # a hand-set config dir
+    assert sleeper.session_account(103) == "a"                             # started before the launcher
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: 1_100.0)
+    assert sleeper.session_account(101) == "a"                             # a reused pid
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: None)
+    assert sleeper.session_account(101) is None                            # gone or unreadable
+
+
+def test_restart_follows_an_account_switch(fake: FakeHerdr, state: Path, tmp_path: Path,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.306")
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: 999.0)
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    accounts(tmp_path, "b", {101: "a"})
+    young = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 60}}
+    sleeper.watch_tick(young, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == []                                            # idle a minute: not yet
+    clocks = {"w1:p1": {**sleeper.clock_key(fake.agents[0]), "since": 1_000_000.0 - 180}}
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True, "dry_run": True})
+    assert fake.signals == [] and "would restart onto account b" in sleeper.LOGFILE.read_text()
+    sleeper.watch_tick(clocks, {**sleeper.DEFAULTS, "restart_outdated": True})
+    assert fake.signals == [(101, signal.SIGTERM)]                       # 3 min idle: well before pressure_idle
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if '"restarted"' in l][-1]
+    assert rec["old"] == "account a" and rec["new"] == "account b" and rec["kind"] == "account"
+
+
+def test_account_command_restarts_idle_and_leaves_busy(fake: FakeHerdr, state: Path, tmp_path: Path,
+                                                      monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: 999.0)
+    monkeypatch.setattr(sleeper, "heal_watcher", lambda: None)
+    monkeypatch.setattr(sleeper, "load_config", lambda: ({**sleeper.DEFAULTS, "restart_outdated": True}, "test"))
+    accounts(tmp_path, "b", {101: "a"})
+    args = types.SimpleNamespace(restart=False, json=True)
+    assert sleeper.cmd_account(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["active"] == "b" and out["sessions"][0]["slot"] == "a" and fake.signals == []
+    fake.agents[0]["agent_status"] = "working"
+    assert sleeper.cmd_account(types.SimpleNamespace(restart=True, json=True)) == 0
+    row = json.loads(capsys.readouterr().out)["sessions"][0]
+    assert row["action"].startswith("pending: switches at its next idle") and fake.signals == []
+    fake.agents[0]["agent_status"] = "idle"
+
+    def start_via_launcher(*argv: Any, **kw: Any) -> Any:   # the woken claude went through the launcher
+        if argv[:2] == ("agent", "start"):
+            (sleeper.ACCOUNTS_DIR / "run" / "101").write_text("b\n")
+        return fake(*argv, **kw)
+    monkeypatch.setattr(sleeper, "herdr", start_via_launcher)
+    assert sleeper.cmd_account(types.SimpleNamespace(restart=True, json=True)) == 0
+    row = json.loads(capsys.readouterr().out)["sessions"][0]
+    assert row["action"] == "restarted" and fake.signals == [(101, signal.SIGTERM)]
