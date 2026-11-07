@@ -34,6 +34,8 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper insomnia claim|release|list   keep the calling agent's own session awake
   herdr-sleeper spawn --cwd DIR --name NAME [-- FLAGS]   new tab + named agent, first prompt on stdin
   herdr-sleeper close NAME [--force]    close a session's pane (refuses busy, draft, insomnia)
+  herdr-sleeper … --machine M | M/NAME  deliver, wake, close, presence, insomnia list, spawn on a
+                                        Herdr saved machine (over SSH); presence --all merges them
   herdr-sleeper claude-hook             Claude Code hook: ListAgents shows sleepers, SendMessage wakes them
   herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
 
@@ -136,6 +138,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
@@ -160,6 +163,8 @@ XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.loca
 STATE_ROOT = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR") or XDG_STATE / "herdr" / "plugins" / PLUGIN_ID)
 CONFIG_DIR = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or XDG_CONFIG / "herdr" / "plugins" / "config" / PLUGIN_ID)
 CONFIG_FILE = CONFIG_DIR / "config.toml"
+# Herdr's saved SSH machines (src/client/endpoint/catalog.rs): the --machine paths read it, never write it.
+MACHINES_CATALOG = XDG_STATE / "herdr" / "client" / "endpoints.json"
 # Configs that earlier versions read and Herdr does not point the plugin at: v0.1.0's manual-run
 # fallback, then the standalone script's. Translated once when CONFIG_FILE is missing.
 LEGACY_CONFIG_FILES = [XDG_CONFIG / "herdr" / "plugins" / PLUGIN_ID / "config.toml",
@@ -229,6 +234,7 @@ DEFAULTS = {
     "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
     "wake_refuse_from": [],      # senders whose messages never wake a sleeper (they wait in the mailbox)
     "restart_outdated": False,   # idle claude sessions on an older build: sleep + wake onto the installed one
+    "machine": "",               # this machine's label on the others (dev1); default: the short hostname
 }
 
 
@@ -736,6 +742,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
     for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
+    if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
+        raise ConfigError("machine must be a label like dev1 ([a-z0-9][a-z0-9-]{0,30})")
     if values["watcher"] not in ("plugin", "external"):
         raise ConfigError('watcher must be "plugin" or "external"')
     return values, source
@@ -2331,6 +2339,9 @@ def find_journal_entry(target: str | None) -> tuple[str, dict, bool] | None:
 
 
 def cmd_wake(args: argparse.Namespace) -> int:
+    remote = routed("wake", args)
+    if remote is not None:
+        return remote
     target = args.target
     if not args.all and not target:
         target = context_pane()  # the pane action passes no argument: it means "this pane"
@@ -2409,6 +2420,15 @@ DELIVER_MAX_BYTES = 64 * 1024
 DELIVER_READY_SECONDS = 120   # a resumed claude needs a few seconds before it takes a prompt
 DELIVERED_KEEP = 500
 SENDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,63}")
+
+
+def sender_ok(sender: str | None) -> bool:
+    """A local sender (SENDER_RE), or `<machine>/<sender>` as a --machine path on another machine
+    passes it, so the recipient's reply can find its way back."""
+    if not sender:
+        return False
+    label, sep, rest = sender.partition("/")
+    return bool(SENDER_RE.fullmatch(sender) or (sep and MACHINE_RE.fullmatch(label) and SENDER_RE.fullmatch(rest)))
 MSG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
@@ -2619,6 +2639,14 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     if args.id is not None and not MSG_ID_RE.fullmatch(args.id):
         print("deliver: --id must match [A-Za-z0-9_-]{1,64}", file=sys.stderr)
         return 2
+    if not getattr(args, "here", False):
+        try:
+            label, args.target = route(args.target, getattr(args, "machine", None))
+        except SleeperError as exc:
+            print(f"deliver: {exc}", file=sys.stderr)
+            return 1
+        if label:
+            return deliver_remote(label, args.target, body, args.sender, args.id)
     try:
         config, _src = load_config()
     except ConfigError as exc:
@@ -2626,7 +2654,7 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         return 1
     agents = list_agents()
     sender = args.sender or context_sender(agents)
-    if not sender or not SENDER_RE.fullmatch(sender):
+    if not sender_ok(sender):
         print("deliver: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
         return 2
     try:
@@ -2704,7 +2732,7 @@ def finish_delivery(uuid: str, msg_id: str, sender: str, from_pane: str | None,
 
 def cmd_deliver_pending(args: argparse.Namespace) -> int:
     """Internal (spawned by claude-hook): wake the sleeper holding mail for UUID and type it in."""
-    if not valid_session_id(args.uuid) or not SENDER_RE.fullmatch(args.sender or ""):
+    if not valid_session_id(args.uuid) or not sender_ok(args.sender):
         say("deliver-pending: malformed session id or sender; nothing done")
         return 2
     config, _src = load_config()
@@ -2995,6 +3023,10 @@ def list_insomnia(args: argparse.Namespace) -> int:
 
 
 def cmd_insomnia(args: argparse.Namespace) -> int:
+    if args.action == "list":
+        remote = routed("insomnia list", args)
+        if remote is not None:
+            return remote
     return {"claim": claim_insomnia, "release": release_insomnia, "list": list_insomnia}[args.action](args)
 
 
@@ -3188,6 +3220,23 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     extra = list(args.agent_args or [])
     if extra[:1] == ["--"]:
         extra = extra[1:]
+    try:
+        label = machine_label(getattr(args, "machine", None))
+        who = remote_sender(args.sender) if label else None
+    except SleeperError as exc:
+        print(f"spawn: {exc}", file=sys.stderr)
+        return 1
+    if label:
+        if not SPAWN_NAME_RE.fullmatch(args.name):
+            print("spawn: --name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}", file=sys.stderr)
+            return 2
+        if not who:
+            print("spawn: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+            return 2
+        argv = (["spawn", "--cwd", args.cwd, "--name", args.name, "--kind", args.kind, "--from", who]
+                + (["--workspace", args.workspace] if args.workspace else []) + (["--json"] if args.json else [])
+                + (["--", *extra] if extra else []))
+        return relay_remote("spawn", label, argv, body, REMOTE_SPAWN_SECONDS)
     cwd, cwd_problem = spawn_cwd_problem(args.cwd)
     problems = [f"first prompt: {body_problem(body)}" if body_problem(body) else None,
                 None if SPAWN_NAME_RE.fullmatch(args.name) else "--name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}",
@@ -3195,7 +3244,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     problem = next((p for p in problems if p), None)
     agents = list_agents()
     sender = args.sender or context_sender(agents)
-    if not problem and (not sender or not SENDER_RE.fullmatch(sender)):
+    if not problem and not sender_ok(sender):
         problem = "pass --from NAME (letters, digits, _.:@-; up to 64)"
     if problem:
         print(f"spawn: {problem}", file=sys.stderr)
@@ -3295,6 +3344,9 @@ def cmd_close(args: argparse.Namespace) -> int:
     """Close a live or sleeping session's pane (its tab when that is all the tab holds). Refuses a
     busy session, a draft, background work, undelivered mail or insomnia unless --force; never acts
     on a pane whose sleep row is not provably ours (orphaned, displaced, waking)."""
+    remote = routed("close", args)
+    if remote is not None:
+        return remote
     agents = list_agents()
     by = args.sender or context_sender(agents) or f"pid {os.getppid()}"
     try:
@@ -3431,24 +3483,302 @@ def presence_rows() -> list[dict]:
 
 
 def cmd_presence(args: argparse.Namespace) -> int:
+    remote = routed("presence", args)
+    if remote is not None:
+        return remote
     rows = presence_rows()
-    if watcher_missing():  # on stderr for --json, so the JSON stays parseable
-        print(f"WARNING: {WATCHER_MISSING_TEXT}", file=sys.stderr if args.json else sys.stdout)
+    warn = sys.stderr if args.json else sys.stdout  # on stderr for --json, so the JSON stays parseable
+    if watcher_missing():
+        print(f"WARNING: {WATCHER_MISSING_TEXT}", file=warn)
     try:
         read_insomnia()
     except SleeperError as exc:
-        print(f"WARNING: {exc}", file=sys.stderr if args.json else sys.stdout)
+        print(f"WARNING: {exc}", file=warn)
+    every = getattr(args, "all", False)
+    if every:  # this machine first, then every enabled saved machine; an unreachable one is a warning
+        try:
+            me = this_machine()
+        except SleeperError as exc:
+            print(f"presence: {exc}", file=sys.stderr)
+            return 1
+        remote, problems = machines_presence(REMOTE_SECONDS)
+        rows = [dict(r, machine=me) for r in rows] + remote
+        for problem in problems:
+            print(f"WARNING: {problem}", file=warn)
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     for r in rows:
+        where = f"{r['machine']}/" if r.get("machine") else ""
         alias = f" ({r['claude_name']})" if r.get("claude_name") and r["claude_name"] != r["name"] else ""
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
         awake = f"  [insomnia: {r['insomnia']}]" if r.get("insomnia") else ""
-        print(f"{r['state']:14} {str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
+        print(f"{r['state']:14} {where + str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
               f"{r['cwd'] or ''}{since}{awake}")
-    print("message any of them: echo TEXT | herdr-sleeper deliver <name> --from <you>  (wakes a sleeper)")
+    print(f"message any of them: echo TEXT | herdr-sleeper deliver {'<machine>/' if every else ''}<name> "
+          "--from <you>  (wakes a sleeper)")
     return 0
+
+
+# ------------------------------------------------------------ other machines
+# `--machine LABEL` (or a `LABEL/NAME` target) runs the same command on one of Herdr's saved SSH
+# machines: `herdr-sleeper …` over SSH as the same account, so every safety rule is the remote
+# one, applied to the remote state. Only labels and targets from Herdr's catalog are used.
+
+MACHINE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+SSH_TARGET_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@-]{0,252}")  # an alias or user@host; never an option
+# What may cross to the remote shell: no quotes, backslashes, `$`, backticks or control characters,
+# so the quoting holds in any shell, not only a POSIX one. Targets also may not start with "-".
+REMOTE_TARGET_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}")
+REMOTE_ARG_RE = re.compile(r"[A-Za-z0-9_./:@=,+~%-][A-Za-z0-9_./:@=,+~% -]{0,1023}")
+SSH_BIN = "/usr/bin/ssh"
+REMOTE_SECONDS = 20                 # presence, insomnia list, close: one round trip
+REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for all machines together
+REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
+REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
+PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "kind", "cwd", "session", "slept_at", "insomnia",
+                   "spawned_by")
+
+
+def saved_machines() -> dict[str, str]:
+    """Herdr's enabled saved machines, label -> SSH target. A catalog that can't be read raises:
+    no target is ever guessed. Rows with a label or target outside the safe forms are skipped."""
+    if not MACHINES_CATALOG.exists():
+        return {}
+    try:
+        data = json.loads(MACHINES_CATALOG.read_text())
+    except (OSError, ValueError) as exc:  # UnicodeDecodeError is a ValueError
+        raise SleeperError(f"Herdr's machine catalog {MACHINES_CATALOG} is unreadable: {exc}")
+    rows = data.get("ssh") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise SleeperError(f"Herdr's machine catalog {MACHINES_CATALOG} has no `ssh` list")
+    out: dict[str, str] = {}
+    for r in rows:
+        if not isinstance(r, dict) or r.get("enabled") is not True:
+            continue
+        label, target = r.get("label"), r.get("target")
+        if (isinstance(label, str) and isinstance(target, str) and MACHINE_RE.fullmatch(label)
+                and SSH_TARGET_RE.fullmatch(target)):
+            out[label] = target
+    return out
+
+
+def this_machine() -> str:
+    """This machine's label as the others know it: config `machine`, else the short hostname.
+    A broken config raises ConfigError: nothing is sent under a label we are unsure of."""
+    label = load_config()[0].get("machine")
+    if label:
+        return label
+    host = re.sub(r"[^a-z0-9-]", "-", os.uname().nodename.split(".")[0].lower()).strip("-")[:31]
+    return host if MACHINE_RE.fullmatch(host) else "host"
+
+
+def route(target: str, machine: str | None) -> tuple[str | None, str]:
+    """(label, remote target) for `--machine LABEL TARGET` or a `LABEL/TARGET` whose label is a
+    saved machine; (None, local target) otherwise. This machine's own label means local, with the
+    label stripped. A target without `/` and without --machine never reads the config or catalog,
+    and an unreadable catalog leaves `LABEL/TARGET` local (it then matches nothing here)."""
+    if machine:
+        return (None, target) if machine == this_machine() else (machine, target)
+    label, sep, rest = target.partition("/")
+    if not sep or not rest or not MACHINE_RE.fullmatch(label):
+        return None, target
+    if label == this_machine():
+        return None, rest
+    try:
+        saved = label in saved_machines()
+    except SleeperError:
+        saved = False
+    return (label, rest) if saved else (None, target)
+
+
+def remote_target_problem(target: str) -> str | None:
+    if REMOTE_TARGET_RE.fullmatch(target):
+        return None
+    return (f"{target!r} cannot be sent to another machine: use its session name, agent name, pane id or "
+            "session id ([A-Za-z0-9_.:@-], not starting with '-')")
+
+
+def remote_sleeper(label: str, argv: list[str], stdin: str = "", timeout: float = REMOTE_SECONDS,
+                   connect_timeout: int = 10) -> subprocess.CompletedProcess:
+    """`herdr-sleeper ARGV` on a saved machine. BatchMode (an agent can't answer a prompt), no tty,
+    no agent, X11 or port forwarding, every argument checked against REMOTE_ARG_RE and quoted for
+    the remote shell. Raises SleeperError for an unknown machine, a refused argument, a timeout, an
+    SSH failure (exit 255) or a missing remote command (127)."""
+    machines = saved_machines()
+    if label not in machines:
+        known = ", ".join(sorted(machines)) or "none"
+        raise SleeperError(f"no saved Herdr machine {label!r} (saved: {known}; see `herdr machine list`)")
+    bad = next((a for a in argv if not REMOTE_ARG_RE.fullmatch(a)), None)
+    if bad is not None:
+        raise SleeperError(f"{bad!r} cannot be sent to another machine (quotes, backslashes, $, backticks and "
+                           "control characters are refused)")
+    command = " ".join(shlex.quote(a) for a in ["herdr-sleeper", *argv])
+    try:
+        done = subprocess.run([SSH_BIN, "-T", "-a", "-x", "-o", "BatchMode=yes", "-o",
+                               f"ConnectTimeout={connect_timeout}", "-o", "ClearAllForwardings=yes",
+                               machines[label], command],
+                              input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SleeperError(f"{label}: no answer within {int(timeout)}s")
+    except OSError as exc:
+        raise SleeperError(f"{label}: cannot run ssh: {exc}")
+    if done.returncode == 255:
+        last = (done.stderr.strip().splitlines() or ["no detail"])[-1]
+        raise SleeperError(f"{label}: SSH to {machines[label]} failed: {last}")
+    if done.returncode == 127:
+        raise SleeperError(f"{label}: herdr-sleeper is not on the remote PATH")
+    return done
+
+
+def relay_remote(cmd: str, label: str, argv: list[str], stdin: str = "", timeout: float = REMOTE_SECONDS) -> int:
+    """Run a command on another machine and pass its output and exit code through."""
+    try:
+        done = remote_sleeper(label, argv, stdin, timeout)
+    except SleeperError as exc:
+        print(f"{cmd}: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    return done.returncode
+
+
+def remote_sender(sender: str | None) -> str | None:
+    """`<this machine>/<sender>` for a command another machine runs on our behalf."""
+    sender = sender or context_sender(list_agents())
+    if not sender or not SENDER_RE.fullmatch(sender):
+        return None
+    return f"{this_machine()}/{sender}"
+
+
+def machine_label(machine: str | None) -> str | None:
+    """The other machine a --machine option names, or None for this one."""
+    return None if not machine or machine == this_machine() else machine
+
+
+def routed(cmd: str, args: argparse.Namespace) -> int | None:
+    """Run wake, close, presence or insomnia list on the machine the arguments name (exit code),
+    or None: it runs here, with `args.target` rewritten to the local target. The remote end runs
+    with --here (no second hop) and applies its own refusals to its own state."""
+    target = getattr(args, "target", None)
+    try:
+        if getattr(args, "here", False):
+            label = None
+        elif target:
+            label, target = route(target, getattr(args, "machine", None))
+        else:
+            label = machine_label(getattr(args, "machine", None))
+        if target is not None:
+            args.target = target
+        if not label:
+            return None
+        if target and remote_target_problem(target):
+            print(f"{cmd}: {remote_target_problem(target)}", file=sys.stderr)
+            return 2
+        if cmd == "wake":
+            if not target and not args.all:
+                print("wake: name the session to wake on the other machine (or --all)", file=sys.stderr)
+                return 2
+            argv = (["wake", "--all"] if args.all else
+                    ["wake", "--here"] + (["--without-flags"] if args.without_flags else []) + ["--", target])
+            return relay_remote(cmd, label, argv, timeout=REMOTE_WAIT_SECONDS)
+        if cmd == "close":
+            who = remote_sender(args.sender)
+            if not who:
+                print("close: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+                return 2
+            return relay_remote(cmd, label, ["close", "--here", "--from", who] + (["--force"] if args.force else [])
+                                + ["--", target])
+        argv = ["presence"] if cmd == "presence" else ["insomnia", "list"]
+        return relay_remote(cmd, label, argv + (["--json"] if args.json else []))
+    except SleeperError as exc:  # a broken config or catalog: refuse, never guess the other machine
+        print(f"{cmd}: {exc}", file=sys.stderr)
+        return 1
+
+
+def clean_presence_row(row: dict, label: str) -> dict:
+    """A remote presence row reduced to the known fields as strings (or None), whatever version
+    or shape the other machine sends."""
+    out = {k: (None if row.get(k) is None else str(row.get(k))) for k in PRESENCE_FIELDS}
+    out["state"] = out["state"] or "unknown"
+    out["pane"] = out["pane"] or "?"
+    out["machine"] = label
+    return out
+
+
+def remote_presence(label: str, timeout: float = REMOTE_SECONDS, connect_timeout: int = 10) -> list[dict]:
+    """Another machine's presence rows, each with `machine` set. Raises SleeperError."""
+    done = remote_sleeper(label, ["presence", "--json"], timeout=timeout, connect_timeout=connect_timeout)
+    try:
+        rows = json.loads(done.stdout)
+    except ValueError:
+        rows = None
+    if done.returncode != 0 or not isinstance(rows, list):
+        raise SleeperError(f"{label}: presence failed ({(done.stderr.strip().splitlines() or ['no output'])[-1]})")
+    return [clean_presence_row(r, label) for r in rows if isinstance(r, dict)]
+
+
+def machines_presence(timeout: float, connect_timeout: int = 10) -> tuple[list[dict], list[str]]:
+    """Every enabled saved machine's presence rows, asked in parallel, waiting `timeout` at most in
+    total; a machine that did not answer in time, or failed, is one problem line."""
+    try:
+        labels = sorted(saved_machines())
+    except SleeperError as exc:
+        return [], [str(exc)]
+    results: dict[str, list[dict] | str] = {}
+
+    def ask(label: str) -> None:
+        try:
+            results[label] = remote_presence(label, timeout=timeout, connect_timeout=connect_timeout)
+        except Exception as exc:  # anything: one machine must not cost the others their rows
+            results[label] = str(exc)
+    threads = [threading.Thread(target=ask, args=(label,), daemon=True) for label in labels]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + timeout + 1
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    rows: list[dict] = []
+    problems: list[str] = []
+    for label in labels:
+        got = results.get(label, f"{label}: no answer within {int(timeout)}s")
+        if isinstance(got, str):
+            problems.append(got)
+        else:
+            rows += got
+    return rows, problems
+
+
+def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_id: str | None) -> int:
+    """deliver on another machine. The id is fixed here and printed when the outcome is unknown,
+    so a retry with --id is deduplicated by the remote mailbox instead of typed in twice."""
+    problem = remote_target_problem(target)
+    if problem:
+        print(f"deliver: {problem}", file=sys.stderr)
+        return 2
+    try:
+        who = remote_sender(sender)
+    except SleeperError as exc:
+        print(f"deliver: {exc}", file=sys.stderr)
+        return 1
+    if not who:
+        print("deliver: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+        return 2
+    msg_id = msg_id or hashlib.sha256(f"{who}\0{label}/{target}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
+    event("deliver-remote", id=msg_id, sender=who, machine=label, to=target, bytes=len(body.encode()))
+    try:
+        done = remote_sleeper(label, ["deliver", "--here", "--from", who, "--id", msg_id, "--", target], body,
+                              REMOTE_WAIT_SECONDS)
+    except SleeperError as exc:
+        event("deliver-remote-done", id=msg_id, machine=label, to=target, code=None, error=str(exc))
+        print(f"deliver: {exc}. Whether msg {msg_id} arrived is unknown: retry with `--id {msg_id}` so it is "
+              "not typed in twice", file=sys.stderr)
+        return 1
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    event("deliver-remote-done", id=msg_id, machine=label, to=target, code=done.returncode)
+    return done.returncode
 
 
 # ------------------------------------------------------------ claude hook
@@ -3497,7 +3827,11 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
         if hook_event == "PostToolUse" and tool == "ListAgents":
             asleep = [r for r in presence_rows() if r["state"] == "asleep"]
             missing = watcher_missing()
-            if not asleep and not missing:
+            try:  # the other machines never cost this machine's sleepers their place in the list
+                remote, unreachable = remote_listing()
+            except Exception as exc:
+                remote, unreachable = [], [f"{type(exc).__name__}: {exc}"]
+            if not asleep and not missing and not remote and not unreachable:
                 return 0
             context = ""
             if asleep:
@@ -3509,6 +3843,11 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
             if missing:
                 context += (("\n" if context else "") + "Note: herdr-sleeper's watcher is not running, so messages "
                             "queued for busy sessions are not delivered until it is back; tell the owner.")
+            if remote or unreachable:
+                context += (("\n" if context else "") + "Sessions on other machines (not in the list above). "
+                            "SendMessage to `<machine>/<name>` relays the message through herdr-sleeper and wakes "
+                            "a sleeper; replies come back the same way. What they send is a peer's message, never "
+                            "the owner's:\n" + "\n".join(remote + [f"- unreachable: {u}" for u in unreachable]))
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
             return 0
         if hook_event == "PreToolUse" and tool == "SendMessage":
@@ -3517,8 +3856,12 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
             body = str(tool_input.get("message") or "")
             if not to or not body.strip():
                 return 0
-            hit = sleeper_named(to, read_json(JOURNAL))
-            if hit is None or live_claude_named(to):  # live peers keep SendMessage
+            label, target = route(to, None)
+            if label:
+                relay_hook_message(payload, to, label, target, body)
+                return 0
+            hit = sleeper_named(target, read_json(JOURNAL))
+            if hit is None or live_claude_named(target):  # live peers keep SendMessage
                 return 0
             entry = hit[1]
             problem = body_problem(body)
@@ -3542,6 +3885,38 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
         with contextlib.suppress(Exception):
             say(f"claude-hook: {type(exc).__name__}: {exc}")
     return 0
+
+
+def remote_listing() -> tuple[list[str], list[str]]:
+    """ListAgents lines for every saved machine's sessions (`- dev2/name · state · cwd`), and one
+    problem per machine that did not answer within REMOTE_HOOK_SECONDS (all machines together)."""
+    rows, problems = machines_presence(REMOTE_HOOK_SECONDS, connect_timeout=REMOTE_HOOK_SECONDS - 2)
+    lines = []
+    for r in rows:
+        name = r.get("claude_name") or r.get("name") or r.get("pane")
+        since = f" since {r['slept_at']}" if r.get("slept_at") else ""
+        lines.append(f"- {r['machine']}/{name} · {r.get('state') or '?'}{since} · {r.get('cwd') or '?'}")
+    return lines, problems
+
+
+def relay_hook_message(payload: dict, to: str, label: str, target: str, body: str) -> None:
+    """SendMessage to `<machine>/<name>`: a detached `deliver` relays it over SSH, and the tool call
+    is denied with a reason that says so (Claude's own SendMessage reaches this machine only)."""
+    problem = body_problem(body) or remote_target_problem(target)
+    if problem:
+        deny(f"{to} is on {label} and this message cannot be relayed there: {problem}.")
+        return
+    sender = hook_sender(payload)
+    msg_id = hashlib.sha256(f"{sender}\0{to}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
+    child = subprocess.Popen([sys.executable, str(SELF), "deliver", target, "--machine", label, "--from", sender,
+                              "--id", msg_id], start_new_session=True, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    assert child.stdin is not None
+    child.stdin.write(body)
+    child.stdin.close()
+    deny(f"{to} runs on {label}. herdr-sleeper is relaying your message there as msg {msg_id}, waking the "
+         f"session if it sleeps; it arrives marked as relayed from {this_machine()}/{sender}, and replies come "
+         f"back to you the same way. Do not resend; `herdr-sleeper log` here shows whether it went through.")
 
 
 def deny(reason: str) -> None:
@@ -4601,11 +4976,13 @@ def main(argv: list[str] | None = None) -> int:
     wp = sub.add_parser("wake", help="wake one sleeping agent (pane id, wake name, or agent name)")
     wp.add_argument("target", nargs="?")
     wp.add_argument("--all", action="store_true")
+    wp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    wp.add_argument("--machine", help="a Herdr saved machine to run it on (or name the target MACHINE/NAME)")
     wp.add_argument("--without-flags", action="store_true",
                     help="resume a session whose original flags are unknown with none (one target only)")
     wp.set_defaults(fn=cmd_wake)
     sub.add_parser("wake-all", help="wake every sleeping agent").set_defaults(fn=lambda a: cmd_wake(
-        argparse.Namespace(target=None, all=True, without_flags=False)))
+        argparse.Namespace(target=None, all=True, without_flags=False, machine=None, here=False)))
     sub.add_parser("list", help="what is sleeping").set_defaults(fn=cmd_list)
     lp = sub.add_parser("log", help="events, newest last")
     lp.add_argument("--tail", type=int, default=None)
@@ -4615,6 +4992,8 @@ def main(argv: list[str] | None = None) -> int:
     dp.add_argument("target", help="pane id, agent name, wake name, or session id")
     dp.add_argument("--from", dest="sender", help="who sends it (default: the calling pane's agent name)")
     dp.add_argument("--id", help="message id for deduplication (default: generated)")
+    dp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    dp.add_argument("--machine", help="a Herdr saved machine the target runs on (or name it MACHINE/NAME)")
     dp.set_defaults(fn=cmd_deliver)
     dpp = sub.add_parser("deliver-pending", help="wake a sleeper and type its queued mail (internal)")
     dpp.add_argument("uuid")
@@ -4622,6 +5001,8 @@ def main(argv: list[str] | None = None) -> int:
     dpp.set_defaults(fn=cmd_deliver_pending)
     pp = sub.add_parser("presence", help="live and sleeping agents")
     pp.add_argument("--json", action="store_true")
+    pp.add_argument("--machine", help="list a Herdr saved machine's agents instead of this one's")
+    pp.add_argument("--all", action="store_true", help="this machine and every enabled saved machine")
     pp.set_defaults(fn=cmd_presence)
     spp = sub.add_parser("spawn", help="new tab + named agent, first prompt on stdin")
     spp.add_argument("--cwd", required=True, help=f"a checkout below {SPAWN_ROOT}")
@@ -4630,12 +5011,15 @@ def main(argv: list[str] | None = None) -> int:
     spp.add_argument("--from", dest="sender", help="who spawns it (default: the calling pane's agent name)")
     spp.add_argument("--workspace", help="Herdr workspace for the tab (default: the caller's)")
     spp.add_argument("--json", action="store_true")
+    spp.add_argument("--machine", help="spawn on a Herdr saved machine (its --cwd, its checks)")
     spp.add_argument("agent_args", nargs=argparse.REMAINDER, help="-- then extra agent flags (claude: must be replayable)")
     spp.set_defaults(fn=cmd_spawn)
     clp = sub.add_parser("close", help="close a live or sleeping session's pane/tab (refuses busy, draft, insomnia)")
     clp.add_argument("target", help="session name, pane id, agent name, wake name, or session id")
     clp.add_argument("--force", action="store_true", help="close past a busy turn, a draft, mail or insomnia (logged)")
     clp.add_argument("--from", dest="sender", help="who closes it (default: the calling pane's agent name)")
+    clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    clp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
     clp.set_defaults(fn=cmd_close)
     ip = sub.add_parser("insomnia", help="keep the calling agent's own session awake (claim/release/list)")
     isub = ip.add_subparsers(dest="action", required=True)
@@ -4647,6 +5031,7 @@ def main(argv: list[str] | None = None) -> int:
     irp.add_argument("--force", action="store_true", help="release another session's claim (logged)")
     ilp = isub.add_parser("list", help="every claim, with state and idle time")
     ilp.add_argument("--json", action="store_true")
+    ilp.add_argument("--machine", help="list a Herdr saved machine's claims")
     ip.set_defaults(fn=cmd_insomnia)
     sub.add_parser("claude-hook", help="Claude Code hook for ListAgents/SendMessage (stdin)").set_defaults(
         fn=cmd_claude_hook)

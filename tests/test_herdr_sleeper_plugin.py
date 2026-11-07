@@ -5,6 +5,7 @@ machine, the watcher tick, the focus hook, and the in-pane stub — against a fa
 from __future__ import annotations
 
 import json
+import re
 import os
 import shlex
 import signal
@@ -73,6 +74,8 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             monkeypatch.setattr(sleeper, name, d / base.name if base != live else d)
     assert "SPAWNED" in vars(sleeper) and sleeper.SPAWNED.parent == d and sleeper.INSOMNIA.parent == d
     monkeypatch.setattr(sleeper, "LEGACY_STATE_DIR", tmp_path / "legacy")
+    # Herdr's machine catalog lives outside the plugin dir: never read the live one
+    monkeypatch.setattr(sleeper, "MACHINES_CATALOG", tmp_path / "herdr-client" / "endpoints.json")
     monkeypatch.setattr(sleeper, "CONFIG_FILE", tmp_path / "absent.toml")
     monkeypatch.setattr(sleeper, "LEGACY_CONFIG_FILES", [tmp_path / "legacy-config.toml"], raising=False)
     # never spawn a real watcher from a unit test; the heal path has its own tests
@@ -441,7 +444,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
-                      "restart_outdated": False}
+                      "restart_outdated": False, "machine": ""}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -3639,3 +3642,377 @@ def test_an_owed_name_is_dropped_for_another_session_or_after_an_hour(fake: Fake
     fake.agents[0]["agent_session"] = {"value": "another-session"}     # the pane moved on
     sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
     assert sleeper.read_json(sleeper.NAMES_OWED) == {} and fake.agents[0]["name"] is None
+
+
+# ------------------------------------------------------------ other machines (v0.1.5)
+
+FAKE_SSH = '''#!/usr/bin/env python3
+import json, os, sys
+log = os.environ["FAKE_SSH_LOG"]
+with open(log, "a") as fh:
+    fh.write(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}) + "\\n")
+reply = json.load(open(os.environ["FAKE_SSH_REPLY"]))
+sys.stdout.write(reply.get("stdout", ""))
+sys.stderr.write(reply.get("stderr", ""))
+sys.exit(reply.get("rc", 0))
+'''
+
+
+class FakeSsh:
+    def __init__(self, tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.bin, self.log, self.reply_file = tmp / "ssh", tmp / "ssh.jsonl", tmp / "ssh-reply.json"
+        self.bin.write_text(FAKE_SSH)
+        self.bin.chmod(0o755)
+        monkeypatch.setattr(sleeper, "SSH_BIN", str(self.bin))
+        monkeypatch.setenv("FAKE_SSH_LOG", str(self.log))
+        monkeypatch.setenv("FAKE_SSH_REPLY", str(self.reply_file))
+        self.reply()
+
+    def reply(self, stdout: str = "", stderr: str = "", rc: int = 0) -> None:
+        self.reply_file.write_text(json.dumps({"stdout": stdout, "stderr": stderr, "rc": rc}))
+
+    def calls(self) -> list[dict]:
+        return [json.loads(l) for l in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def remote_argv(self, i: int = -1) -> list[str]:
+        """What the remote shell runs, split back the way it would."""
+        return shlex.split(self.calls()[i]["argv"][-1])
+
+
+def write_catalog(rows: list[dict] | str) -> None:
+    sleeper.MACHINES_CATALOG.parent.mkdir(parents=True, exist_ok=True)
+    sleeper.MACHINES_CATALOG.write_text(rows if isinstance(rows, str) else json.dumps({"version": 1, "ssh": rows}))
+
+
+def machine_row(label: str = "dev2", target: str = "herdr-dev2", enabled: bool = True) -> dict:
+    return {"id": "0" * 32, "label": label, "target": target, "session": "default", "enabled": enabled}
+
+
+@pytest.fixture
+def ssh(state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSsh:
+    """dev1 (this machine) with dev2 saved; the real Popen, so the fake ssh actually runs."""
+    write_catalog([machine_row()])
+    cfg = tmp_path / "machine.toml"
+    cfg.write_text('machine = "dev1"\nexclude = []\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    return FakeSsh(tmp_path, monkeypatch)
+
+
+def test_saved_machines_reads_only_safe_enabled_rows(state: Path) -> None:
+    assert sleeper.saved_machines() == {}                                 # no catalog: no machines
+    write_catalog([machine_row(), machine_row("off", enabled=False), machine_row("Dev 3"),
+                   machine_row("evil", "-oProxyCommand=touch /tmp/x"), machine_row("dev4", "dev@10.8.0.9")])
+    assert sleeper.saved_machines() == {"dev2": "herdr-dev2", "dev4": "dev@10.8.0.9"}
+    for broken in ("{not json", json.dumps({"version": 1}), json.dumps([1])):
+        write_catalog(broken)
+        with pytest.raises(sleeper.SleeperError, match="catalog"):
+            sleeper.saved_machines()                                      # never a guessed target
+
+
+def test_route_sends_only_saved_machine_labels_away(ssh: FakeSsh) -> None:
+    assert sleeper.route("impl-1", None) == (None, "impl-1")
+    assert sleeper.route("dev2/impl-1", None) == ("dev2", "impl-1")
+    assert sleeper.route("dev1/impl-1", None) == (None, "impl-1")         # this machine's own label
+    assert sleeper.route("dev9/impl-1", None) == (None, "dev9/impl-1")    # not saved: a local name
+    assert sleeper.route("impl-1", "dev2") == ("dev2", "impl-1")
+    assert sleeper.route("impl-1", "dev1") == (None, "impl-1")
+
+
+def test_machine_label_comes_from_config_and_is_validated(state: Path, tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "m.toml"
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    cfg.write_text('machine = "dev1"\n')
+    assert sleeper.this_machine() == "dev1"
+    cfg.write_text('exclude = []\n')
+    assert sleeper.MACHINE_RE.fullmatch(sleeper.this_machine())          # no label: the short hostname
+    cfg.write_text('machine = "Dev 1"\n')
+    with pytest.raises(sleeper.ConfigError, match="machine"):
+        sleeper.load_config()
+    with pytest.raises(sleeper.ConfigError):
+        sleeper.this_machine()                                            # never a guessed label
+
+
+def test_remote_command_is_locked_down_and_quoted(ssh: FakeSsh) -> None:
+    ssh.reply(stdout="ok\n")
+    done = sleeper.remote_sleeper("dev2", ["spawn", "--cwd", "/Users/dev/development/my app", "--", "--model",
+                                           "opus"], "body")
+    argv = ssh.calls()[0]["argv"]
+    assert done.stdout == "ok\n" and ssh.calls()[0]["stdin"] == "body"
+    assert argv[:-2] == ["-T", "-a", "-x", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                         "-o", "ClearAllForwardings=yes"]
+    assert argv[-2] == "herdr-dev2"
+    assert ssh.remote_argv() == ["herdr-sleeper", "spawn", "--cwd", "/Users/dev/development/my app", "--",
+                                 "--model", "opus"]
+    # what could escape the quoting in some shell never leaves this machine
+    for bad in ("x; rm -rf ~", "$(id)", "`id`", "a'b", 'a"b', "a\\b", "a\nb", "-"[:0]):
+        with pytest.raises(sleeper.SleeperError, match="cannot be sent"):
+            sleeper.remote_sleeper("dev2", ["deliver", bad])
+    assert len(ssh.calls()) == 1
+
+
+def test_remote_failures_raise(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(sleeper.SleeperError, match="no saved Herdr machine 'dev7'.*saved: dev2"):
+        sleeper.remote_sleeper("dev7", ["presence"])
+    assert ssh.calls() == []
+    ssh.reply(stderr="ssh: connect to host 10.8.0.101 port 22: Operation timed out\n", rc=255)
+    with pytest.raises(sleeper.SleeperError, match="SSH to herdr-dev2 failed: .*timed out"):
+        sleeper.remote_sleeper("dev2", ["presence"])
+    ssh.bin.write_text("#!/bin/sh\nsleep 5\n")
+    with pytest.raises(sleeper.SleeperError, match="no answer within 1s"):
+        sleeper.remote_sleeper("dev2", ["presence"], timeout=1)
+
+
+def test_deliver_to_another_machine_carries_sender_machine_and_a_fixed_id(
+        ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stdout="queued msg x for impl-1: not ready yet (busy); typed in when it is\n", rc=3)
+    assert deliver(monkeypatch, "dev2/impl-1", body="review MR !4") == 3   # the remote exit code passes through
+    call = ssh.calls()[0]
+    remote = ssh.remote_argv()
+    assert remote[:5] == ["herdr-sleeper", "deliver", "--here", "--from", "dev1/orc"]
+    assert remote[5] == "--id" and re.fullmatch(r"[0-9a-f]{16}", remote[6]) and remote[7:] == ["--", "impl-1"]
+    assert call["stdin"] == "review MR !4" and "queued msg" in capsys.readouterr().out
+    assert prompts(fake) == []                                            # nothing typed on this machine
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()]
+    assert [r["event"] for r in rec] == ["deliver-remote", "deliver-remote-done"]
+    assert rec[1]["code"] == 3 and all("review MR" not in json.dumps(r) for r in rec)
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("again"))
+    assert sleeper.cmd_deliver(types.SimpleNamespace(target="impl-1", sender="orc", id="m-1", machine="dev2")) == 3
+    assert ssh.remote_argv()[-4:] == ["--id", "m-1", "--", "impl-1"]    # a retry keeps the caller's id
+
+
+def test_deliver_from_another_machine_shows_it_in_the_envelope(fake: FakeHerdr,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a", sender="dev2/impl-1") == 0
+    assert prompts(fake)[0][3].startswith("[relayed from dev2/impl-1 via herdr-sleeper, msg ")
+    assert "not from the owner]" in prompts(fake)[0][3]
+    for bad in ("dev2/x/y", "Dev2/x", "dev2/", "/x"):
+        assert not sleeper.sender_ok(bad)
+        assert deliver(monkeypatch, "a", sender=bad) == 2
+
+
+def test_wake_close_and_insomnia_list_run_on_the_named_machine(ssh: FakeSsh, fake: FakeHerdr,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stdout="woke impl-1\n")
+    assert sleeper.cmd_wake(types.SimpleNamespace(target="dev2/impl-1", all=False, without_flags=False,
+                                                  machine=None)) == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "wake", "--here", "--", "impl-1"]
+    assert sleeper.cmd_wake(types.SimpleNamespace(target=None, all=False, without_flags=False, machine="dev2")) == 2
+    assert sleeper.cmd_close(types.SimpleNamespace(target="impl-1", force=True, sender="orc", machine="dev2")) == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "close", "--here", "--from", "dev1/orc", "--force", "--", "impl-1"]
+    assert sleeper.cmd_insomnia(types.SimpleNamespace(action="list", json=True, machine="dev2")) == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "insomnia", "list", "--json"]
+    assert "woke impl-1" in capsys.readouterr().out
+    assert not any(c[:2] in (("agent", "start"), ("pane", "close"), ("tab", "close")) for c in fake.calls)
+
+
+def test_spawn_on_another_machine_leaves_the_checks_to_it(ssh: FakeSsh, fake: FakeHerdr,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    ssh.reply(stdout='{"name": "impl-1"}\n')
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("build B-1"))
+    args = types.SimpleNamespace(cwd="/Users/dev/development/klinikon/x", name="impl-1", kind="claude",
+                                 sender="orc", workspace=None, json=True, agent_args=["--", "--model", "opus"],
+                                 machine="dev2")
+    assert sleeper.cmd_spawn(args) == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "spawn", "--cwd", "/Users/dev/development/klinikon/x",
+                                 "--name", "impl-1", "--kind", "claude", "--from", "dev1/orc", "--json",
+                                 "--", "--model", "opus"]
+    assert ssh.calls()[0]["stdin"] == "build B-1"
+    assert not any(c[:2] == ("tab", "create") for c in fake.calls)       # nothing created here
+
+
+def test_presence_all_merges_machines_and_warns_for_an_unreachable_one(
+        ssh: FakeSsh, fake: FakeHerdr, capsys: pytest.CaptureFixture[str]) -> None:
+    remote = [{"state": "asleep", "name": "impl-1", "claude_name": "impl-1", "pane": "w2:p1", "kind": "claude",
+               "cwd": "/Users/dev/development/klinikon", "session": "s", "slept_at": "2026-11-07T10:00:00",
+               "insomnia": None, "spawned_by": "dev1/orc"}]
+    ssh.reply(stdout=json.dumps(remote))
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "dev1/a " in out and "dev2/impl-1" in out and "deliver <machine>/<name>" in out
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True, machine=None, all=True)) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert {(r["machine"], r["name"]) for r in rows} == {("dev1", "a"), ("dev2", "impl-1")}
+    ssh.reply(stderr="Connection refused\n", rc=255)
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "WARNING: dev2: SSH to herdr-dev2 failed: Connection refused" in out and "dev1/a " in out
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine="dev2", all=False)) == 1
+
+
+def test_hook_lists_other_machines_in_list_agents(ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stdout=json.dumps([{"state": "idle", "name": "impl-2", "pane": "w2:p2", "cwd": "/k"},
+                                 {"state": "asleep", "name": "wake-w2-p1", "claude_name": "impl-1", "pane": "w2:p1",
+                                  "cwd": "/k", "slept_at": "2026-11-07T10:00:00"}]))
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    text = ctx["hookSpecificOutput"]["additionalContext"]
+    assert "- dev2/impl-2 · idle · /k" in text and "- dev2/impl-1 · asleep since 2026-11-07T10:00:00 · /k" in text
+    assert "never the owner's" in text
+    ssh.reply(stderr="No route to host\n", rc=255)
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    assert "- unreachable: dev2: SSH to herdr-dev2 failed: No route to host" in ctx["hookSpecificOutput"][
+        "additionalContext"]
+
+
+def test_hook_relays_send_message_to_another_machine(ssh: FakeSsh, fake: FakeHerdr, state: Path,
+                                                     monkeypatch: pytest.MonkeyPatch,
+                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    sender_log = state / "sender.jsonl"
+    sender_log.write_text(json.dumps({"type": "agent-name", "agentName": "orchestrator"}) + "\n")
+    started: list[tuple[list[str], str]] = []
+
+    class Child:
+        def __init__(self, argv: list[str], **kw: Any) -> None:
+            assert kw["start_new_session"] and kw["stdout"] is sleeper.subprocess.DEVNULL
+            self.argv, self.stdin = argv, self
+
+        def write(self, text: str) -> None:
+            started.append((self.argv, text))
+
+        def close(self) -> None:
+            pass
+    monkeypatch.setattr(sleeper.subprocess, "Popen", Child)
+    out = run_hook(monkeypatch, capsys, {
+        "hook_event_name": "PreToolUse", "tool_name": "SendMessage", "transcript_path": str(sender_log),
+        "tool_input": {"to": "dev2/impl-1 [3fa9c1]", "message": "please rebase"}})
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny"
+    assert "relayed from dev1/orchestrator" in hso["permissionDecisionReason"]
+    [(argv, body)] = started
+    assert argv[2:8] == ["deliver", "impl-1", "--machine", "dev2", "--from", "orchestrator"]
+    assert argv[8] == "--id" and argv[9] in hso["permissionDecisionReason"] and body == "please rebase"
+    assert sleeper.pending_mail(UUID) == [] and prompts(fake) == []
+    out = run_hook(monkeypatch, capsys, {"hook_event_name": "PreToolUse", "tool_name": "SendMessage",
+                                         "tool_input": {"to": "dev2/impl-1", "message": "bad\x07"}})
+    assert "cannot be relayed there" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert len(started) == 1
+
+
+def test_own_label_targets_resolve_here(ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    # presence --all prints this machine's rows as dev1/<name>; that address must work here too
+    assert deliver(monkeypatch, "dev1/a") == 0 and prompts(fake)[0][2] == "w1:p1"
+    args = types.SimpleNamespace(target="dev1/a", all=False, without_flags=False, machine=None, here=False)
+    assert sleeper.routed("wake", args) is None and args.target == "a"
+    assert ssh.calls() == []
+
+
+def test_remote_end_never_routes_again(ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("hi"))
+    # dev2 sends `deliver --here -- dev1/x`: resolved here as given, never sent back over SSH
+    assert sleeper.cmd_deliver(types.SimpleNamespace(target="dev2/a", sender="dev2/impl", id=None, machine=None,
+                                                     here=True)) == 1
+    assert ssh.calls() == []
+    args = types.SimpleNamespace(target="dev2/x", all=False, without_flags=False, machine=None, here=True)
+    assert sleeper.routed("wake", args) is None and args.target == "dev2/x"
+
+
+def test_targets_that_could_turn_into_options_stay_here(ssh: FakeSsh, fake: FakeHerdr,
+                                                        monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    for target in ("dev2/-h", "dev2/--all", "dev2/x y", "dev2/$(id)"):
+        assert deliver(monkeypatch, target) == 2
+        assert sleeper.cmd_close(types.SimpleNamespace(target=target, force=False, sender="orc", machine=None,
+                                                       here=False)) == 2
+    assert ssh.calls() == [] and "cannot be sent to another machine" in capsys.readouterr().err
+    # and the remote parser reads what follows `--` as the target, whatever it looks like
+    seen: list[str] = []
+    monkeypatch.setattr(sleeper, "cmd_deliver", lambda a: seen.append(a.target) or 0)
+    assert sleeper.main(["deliver", "--here", "--from", "dev1/orc", "--", "-h"]) == 0 and seen == ["-h"]
+
+
+def test_a_lost_connection_prints_the_id_to_retry_with(ssh: FakeSsh, fake: FakeHerdr,
+                                                       monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stderr="client_loop: send disconnect: Broken pipe\n", rc=255)
+    assert deliver(monkeypatch, "dev2/impl-1") == 1
+    err = capsys.readouterr().err
+    sent_id = ssh.remote_argv()[6]
+    assert f"Whether msg {sent_id} arrived is unknown: retry with `--id {sent_id}`" in err
+    done = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()][-1]
+    assert done["event"] == "deliver-remote-done" and done["code"] is None and "Broken pipe" in done["error"]
+    ssh.reply(stdout=f"msg {sent_id} was delivered already; not sent twice\n")
+    assert deliver(monkeypatch, "dev2/impl-1", msg_id=sent_id) == 0       # the retry the message suggests
+    assert ssh.remote_argv()[6] == sent_id
+
+
+def test_remote_paths_refuse_without_a_sender_or_with_a_broken_config(
+        ssh: FakeSsh, fake: FakeHerdr, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    assert sleeper.cmd_close(types.SimpleNamespace(target="dev2/x", force=False, sender=None, machine=None,
+                                                   here=False)) == 2
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("go"))
+    spawn = types.SimpleNamespace(cwd="/Users/dev/development/k", name="impl-1", kind="claude", sender=None,
+                                  workspace=None, json=False, agent_args=[], machine="dev2")
+    assert sleeper.cmd_spawn(spawn) == 2
+    for bad_name, flags in (("bad name", []), ("impl-1", ["--", "--append-system-prompt", "it's"])):
+        monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("go"))
+        rc = sleeper.cmd_spawn(types.SimpleNamespace(**{**vars(spawn), "sender": "orc", "name": bad_name,
+                                                        "agent_args": flags}))
+        assert rc in (1, 2)
+    assert ssh.calls() == []
+    sleeper.CONFIG_FILE.write_text('machine = "Not A Label"\n')
+    assert deliver(monkeypatch, "dev2/impl-1") == 1                       # no label we trust: nothing sent
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 1
+    assert ssh.calls() == []
+
+
+def test_odd_remote_output_never_crashes(ssh: FakeSsh, fake: FakeHerdr, capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stdout=json.dumps([{"name": "impl-1"}, {"state": "idle", "pane": None, "kind": 7}, "junk"]))
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "dev2/impl-1" in out and "unknown" in out
+    ssh.bin.write_text("#!/bin/sh\nprintf '\\377\\376 not utf-8\\n'\n")
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine="dev2", all=False)) == 0
+    assert "not utf-8" in capsys.readouterr().out
+    ssh.bin.write_text("#!/bin/sh\nexit 127\n")
+    with pytest.raises(sleeper.SleeperError, match="not on the remote PATH"):
+        sleeper.remote_sleeper("dev2", ["presence"])
+
+
+def test_hook_waits_for_all_machines_together_and_keeps_local_sleepers(
+        ssh: FakeSsh, fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    write_catalog([machine_row("dev2", "herdr-dev2"), machine_row("dev3", "herdr-dev3")])
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    ssh.bin.write_text("#!/bin/sh\nsleep 30\n")
+    monkeypatch.setattr(sleeper, "REMOTE_HOOK_SECONDS", 3)
+    began = time.monotonic()
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    assert time.monotonic() - began < 6                                   # not 3 s per machine, one after another
+    text = ctx["hookSpecificOutput"]["additionalContext"]
+    assert "ts-api-worker" in text
+    assert "- unreachable: dev2: no answer within 3s" in text and "- unreachable: dev3: no answer" in text
+    monkeypatch.setattr(sleeper, "machines_presence", lambda *a, **k: 1 / 0)
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
+    assert "ts-api-worker" in ctx["hookSpecificOutput"]["additionalContext"]   # an error there costs nothing here
+
+
+def test_local_sleepers_keep_send_message_with_machines_saved(ssh: FakeSsh, fake: FakeHerdr, state: Path,
+                                                              monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    named_transcript(state, UUID, "ts-api-worker")
+    slept_entry(fake)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: spawned.append(argv))
+    for to in ("ts-api-worker", "dev1/ts-api-worker"):
+        out = run_hook(monkeypatch, capsys, {"hook_event_name": "PreToolUse", "tool_name": "SendMessage",
+                                             "tool_input": {"to": to, "message": "rebase"}})
+        assert "queued as msg" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert [a[-4] for a in spawned] == ["deliver-pending", "deliver-pending"] and ssh.calls() == []
+
+
+def test_an_unreadable_catalog_keeps_slashed_local_names_local(state: Path, tmp_path: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "m.toml"
+    cfg.write_text('machine = "dev1"\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    write_catalog("{broken")
+    assert sleeper.route("feat/x", None) == (None, "feat/x")
+    with pytest.raises(sleeper.SleeperError, match="unreadable"):
+        sleeper.remote_sleeper("dev2", ["presence"])                      # an explicit --machine still refuses

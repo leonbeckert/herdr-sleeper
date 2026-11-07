@@ -596,6 +596,22 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
 - *Not covered:* a real reboot with a claim; `--for` expiry and `insomnia-stale` against a real server (unit
   tests only); codex spawn.
 
+**10.11 Herdr saved machines, as the --machine paths use them (2026-11-07, Herdr 0.9.5, v0.1.5).**
+- *Catalog:* `machine add` writes `$XDG_STATE_HOME/herdr/client/endpoints.json` (`{version: 1, ssh: [{id,
+  label, target, session, enabled}]}`, `deny_unknown_fields`, id = 32 lowercase hex;
+  `src/client/endpoint/catalog.rs`) plus a metadata cache in `client/ssh-metadata/`. A catalog written by
+  configuration management alone is enough: with the cache deleted, `herdr --machine dev2 agent list`
+  worked, and Herdr rebuilt the cache itself (lab with its own HOME and XDG dirs).
+- *SSH:* Herdr runs the system `ssh` with `-F` pointing at a config it writes, which includes
+  `$HOME/.ssh/config` and `/etc/ssh/ssh_config` (`write_managed_ssh_config` in `src/remote/attach.rs`). A
+  target's key, user and pinned host key must therefore come from a `Host` alias in `~/.ssh/config`; a
+  separate `-F` file (the minis' `~/.ssh/impl.conf`) is invisible to Herdr.
+- *A lab HOME does not move ssh:* OpenSSH expands `~` from the account's home directory, not `$HOME`, so the
+  plugin's own `ssh` call (no `-F`) reads the real `~/.ssh/config` even under a lab HOME. The --machine paths
+  were therefore unit-tested against a fake `ssh`, and verified live only after a deploy wrote the alias.
+- *Not taken:* reusing Herdr's shared connection. Its ControlPath lives in a directory Herdr scopes to its own
+  config; each plugin call opens its own connection (a remote `presence --json` took 0.53 s over the VPN).
+
 ---
 
 ## Asks for Herdr upstream

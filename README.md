@@ -393,6 +393,69 @@ An orphaned, displaced or waking row is never closed, not even with
 `--force`. Either way the transcript stays on disk, and `close` prints
 the line that resumes it by hand.
 
+## Other machines
+
+Herdr's saved SSH machines (`herdr machine list`) extend `deliver`, `wake`,
+`close`, `presence`, `insomnia list` and `spawn` to another machine:
+
+```sh
+echo "review MR !4" | herdr-sleeper deliver dev2/impl-1 --from orc   # or: deliver impl-1 --machine dev2
+herdr-sleeper wake dev2/impl-1
+herdr-sleeper presence --all                # this machine and every enabled saved one, as machine/name
+herdr-sleeper presence --machine dev2 [--json]
+herdr-sleeper insomnia list --machine dev2
+echo "build B-17" | herdr-sleeper spawn --machine dev2 --cwd ~/development/app --name impl-1 [-- FLAGS]
+herdr-sleeper close dev2/impl-1 [--force]
+```
+
+The command runs as `herdr-sleeper …` on that machine over SSH, as the same
+account, so the remote checks (cwd, flags, busy, draft, insomnia) apply to
+the remote state, and nothing about the remote session is decided here.
+Details:
+- **Where:** only machines in Herdr's catalog
+  (`$XDG_STATE_HOME/herdr/client/endpoints.json`, read, never written) are
+  used. Each must be enabled and have a plain label (`[a-z0-9-]`) and an
+  alias or `user@host` target. A catalog that can't be read refuses the
+  command; a target is never guessed.
+- **`LABEL/NAME` is remote** only when LABEL is a saved machine; this
+  machine's own label means the local session (so the `dev1/name` that
+  `presence --all` prints works on dev1 too). A target without `/` never
+  reads the catalog, and an unreadable catalog keeps `LABEL/NAME` local. A
+  local name that starts with a saved label and `/` needs its pane id.
+  The receiving end gets the target after `--` with an internal `--here`,
+  so it never routes again.
+- **SSH:** `ssh -T -a -x -o BatchMode=yes -o ClearAllForwardings=yes <target>`
+  (no prompt an agent could not answer, no agent, X11 or port forwarding),
+  with every argument quoted for the remote shell. Arguments with quotes,
+  backslashes, `$`, backticks or control characters are refused here, so the
+  quoting holds in any remote shell, and a target must match
+  `[A-Za-z0-9_][A-Za-z0-9_.:@-]*` (never an option). Exit 127 there means
+  `herdr-sleeper` is not on that account's PATH. The alias's key and
+  pinned host key come from `~/.ssh/config`. Each call is its own
+  connection, not Herdr's shared one, which lives in a directory scoped to
+  Herdr.
+- **Who:** the sender reaches the other side as `<machine>/<sender>`, so
+  the envelope says `[relayed from dev1/orc via herdr-sleeper, …; not from
+  the owner]` and a reply can find its way back. `machine` in the config
+  sets the label (default: the short hostname). It has to match what the
+  other machines call this one. A broken config refuses every remote path,
+  as it refuses local delivery. `wake_refuse_from` matches the sender as it
+  arrives: `dev1/orc`, not `orc`.
+- **Retries:** `deliver` fixes the message id before it sends. When the
+  connection is lost or the answer doesn't come in time, it prints that the
+  outcome is unknown and the `--id` to retry with; the remote mailbox then
+  deduplicates instead of typing the message twice. Otherwise the remote exit
+  code passes through. `deliver-remote` and `deliver-remote-done` are logged
+  here.
+- **Claude hook:** `ListAgents` adds every saved machine's sessions as
+  `<machine>/<name>`. The machines are asked in parallel, 6 s at most for all
+  together; an unreachable one is named, and an error there never drops this
+  machine's sleepers from the list. `presence --all` asks the same way. `SendMessage` to `<machine>/<name>` is relayed by a detached
+  `deliver` and the tool call is denied with a reason that says so.
+
+A message from another machine is a peer's message like any other relayed
+one, never the owner's word.
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -498,13 +561,13 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 340 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 361 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close, against a fake `herdr`, and the CLI's real output shapes (the
+and close, against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's
 `/usr/bin/python3`) and 3.12. The `state` fixture redirects every module-level
 path in the state dir, so a new state file cannot reach the live one. The fake does not prove what a real Herdr
