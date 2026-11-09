@@ -216,6 +216,8 @@ WAKE_CONFIRM_SECONDS = 15        # agent start may answer before the session id 
 WAKE_DELEGATE_SECONDS = 30       # how long `wake` waits for the in-pane stub to resume
 FOCUS_LOCK_WAIT_SECONDS = 10     # a focus hook gives up after this (the next focus retries)
 WATCHER_POLL_SECONDS_DEFAULT = 60
+MAIL_POLL_SECONDS = 5           # while mail waits, retry it this often between the watcher's ticks
+MAIL_BATCH_MAX_BYTES = 32768    # queued messages typed in as one prompt, up to this size
 WATCHER_BACKOFF_MAX = 600
 WATCHER_LOCK_WAIT_SECONDS = 120  # a replacement watcher waits this long for the old one to finish
 CLAIM_SOURCE = "custom:herdr-sleeper"
@@ -2704,36 +2706,50 @@ def well_formed_mail(msg: object) -> bool:
 
 
 def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
-    """Type queued messages for uuid into its agent, oldest first, each only after a fresh
-    mail_refusal check passes; a file is removed only after `agent prompt` succeeded (at least
-    once). Returns (ids typed in, why it stopped early or None). Caller holds the mailbox lock."""
+    """Type queued messages for uuid into its agent, oldest first, after a fresh mail_refusal
+    check passes. Everything queued goes in as ONE prompt (envelopes one after another, up to
+    MAIL_BATCH_MAX_BYTES): the agent turns `working` as soon as the first message lands, so one
+    prompt per message would let only one through per tick. A file is removed only after `agent
+    prompt` succeeded (at least once). Returns (ids typed in, why it stopped early or None).
+    Caller holds the mailbox lock."""
     sent: list[str] = []
-    for path in pending_mail(uuid):
-        try:
-            msg = json.loads(path.read_text())
-            problem = None if well_formed_mail(msg) else "malformed"
-        except (OSError, ValueError):
-            problem = "unreadable"
-        if problem:
-            aside = path.with_suffix(".damaged")
-            with contextlib.suppress(OSError):
-                os.replace(path, aside)
-            say(f"WARN mailbox file {path.name} {problem}; moved aside to {aside.name}")
-            continue
+    while True:
+        batch: list[tuple[Path, dict]] = []
+        size = 0
+        for path in pending_mail(uuid):
+            try:
+                msg = json.loads(path.read_text())
+                problem = None if well_formed_mail(msg) else "malformed"
+            except (OSError, ValueError):
+                problem = "unreadable"
+            if problem:
+                aside = path.with_suffix(".damaged")
+                with contextlib.suppress(OSError):
+                    os.replace(path, aside)
+                say(f"WARN mailbox file {path.name} {problem}; moved aside to {aside.name}")
+                continue
+            text = envelope(msg)
+            if batch and size + len(text.encode()) > MAIL_BATCH_MAX_BYTES:
+                break
+            batch.append((path, msg))
+            size += len(text.encode()) + 2
+        if not batch:
+            break
         refusal = mail_refusal(pane, uuid)
         if refusal:
             return sent, refusal
         try:
-            herdr("agent", "prompt", pane, envelope(msg))
+            herdr("agent", "prompt", pane, "\n\n".join(envelope(m) for _p, m in batch))
         except SleeperError:
             # Herdr's error detail may quote what it was asked to type: the message stays out of the log
             raise SleeperError("herdr agent prompt failed") from None
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        mark_delivered(msg["id"])
-        event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
-              bytes=len(str(msg.get("body", "")).encode()))
-        sent.append(msg["id"])
+        for path, msg in batch:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            mark_delivered(msg["id"])
+            event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
+                  bytes=len(str(msg.get("body", "")).encode()), **({"batch": len(batch)} if len(batch) > 1 else {}))
+            sent.append(msg["id"])
     if not pending_mail(uuid):
         clear_mail_hold(uuid)  # nothing waits any more
     return sent, None
@@ -4950,6 +4966,30 @@ def pause(seconds: float) -> None:
         time.sleep(1)
 
 
+def mail_waiting() -> bool:
+    """Any mailbox with a queued message (a directory listing, no Herdr call)."""
+    with contextlib.suppress(OSError):
+        return any(d.is_dir() and valid_session_id(d.name) and pending_mail(d.name) for d in MAILBOX.iterdir())
+    return False
+
+
+def pause_watching_mail(seconds: float) -> None:
+    """Wait for the next tick. While mail waits, retry it every MAIL_POLL_SECONDS: a cleared draft
+    or an agent going idle releases it within seconds, not a whole poll, and the hold reason that
+    `presence` shows is at most that old. Only mail is retried; sleeping waits for the full tick."""
+    left = float(seconds)  # counted in slept steps (a retry's own time is not subtracted)
+    while left > 0 and not STOP["requested"]:
+        step = min(left, MAIL_POLL_SECONDS)
+        pause(step)
+        left -= step
+        if left > 0 and not STOP["requested"] and mail_waiting():
+            try:
+                flush_mail_safely(list_agents())
+            except SleeperError as exc:
+                say(f"mail retry: {exc}; the next tick retries")
+                return
+
+
 def watch_loop() -> None:
     lock_fh = os.fdopen(open_private(WATCHER_LOCK, os.O_RDWR), "a+")
     for waited in range(WATCHER_LOCK_WAIT_SECONDS + 1):  # an old watcher may be finishing a transaction
@@ -5014,7 +5054,9 @@ def watch_loop() -> None:
             delay = poll if not failures else min(WATCHER_BACKOFF_MAX, poll * 2 ** min(failures, 10))
             if failures:
                 say(f"backing off {delay:g}s after {failures} failed tick(s)")
-            pause(delay)
+                pause(delay)
+            else:
+                pause_watching_mail(delay)
         say("watcher stopped")
     finally:
         lock_fh.close()

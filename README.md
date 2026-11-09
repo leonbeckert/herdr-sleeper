@@ -283,6 +283,14 @@ when older queued mail went in first but the agent went busy before this
 message, the answer is 3 (`typed K older message(s) first; <id> waits (…)`),
 not 0. Any local process running as the same user can send.
 
+**Released within seconds** (*v0.1.10*). While any mail waits, the watcher
+retries it every 5 s between its ticks (only mail; a directory listing when
+nothing waits), so a cleared draft or an agent going idle lets it in within
+seconds, and the reason `presence` shows is at most that old. Everything
+queued for a session goes in as one prompt (up to 32 KB): one prompt per
+message let only one through per tick, because the agent turns `working`
+as soon as the first lands.
+
 **Why mail waits.** A hold is correct whenever the sleeper cannot prove the
 prompt is free: Herdr's status is not idle/done, or the composer is not
 empty (a draft and an open question menu look alike and both hold). It is

@@ -4174,6 +4174,7 @@ def test_deliver_is_not_delivered_when_only_older_mail_went_in(fake: FakeHerdr, 
     fake.agents[0]["agent_status"] = "working"
     assert deliver(monkeypatch, "a", body="older one", msg_id="older") == 3
     fake.agents[0]["agent_status"] = "idle"
+    monkeypatch.setattr(sleeper, "MAIL_BATCH_MAX_BYTES", 10)  # one message per prompt: the batch splits here
     answers = iter([None, None, "status working"])  # ready, `older` may go, then the agent is busy for `mine`
     monkeypatch.setattr(sleeper, "mail_refusal", lambda pane, uuid: next(answers))
     capsys.readouterr()
@@ -4183,6 +4184,35 @@ def test_deliver_is_not_delivered_when_only_older_mail_went_in(fake: FakeHerdr, 
     assert [p.stem.split("-", 1)[1] for p in sleeper.pending_mail(UUID)] == ["mine"]
     assert "older" in sleeper.recently_delivered() and "mine" not in sleeper.recently_delivered()
     assert held()["reason"] == "status working"
+
+
+def test_queued_mail_goes_in_as_one_prompt_once_the_agent_is_ready(fake: FakeHerdr,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    for i in range(3):
+        assert deliver(monkeypatch, "a", body=f"note {i}", msg_id=f"m{i}") == 3
+    fake.agents[0]["agent_status"] = "idle"
+    checks = []
+    monkeypatch.setattr(sleeper, "mail_refusal", lambda pane, uuid: checks.append(pane))  # always ready
+    sleeper.flush_mail(sleeper.list_agents())
+    (call,) = prompts(fake)                                 # one prompt, not one per message and tick
+    text = call[3]
+    assert text.index("msg m0;") < text.index("msg m1;") < text.index("msg m2;") and text.endswith("note 2")
+    assert len(checks) == 1 and sleeper.pending_mail(UUID) == [] and held() is None
+    assert {"m0", "m1", "m2"} <= set(sleeper.recently_delivered())
+
+
+def test_mail_is_retried_between_ticks_only_while_some_waits(fake: FakeHerdr,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    flushes = []
+    monkeypatch.setattr(sleeper, "pause", lambda s: None)
+    monkeypatch.setattr(sleeper, "flush_mail_safely", lambda agents: flushes.append(1))
+    sleeper.pause_watching_mail(60)
+    assert flushes == []                                    # nothing queued: no extra Herdr calls
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", body="later") == 3
+    sleeper.pause_watching_mail(60)
+    assert len(flushes) == 60 // sleeper.MAIL_POLL_SECONDS - 1  # every 5 s; the last slot is the tick itself
 
 
 def test_deliver_names_the_real_refusal(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
@@ -4210,7 +4240,7 @@ def test_deliver_pending_succeeds_only_when_the_mailbox_is_empty(fake: FakeHerdr
     assert deliver(monkeypatch, "a", msg_id="one") == 3 and deliver(monkeypatch, "a", msg_id="two") == 3
     fake.agents[0]["agent_status"] = "idle"
     assert sleeper.cmd_deliver_pending(types.SimpleNamespace(uuid=UUID, sender="orc")) == 0
-    assert len(prompts(fake)) == 2 and sleeper.pending_mail(UUID) == [] and held() is None
+    assert len(prompts(fake)) == 1 and sleeper.pending_mail(UUID) == [] and held() is None  # both in one prompt
 
 
 def test_hold_reason_is_recorded_shown_and_cleared(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
@@ -4233,7 +4263,7 @@ def test_hold_reason_is_recorded_shown_and_cleared(fake: FakeHerdr, monkeypatch:
     assert "[2 queued 0m: status working]" in text and "secret plan" not in text + hold_file.read_text()
     fake.agents[0]["agent_status"] = "idle"
     sleeper.flush_mail(fake.agents)
-    assert len(prompts(fake)) == 2 and held() is None and not hold_file.exists()
+    assert len(prompts(fake)) == 1 and held() is None and not hold_file.exists()  # both in one prompt
 
 
 def test_mail_held_event_escalates_once_per_reason(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
