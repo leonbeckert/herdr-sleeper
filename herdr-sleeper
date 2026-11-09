@@ -1070,18 +1070,21 @@ def composer_state(screen: str | None) -> tuple[str, str]:
     for idx in range(len(lines) - 1, -1, -1):
         stripped = lines[idx].lstrip()
         if stripped.startswith(PROMPT_GLYPHS):
-            # the detail is logged: say where the draft is, never what it says
+            # the detail is logged: say where the text is and its shape, never what it says. A typed
+            # draft ("2. good point") and an open question menu ("❯ 1. Option") look alike: both refuse
             typed = typed_text(raw[idx]).strip()
             if typed.startswith(PROMPT_GLYPHS):
                 typed = typed[1:].strip()
             if typed:
-                return "draft", "text in the composer"
+                return "draft", f"text on the prompt line (a draft or an open question menu), {len(typed)} chars"
             rest = lines[idx + 1:]
             rule = next((j for j, ln in enumerate(rest) if is_rule(ln)), None)
             if rule is None:  # a bare glyph with no box under it is not a composer we can vouch for
                 return "unknown", "no rule below the prompt"
-            if any(typed_text(ln).strip() for ln in raw[idx + 1:idx + 1 + rule]):
-                return "draft", "text below the composer line"
+            below = sum(1 for ln in raw[idx + 1:idx + 1 + rule] if typed_text(ln).strip())
+            if below:
+                return "draft", (f"text below the prompt line (a multi-line draft or an open menu), "
+                                 f"{below} line{'s' if below != 1 else ''}")
             return "empty", ""
         if stripped.startswith(("⏺", "✻", "⎿")):
             return "unknown", "composer not visible below transcript"
@@ -2441,10 +2444,146 @@ MSG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def pending_mail(uuid: str) -> list[Path]:
-    """This session's undelivered messages, oldest first (file names start with a ns timestamp)."""
+    """This session's undelivered messages, oldest first (file names start with a ns timestamp).
+    Dot files (.lock, .held) are the mailbox's own bookkeeping, never mail."""
     with contextlib.suppress(OSError):
-        return sorted((MAILBOX / uuid).glob("*.json"))
+        return sorted(p for p in (MAILBOX / uuid).glob("*.json") if not p.name.startswith("."))
     return []
+
+
+MAIL_HELD_EVENT_SECONDS = 600     # mail waiting this long gets a `mail-held` event (again when the reason changes)
+MAIL_HELD_REPEAT_SECONDS = 1800   # ... and again after this long with the same reason
+HELD_NAME = ".held"               # <mailbox>/.held: why the mail waits ({reason, since, checked}); never mail
+NO_LIVE_AGENT = "no live agent runs the session"
+QUEUED_ANY = "(queued)"           # finish_delivery's msg id for "whatever is queued" (deliver-pending)
+
+
+def mail_age(path: Path, now: float | None = None) -> float | None:
+    """Seconds since a mailbox file was queued, from the ns timestamp its name starts with."""
+    try:
+        ns = int(path.name.split("-", 1)[0])
+    except ValueError:
+        return None
+    return max(0.0, (time.time() if now is None else now) - ns / 1e9)
+
+
+def reason_key(reason: str) -> str:
+    """A hold reason with its numbers blanked: a draft growing by a character is the same hold."""
+    return re.sub(r"\d+", "N", reason)
+
+
+def read_mail_hold(uuid: str) -> dict | None:
+    """The recorded reason uuid's mail waits ({reason, since, checked, …}), or None."""
+    try:
+        data = json.loads((MAILBOX / uuid / HELD_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("reason"), str) else None
+
+
+def write_mail_hold(uuid: str, rec: dict) -> None:
+    """Replace <mailbox>/.held atomically (0600, mkstemp's mode). Bookkeeping only: no fsync."""
+    box = MAILBOX / uuid
+    fd, tmp = tempfile.mkstemp(prefix=HELD_NAME + ".", suffix=".tmp", dir=box)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    os.replace(tmp, box / HELD_NAME)
+
+
+def note_mail_hold(uuid: str, reason: str, now: float | None = None) -> dict:
+    """Record why uuid's mail waits (a reason, never a message or draft text). `since` is kept while
+    the reason stays the same. Returns the record; failures to write are logged, never raised.
+    Caller holds the mailbox lock."""
+    now = time.time() if now is None else now
+    old = read_mail_hold(uuid) or {}
+    same = isinstance(old.get("reason"), str) and reason_key(old["reason"]) == reason_key(reason)
+    since = old.get("since") if same and isinstance(old.get("since"), (int, float)) else now
+    rec = {k: v for k, v in old.items() if k in ("evented_reason", "evented_at")}
+    rec.update(reason=reason, since=since, checked=now)
+    try:
+        write_mail_hold(uuid, rec)
+    except OSError as exc:
+        say(f"WARN could not record why mail for {uuid} waits: {exc}")
+    return rec
+
+
+def clear_mail_hold(uuid: str) -> None:
+    with contextlib.suppress(OSError):
+        (MAILBOX / uuid / HELD_NAME).unlink()
+
+
+RULE_PART_RE = re.compile(r"[A-Za-z0-9_().:-]{1,64}")
+
+
+def herdr_matched_rule(pane: str) -> str | None:
+    """The detection rule Herdr's status for pane comes from (`herdr agent explain --json`), as
+    `id (state, region, priority N)`, or None. Read-only and best effort. Only the rule's own
+    fields are kept: the rest of the output previews the screen, which may hold a draft."""
+    try:
+        proc = subprocess.run([HERDR_BIN, "agent", "explain", pane, "--json"], capture_output=True, text=True,
+                              timeout=10)
+        rule = json.loads(proc.stdout).get("matched_rule") if proc.returncode == 0 else None
+    except Exception:  # never costs the flush or the tick
+        return None
+    if not isinstance(rule, dict) or not isinstance(rule.get("id"), str) or not RULE_PART_RE.fullmatch(rule["id"]):
+        return None
+    extra = [rule[k] for k in ("state", "region")
+             if isinstance(rule.get(k), str) and RULE_PART_RE.fullmatch(rule[k])]
+    if isinstance(rule.get("priority"), int) and not isinstance(rule.get("priority"), bool):
+        extra.append(f"priority {rule['priority']}")
+    return rule["id"] + (f" ({', '.join(extra)})" if extra else "")
+
+
+def escalate_mail_hold(uuid: str, name: str, pane: str | None, hold: dict, now: float | None = None) -> None:
+    """A `mail-held` event once the oldest queued message waited MAIL_HELD_EVENT_SECONDS, again when
+    the reason changes or MAIL_HELD_REPEAT_SECONDS passed. Counts and reasons only, never a body.
+    For a Herdr status hold it adds the rule Herdr matched, so a false `working` shows in `log`.
+    Caller holds the mailbox lock."""
+    now = time.time() if now is None else now
+    pending = pending_mail(uuid)
+    oldest = mail_age(pending[0], now) if pending else None
+    if oldest is None or oldest < MAIL_HELD_EVENT_SECONDS:
+        return
+    reason = hold["reason"]
+    last, at = hold.get("evented_reason"), hold.get("evented_at")
+    if (isinstance(last, str) and reason_key(last) == reason_key(reason) and isinstance(at, (int, float))
+            and now - at < MAIL_HELD_REPEAT_SECONDS):
+        return
+    rule = herdr_matched_rule(pane) if pane and reason.startswith("status ") else None
+    hold.update(evented_reason=reason, evented_at=now)
+    try:
+        write_mail_hold(uuid, hold)
+    except OSError as exc:
+        say(f"WARN could not record why mail for {uuid} waits: {exc}")
+    event("mail-held", to=name, pane=pane, uuid=uuid, queued=len(pending), oldest_age_s=int(oldest),
+          reason=reason, **({"herdr_rule": rule} if rule else {}))
+
+
+def mail_summary(uuid: object, now: float | None = None) -> dict:
+    """presence's mail fields for a session: queued count, the oldest one's age, the hold reason."""
+    if not valid_session_id(uuid):
+        return {"mail_queued": None, "mail_oldest_s": None, "mail_held": None}
+    pending = pending_mail(str(uuid))
+    if not pending:
+        return {"mail_queued": 0, "mail_oldest_s": None, "mail_held": None}
+    age = mail_age(pending[0], now)
+    return {"mail_queued": len(pending), "mail_oldest_s": None if age is None else int(age),
+            "mail_held": (read_mail_hold(str(uuid)) or {}).get("reason")}
+
+
+def mail_tag(row: dict) -> str:
+    """`  [3 queued 122m: why]` for a presence row with mail; "" without (or from an older version)."""
+    try:
+        queued = int(row.get("mail_queued") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if queued <= 0:
+        return ""
+    age = ""
+    with contextlib.suppress(TypeError, ValueError):
+        age = f" {int(float(row['mail_oldest_s'])) // 60}m" if row.get("mail_oldest_s") is not None else ""
+    held = f": {row['mail_held']}" if row.get("mail_held") else ""
+    return f"  [{queued} queued{age}{held}]"
 
 
 class mailbox_lock:
@@ -2552,19 +2691,28 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
     return None
 
 
-def type_mail(pane: str, uuid: str, name: str) -> tuple[int, str | None]:
+def well_formed_mail(msg: object) -> bool:
+    """A mailbox record envelope() can type: a dict with string id/from/body and a valid id."""
+    return (isinstance(msg, dict) and all(isinstance(msg.get(k), str) for k in ("id", "from", "body"))
+            and MSG_ID_RE.fullmatch(msg["id"]) is not None)
+
+
+def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
     """Type queued messages for uuid into its agent, oldest first, each only after a fresh
     mail_refusal check passes; a file is removed only after `agent prompt` succeeded (at least
-    once). Returns (sent, why it stopped early or None). Caller holds the mailbox lock."""
-    sent = 0
+    once). Returns (ids typed in, why it stopped early or None). Caller holds the mailbox lock."""
+    sent: list[str] = []
     for path in pending_mail(uuid):
         try:
             msg = json.loads(path.read_text())
+            problem = None if well_formed_mail(msg) else "malformed"
         except (OSError, ValueError):
+            problem = "unreadable"
+        if problem:
             aside = path.with_suffix(".damaged")
             with contextlib.suppress(OSError):
                 os.replace(path, aside)
-            say(f"WARN mailbox file {path.name} unreadable; moved aside to {aside.name}")
+            say(f"WARN mailbox file {path.name} {problem}; moved aside to {aside.name}")
             continue
         refusal = mail_refusal(pane, uuid)
         if refusal:
@@ -2579,7 +2727,9 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[int, str | None]:
         mark_delivered(msg["id"])
         event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
               bytes=len(str(msg.get("body", "")).encode()))
-        sent += 1
+        sent.append(msg["id"])
+    if not pending_mail(uuid):
+        clear_mail_hold(uuid)  # nothing waits any more
     return sent, None
 
 
@@ -2619,6 +2769,20 @@ def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str,
     hits = [(k, e) for k, e in journal.items()
             if valid_entry(e) and target in (k, e["uuid"], e.get("name") or None, wake_name(e),
                                              e.get("claude_name") or None)]
+    # Herdr can drop a live agent's name (it keeps the pane and the title); the Claude session
+    # name in its transcript survives. Only when nothing above matched by pane, name or session id.
+    named = [a for a in agents if a.get("agent") == "claude"
+             and valid_session_id((a.get("agent_session") or {}).get("value"))
+             and claude_session_name(transcript_for(a["agent_session"]["value"])) == target]
+    if len(named) > 1:
+        raise SleeperError(f"{target!r} matches {len(named)} live agents by Claude name "
+                           f"({', '.join(a['pane_id'] for a in named)}); name the pane id instead")
+    if named:
+        others = [k for k, e in hits if e["uuid"] != named[0]["agent_session"]["value"]]
+        if others:
+            raise SleeperError(f"{target!r} matches live agent {named[0]['pane_id']} by Claude name and sleeping "
+                               f"agents ({', '.join(others)}); name the pane id instead")
+        return "live", named[0], None
     if len(hits) > 1:
         raise SleeperError(f"{target!r} matches {len(hits)} sleeping agents ({', '.join(k for k, _ in hits)}); "
                            "name the pane id instead")
@@ -2698,6 +2862,7 @@ def finish_delivery(uuid: str, msg_id: str, sender: str, from_pane: str | None,
     Returns (exit code, one line for the sender). Caller holds the session's mailbox lock."""
     where = session_state(uuid)
     if where is None:
+        note_mail_hold(uuid, NO_LIVE_AGENT)
         return 3, f"queued msg {msg_id} for {uuid}: neither live nor asleep now; typed in when it next runs"
     state, hit, key = where
     name = wake_name(hit) if state == "asleep" else (hit.get("name") or hit["pane_id"])
@@ -2705,6 +2870,7 @@ def finish_delivery(uuid: str, msg_id: str, sender: str, from_pane: str | None,
     if state == "asleep":
         if sender in config["wake_refuse_from"] or (from_pane and from_pane in config["wake_refuse_from"]):
             event("deliver-held", id=msg_id, sender=sender, to=name, reason="sender may not wake")
+            note_mail_hold(uuid, "asleep; the sender may not wake it")
             return 3, (f"queued msg {msg_id} for {name}: {sender} may not wake sleepers; "
                        "it is typed in when the agent next runs")
         with locked():
@@ -2716,26 +2882,39 @@ def finish_delivery(uuid: str, msg_id: str, sender: str, from_pane: str | None,
             outcome = await_stub_wake(entry)
         if not outcome:
             event("deliver-held", id=msg_id, sender=sender, to=name, reason="wake refused or failed")
+            note_mail_hold(uuid, "the wake was refused or failed")
             return 3, (f"queued msg {msg_id} for {name}: the wake was refused or failed (see `log`); "
                        "it is typed in when the agent next runs")
         woke = True
-    target, refusal = None, "not idle"
+    target: dict | None = None
+    refusal: str | None = NO_LIVE_AGENT
     for _ in range(DELIVER_READY_SECONDS if woke else 1):
-        target = live_agent(uuid)
-        refusal = mail_refusal(target["pane_id"], uuid) if target else "not idle"
+        # an idle agent on the session first, else any (its refusal names the real status)
+        target = live_agent(uuid) or live_agent(uuid, ready=False)
+        refusal = mail_refusal(target["pane_id"], uuid) if target else NO_LIVE_AGENT
         if not refusal:
             break
         time.sleep(1)
     if refusal or not target:
+        note_mail_hold(uuid, refusal or NO_LIVE_AGENT)
         return 3, f"queued msg {msg_id} for {name}: not ready yet ({refusal}); typed in when it is"
     try:
         sent, refusal = type_mail(target["pane_id"], uuid, name)
     except SleeperError as exc:
         event("deliver-held", id=msg_id, sender=sender, to=name, reason=str(exc))
+        note_mail_hold(uuid, f"typing it in failed ({exc})")
         return 3, f"queued msg {msg_id} for {name}: typing it in failed ({exc}); the watcher retries"
-    if refusal and not sent:
-        return 3, f"queued msg {msg_id} for {name}: not ready yet ({refusal}); typed in when it is"
-    return 0, f"delivered msg {msg_id} to {name}" + (" (woke it)" if woke else "")
+    if refusal:
+        note_mail_hold(uuid, refusal)
+    mine = not pending_mail(uuid) if msg_id == QUEUED_ANY else msg_id in sent
+    if mine:
+        return 0, f"delivered msg {msg_id} to {name}" + (" (woke it)" if woke else "")
+    why = refusal or "the agent went busy"
+    if not sent:
+        return 3, f"queued msg {msg_id} for {name}: not ready yet ({why}); typed in when it is"
+    if msg_id == QUEUED_ANY:
+        return 3, f"typed {len(sent)} queued message(s) into {name}; the rest wait ({why})"
+    return 3, f"queued msg {msg_id} for {name}: typed {len(sent)} older message(s) first; {msg_id} waits ({why})"
 
 
 def cmd_deliver_pending(args: argparse.Namespace) -> int:
@@ -2747,7 +2926,7 @@ def cmd_deliver_pending(args: argparse.Namespace) -> int:
     with mailbox_lock(args.uuid):
         if not pending_mail(args.uuid):
             return 0
-        code, text = finish_delivery(args.uuid, "(queued)", args.sender, None, config)
+        code, text = finish_delivery(args.uuid, QUEUED_ANY, args.sender, None, config)
     say(f"deliver-pending: {text}")
     return code
 
@@ -3485,8 +3664,10 @@ def presence_rows() -> list[dict]:
                      "claude_name": claude_name, "pane": key, "kind": e.get("kind"), "cwd": e.get("cwd"),
                      "session": e["uuid"], "slept_at": e.get("slept_at"),
                      "insomnia": insomnia_label(claims[e["uuid"]]) if e["uuid"] in claims else None})
+    now = time.time()
     for r in rows:
         r["spawned_by"] = spawners.get(r["session"])
+        r.update(mail_summary(r["session"], now))
     return rows
 
 
@@ -3522,7 +3703,7 @@ def cmd_presence(args: argparse.Namespace) -> int:
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
         awake = f"  [insomnia: {r['insomnia']}]" if r.get("insomnia") else ""
         print(f"{r['state']:14} {where + str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
-              f"{r['cwd'] or ''}{since}{awake}")
+              f"{r['cwd'] or ''}{since}{awake}{mail_tag(r)}")
     print(f"message any of them: echo TEXT | herdr-sleeper deliver {'<machine>/' if every else ''}<name> "
           "--from <you>  (wakes a sleeper)")
     return 0
@@ -3545,7 +3726,7 @@ REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for al
 REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
 REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
 PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "kind", "cwd", "session", "slept_at", "insomnia",
-                   "spawned_by")
+                   "spawned_by", "mail_queued", "mail_oldest_s", "mail_held")  # an older machine sends no mail_*
 
 
 def saved_machines() -> dict[str, str]:
@@ -3804,7 +3985,12 @@ def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_i
         return 1
     sys.stdout.write(done.stdout)
     sys.stderr.write(done.stderr)
-    event("deliver-remote-done", id=msg_id, machine=label, to=target, code=done.returncode)
+    # the remote's one status line ("queued msg … not ready yet (status working)"): never the body,
+    # and the only trace of the outcome for a SendMessage relay, whose child's output goes nowhere
+    reason = next((ln.strip() for ln in (done.stdout or "").splitlines() + (done.stderr or "").splitlines()
+                   if ln.strip()), None)
+    event("deliver-remote-done", id=msg_id, machine=label, to=target, code=done.returncode,
+          reason=CONTROL_CHARS.sub("?", reason)[:200] if reason else None)
     return done.returncode
 
 
@@ -3922,7 +4108,9 @@ def remote_listing() -> tuple[list[str], list[str]]:
     for r in rows:
         name = r.get("claude_name") or r.get("name") or r.get("pane")
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
-        lines.append(f"- {r['machine']}/{name} · {r.get('state') or '?'}{since} · {r.get('cwd') or '?'}")
+        mail = mail_tag(r).strip()
+        lines.append(f"- {r['machine']}/{name} · {r.get('state') or '?'}{since} · {r.get('cwd') or '?'}"
+                     + (f" · {mail}" if mail else ""))
     return lines, problems
 
 
@@ -3951,30 +4139,61 @@ def deny(reason: str) -> None:
                                              "permissionDecisionReason": reason}}))
 
 
-def flush_mail(agents: list[dict]) -> None:
+def flush_mail(agents: list[dict], now: float | None = None) -> None:
     """Watcher: type queued mail into targets that are live and idle now. Never wakes anyone:
-    a sleeper is woken only by the `deliver` that queued for it."""
+    a sleeper is woken only by the `deliver` that queued for it. Mail that cannot go in has its
+    reason recorded (<mailbox>/.held, shown by `presence`) and, once it waited long enough, a
+    `mail-held` event. The readiness gates are mail_refusal's, unchanged: a hold never types."""
     boxes: list[Path] = []
     with contextlib.suppress(OSError):
         boxes = [d for d in MAILBOX.iterdir() if d.is_dir() and valid_session_id(d.name)]
     for box in boxes:
-        if not pending_mail(box.name):
-            continue
-        target = next((a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
-                       and (a.get("agent_session") or {}).get("value") == box.name
-                       and a.get("agent_status") in SLEEPABLE_STATUSES), None)
-        if not target:
-            continue
-        with mailbox_lock(box.name, wait=False) as got:
-            if not got:
-                continue  # a `deliver` is on it
+        try:
+            flush_box(box.name, agents, now)
+        except Exception as exc:  # one mailbox must not cost the others theirs
+            say(f"mail for {box.name}: {type(exc).__name__}: {exc}; next tick retries")
+
+
+def absent_reason(uuid: str) -> str:
+    """Why mail for a session no live agent runs waits: asleep (only a `deliver` wakes), or gone."""
+    try:
+        journal = read_json(JOURNAL)
+    except SleeperError:
+        journal = {}
+    row = next((e for e in journal.values() if valid_entry(e) and e["uuid"] == uuid), None)
+    if row is not None:
+        return f"{NO_LIVE_AGENT}: {row.get('phase', 'asleep')} (the watcher never wakes for mail)"
+    return NO_LIVE_AGENT
+
+
+def flush_box(uuid: str, agents: list[dict], now: float | None) -> None:
+    if not pending_mail(uuid):
+        if (MAILBOX / uuid / HELD_NAME).exists():
+            with mailbox_lock(uuid, wait=False) as got:
+                if got and not pending_mail(uuid):
+                    clear_mail_hold(uuid)
+        return
+    live = [a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
+            and (a.get("agent_session") or {}).get("value") == uuid]
+    target = next((a for a in live if a.get("agent_status") in SLEEPABLE_STATUSES), None)
+    shown = target or (live[0] if live else None)
+    name = (shown.get("name") or shown["pane_id"]) if shown else uuid
+    with mailbox_lock(uuid, wait=False) as got:
+        if not got:
+            return  # a `deliver` is on it
+        if target is None:
+            hold = note_mail_hold(uuid, f"status {live[0].get('agent_status')}" if live else absent_reason(uuid), now)
+        else:
             try:
-                _sent, refusal = type_mail(target["pane_id"], box.name, target.get("name") or target["pane_id"])
+                _sent, refusal = type_mail(target["pane_id"], uuid, name)
             except SleeperError as exc:
-                say(f"mail for {box.name}: {exc}; next tick retries")
-                continue
-            if refusal:
-                note_skip(target["pane_id"], f"mail waits: {refusal}")
+                say(f"mail for {uuid}: {exc}; next tick retries")
+                refusal = f"typing it in failed ({exc})"
+            if not refusal:
+                return
+            note_skip(target["pane_id"], f"mail waits: {refusal}")
+            hold = note_mail_hold(uuid, refusal, now)
+        escalate_mail_hold(uuid, name, shown["pane_id"] if shown else None, hold, now)
 
 
 # --------------------------------------------------------------- reconcile
@@ -4582,6 +4801,26 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
 
 
 def watch_tick(clocks: dict[str, dict], config: dict) -> None:
+    """One watcher tick: sleep_tick, then the mail flush, which runs even when sleep_tick failed
+    (a broken sleep or reconcile must not hold mail back; mail_refusal re-reads fresh state)."""
+    agents = list_agents()
+    try:
+        sleep_tick(clocks, config, agents)
+    except Exception as exc:
+        if not server_down(exc):  # with no server there is nothing to type into
+            flush_mail_safely(agents)
+        raise
+    flush_mail_safely(agents)
+
+
+def flush_mail_safely(agents: list[dict]) -> None:
+    try:
+        flush_mail(agents)
+    except Exception as exc:
+        say(f"mail flush: {type(exc).__name__}: {exc}")
+
+
+def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> None:
     """One pass over `agent list`: advance idle clocks, sleep what is due, reconcile the journal.
 
     clocks[pane] = {terminal_id, seq, uuid, since}: the wall-clock start of the pane's
@@ -4592,7 +4831,6 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     (late, never early) after a server restart. Every reset is on disk (idle.json) before
     the first sleep transaction of the tick: a crash must not replay a stale `since`.
     """
-    agents = list_agents()
     now = time.time()
     seen: set[str] = set()
     exclude = set(config["exclude"])
@@ -4690,7 +4928,6 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
         await_stub_wake(restarting)  # outside the lock: the stub takes it
     if json.dumps(clocks, sort_keys=True) != before:
         persist_clocks(clocks)
-    flush_mail(agents)
 
 
 def on_term(*_a: object) -> None:

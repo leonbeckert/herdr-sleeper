@@ -245,7 +245,10 @@ A slept agent has no process, so `herdr agent prompt` and Claude Code's
 echo "rebase onto main, then ping me" | herdr-sleeper deliver ts-api --from orchestrator
 ```
 
-The target is a pane id, agent name, wake name, or session id. The message
+The target is a pane id, agent name, wake name, or session id; a live
+claude whose Herdr name is gone (Herdr can drop it and keep only the title)
+is also found by its Claude session name, as long as exactly one session
+carries it (*v0.1.8*). The message
 (stdin, up to 64 KB; no control characters but newline and tab, since a CR
 would submit early and an ESC would drive the TUI) goes into a 0600 file in
 `mailbox/<session>/` first.
@@ -271,8 +274,30 @@ so an agent running with bypassed permissions does not take it for its
 owner's instructions. `events.jsonl` records each delivery (id, sender,
 target, size) but never the text. `wake_refuse_from` lists senders whose
 messages wait for the target's next wake instead of causing one (agents
-that read untrusted content). Exit codes: 0 delivered, 3 queued, 1 refused,
-2 bad input. Any local process running as the same user can send. The
+that read untrusted content). Exit codes: 0 delivered (the caller's own
+message was typed in), 3 queued, 1 refused, 2 bad input. *v0.1.8:* the
+queued line names the real reason (`status working`, `status blocked`,
+`composer draft: text on the prompt line (a draft or an open question menu),
+N chars`, `no live agent runs the session`, …), never a bare "not idle"; and
+when older queued mail went in first but the agent went busy before this
+message, the answer is 3 (`typed K older message(s) first; <id> waits (…)`),
+not 0. Any local process running as the same user can send.
+
+**Why mail waits.** A hold is correct whenever the sleeper cannot prove the
+prompt is free: Herdr's status is not idle/done, or the composer is not
+empty (a draft and an open question menu look alike and both hold). It is
+never silent (*v0.1.8*): the reason is kept in `mailbox/<session>/.held`
+(0600; reason, since, last checked; a dot file, never mail) by `deliver` and
+on every watcher tick, and removed once the mailbox is empty. Once the oldest
+queued message has waited 10 minutes the watcher logs a `mail-held` event
+(target, pane, session, queued count, oldest age, reason; again when the
+reason changes or after 30 minutes). For a `status …` hold it adds
+`herdr_rule`, the detection rule Herdr's status comes from (`herdr agent
+explain --json`, read-only; only the rule's id, state, region and priority
+are kept, never the screen preview). Bodies and draft text never appear in
+any of these. The watcher's mail flush runs even when the sleep part of a
+tick failed, and a malformed mailbox file is moved aside to `*.damaged` like
+an unreadable one, so it cannot hold up other mailboxes. The
 sender name is self-declared, so the audit trail is only as good as that.
 `herdr agent prompt` takes the text as an argument, so while it runs the
 message is visible in the process list to processes of the same user; the
@@ -280,7 +305,11 @@ plugin itself never logs it, not even inside a Herdr error.
 
 `presence [--json]` lists every live agent and every sleeper (state, Herdr
 name, Claude session name, pane, kind, cwd, session id, slept since), with
-no argv, for agents looking for a peer.
+no argv, for agents looking for a peer. Every row with a session also
+carries its mail (*v0.1.8*): `mail_queued`, `mail_oldest_s` and `mail_held`
+in `--json` (0/null without mail; a row from an older machine has none,
+which reads as unknown), and `[3 queued 122m: <reason>]` in the text listing
+and in the other-machine lines `ListAgents` gets.
 
 **Claude Code hooks.** `claude-hook` is a hook command for two built-in
 tools. Register it in `~/.claude/settings.json` as a `PostToolUse` hook with
@@ -454,7 +483,9 @@ Details:
   outcome is unknown and the `--id` to retry with; the remote mailbox then
   deduplicates instead of typing the message twice. Otherwise the remote exit
   code passes through. `deliver-remote` and `deliver-remote-done` are logged
-  here.
+  here; `deliver-remote-done` carries `reason`, the remote's status line
+  (e.g. `queued msg … not ready yet (status working)`), so a `SendMessage`
+  relay, whose output goes nowhere, can be followed with `log` (*v0.1.8*).
 - **Claude hook:** `ListAgents` adds every saved machine's sessions as
   `<machine>/<name>`. The machines are asked in parallel, 6 s at most for all
   together; an unreachable one is named, and an error there never drops this
@@ -592,7 +623,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 371 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 382 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

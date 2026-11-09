@@ -308,6 +308,7 @@ def fake(state: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHerdr:
     f = FakeHerdr([agent()])
     monkeypatch.setattr(sleeper, "herdr", f)
     monkeypatch.setattr(sleeper, "herdr_screen", lambda pane: f.screen)
+    monkeypatch.setattr(sleeper, "herdr_matched_rule", lambda pane: None)  # never a real `herdr agent explain`
     monkeypatch.setattr(sleeper, "uuid_live_elsewhere", lambda uuid, except_pane=None, cwd=None: None)
     monkeypatch.setattr(sleeper.time, "sleep", lambda s: None)
     monkeypatch.setattr(sleeper, "EXIT_WAIT_SECONDS", 2)
@@ -410,9 +411,13 @@ CLAUDE_SCREEN = """
 def test_composer_state_fails_closed() -> None:
     cs = sleeper.composer_state
     assert cs(CLAUDE_SCREEN.format(composer=""))[0] == "empty"
-    assert cs(CLAUDE_SCREEN.format(composer="half-typed thought")) == ("draft", "text in the composer")
+    assert cs(CLAUDE_SCREEN.format(composer="half-typed thought")) == (
+        "draft", "text on the prompt line (a draft or an open question menu), 18 chars")
     multiline = CLAUDE_SCREEN.format(composer="") .replace("────────\n  ◤", "  second line of a draft\n────────\n  ◤", 1)
-    assert cs(multiline)[0] == "draft"
+    assert cs(multiline) == ("draft", "text below the prompt line (a multi-line draft or an open menu), 1 line")
+    menu = CLAUDE_SCREEN.format(composer="1. Yes, deploy").replace(
+        "────────\n  ◤", "  2. No\n  3. Type something\n────────\n  ◤", 1)
+    assert cs(menu) == ("draft", "text on the prompt line (a draft or an open question menu), 14 chars")
     assert cs("❯ \n  ?\n────────\n")[0] == "draft"          # one-character draft is still a draft
     assert cs("❯ \n")[0] == "unknown"                    # bare glyph, nothing rendered below it
     assert cs(None)[0] == "unknown"                       # unreadable screen
@@ -3804,6 +3809,7 @@ def test_deliver_to_another_machine_carries_sender_machine_and_a_fixed_id(
     rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()]
     assert [r["event"] for r in rec] == ["deliver-remote", "deliver-remote-done"]
     assert rec[1]["code"] == 3 and all("review MR" not in json.dumps(r) for r in rec)
+    assert rec[1]["reason"] == "queued msg x for impl-1: not ready yet (busy); typed in when it is"
     import io
     monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("again"))
     assert sleeper.cmd_deliver(types.SimpleNamespace(target="impl-1", sender="orc", id="m-1", machine="dev2")) == 3
@@ -4138,3 +4144,221 @@ def test_account_command_restarts_idle_and_leaves_busy(fake: FakeHerdr, state: P
     assert sleeper.cmd_account(types.SimpleNamespace(restart=True, json=True)) == 0
     row = json.loads(capsys.readouterr().out)["sessions"][0]
     assert row["action"] == "restarted" and fake.signals == [(101, signal.SIGTERM)]
+
+
+# ------------------------------------------------- v0.1.8: why mail waits, and saying so
+
+def held() -> dict | None:
+    return sleeper.read_mail_hold(UUID)
+
+
+def mail_events() -> list[dict]:
+    p = sleeper.EVENTS
+    return [r for r in (json.loads(l) for l in p.read_text().splitlines()) if r["event"] == "mail-held"] \
+        if p.exists() else []
+
+
+def test_deliver_is_not_delivered_when_only_older_mail_went_in(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", body="older one", msg_id="older") == 3
+    fake.agents[0]["agent_status"] = "idle"
+    answers = iter([None, None, "status working"])  # ready, `older` may go, then the agent is busy for `mine`
+    monkeypatch.setattr(sleeper, "mail_refusal", lambda pane, uuid: next(answers))
+    capsys.readouterr()
+    assert deliver(monkeypatch, "a", body="my one", msg_id="mine") == 3
+    out = capsys.readouterr().out
+    assert "typed 1 older message(s) first; mine waits (status working)" in out and "delivered" not in out
+    assert [p.stem.split("-", 1)[1] for p in sleeper.pending_mail(UUID)] == ["mine"]
+    assert "older" in sleeper.recently_delivered() and "mine" not in sleeper.recently_delivered()
+    assert held()["reason"] == "status working"
+
+
+def test_deliver_names_the_real_refusal(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a") == 3
+    out = capsys.readouterr().out
+    assert "not ready yet (status working)" in out and "not idle" not in out
+    fake.screen = CLAUDE_SCREEN.format(composer="half a thought")
+    fake.agents[0]["agent_status"] = "idle"
+    assert deliver(monkeypatch, "a") == 3
+    out = capsys.readouterr().out
+    assert "composer draft: text on the prompt line" in out and "half a thought" not in out
+    # the session is gone between the caller's look and the lock: "no live agent", not "not idle"
+    monkeypatch.setattr(sleeper, "session_state", lambda uuid: ("live", agent(), None))
+    fake.agents.clear()
+    code, text = sleeper.finish_delivery(UUID, "m-x", "orc", None, dict(sleeper.DEFAULTS))
+    assert code == 3 and "no live agent runs the session" in text
+    assert held()["reason"] == sleeper.NO_LIVE_AGENT
+
+
+def test_deliver_pending_succeeds_only_when_the_mailbox_is_empty(fake: FakeHerdr,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", msg_id="one") == 3 and deliver(monkeypatch, "a", msg_id="two") == 3
+    fake.agents[0]["agent_status"] = "idle"
+    assert sleeper.cmd_deliver_pending(types.SimpleNamespace(uuid=UUID, sender="orc")) == 0
+    assert len(prompts(fake)) == 2 and sleeper.pending_mail(UUID) == [] and held() is None
+
+
+def test_hold_reason_is_recorded_shown_and_cleared(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents.append({**agent(pane="w2:p1", uuid="u2-session", name="orc", terminal="t2"), "pid_hint": 102})
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", body="secret plan") == 3 and deliver(monkeypatch, "a", body="b") == 3
+    hold_file = sleeper.MAILBOX / UUID / sleeper.HELD_NAME
+    assert hold_file.stat().st_mode & 0o777 == 0o600 and len(sleeper.pending_mail(UUID)) == 2  # .held is not mail
+    sleeper.flush_mail(fake.agents)                                    # the watcher keeps the reason current
+    assert held()["reason"] == "status working" and prompts(fake) == []
+    capsys.readouterr()
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True)) == 0
+    rows = {r["name"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows["a"]["mail_queued"] == 2 and rows["a"]["mail_held"] == "status working"
+    assert isinstance(rows["a"]["mail_oldest_s"], int)
+    assert rows["orc"]["mail_queued"] == 0 and rows["orc"]["mail_oldest_s"] is None and rows["orc"]["mail_held"] is None
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False)) == 0
+    text = capsys.readouterr().out
+    assert "[2 queued 0m: status working]" in text and "secret plan" not in text + hold_file.read_text()
+    fake.agents[0]["agent_status"] = "idle"
+    sleeper.flush_mail(fake.agents)
+    assert len(prompts(fake)) == 2 and held() is None and not hold_file.exists()
+
+
+def test_mail_held_event_escalates_once_per_reason(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    rules: list[str] = []
+    monkeypatch.setattr(sleeper, "herdr_matched_rule", lambda pane: rules.append(pane) or "live_turn_working (working)")
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", body="the secret plan") == 3
+    t0 = time.time()
+    sleeper.flush_mail(fake.agents, now=t0 + 100)
+    sleeper.flush_mail(fake.agents, now=t0 + 590)
+    assert mail_events() == []                                        # not before MAIL_HELD_EVENT_SECONDS
+    sleeper.flush_mail(fake.agents, now=t0 + 700)
+    sleeper.flush_mail(fake.agents, now=t0 + 800)
+    (ev,) = mail_events()
+    assert ev["reason"] == "status working" and ev["queued"] == 1 and ev["oldest_age_s"] >= 690
+    assert ev["to"] == "a" and ev["pane"] == "w1:p1" and ev["uuid"] == UUID
+    assert ev["herdr_rule"] == "live_turn_working (working)" and rules == ["w1:p1"]
+    fake.agents[0]["agent_status"] = "idle"                           # a new reason: a draft
+    fake.screen = CLAUDE_SCREEN.format(composer="the secret draft")
+    sleeper.flush_mail(fake.agents, now=t0 + 900)
+    fake.screen = CLAUDE_SCREEN.format(composer="the secret draft, longer")   # same hold, other length
+    sleeper.flush_mail(fake.agents, now=t0 + 1000)
+    evs = mail_events()
+    assert len(evs) == 2 and evs[1]["reason"].startswith("composer draft:") and "herdr_rule" not in evs[1]
+    sleeper.flush_mail(fake.agents, now=t0 + 900 + sleeper.MAIL_HELD_REPEAT_SECONDS + 1)
+    assert len(mail_events()) == 3                                    # the same hold again after 30 min
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1
+    logged = sleeper.EVENTS.read_text() + (sleeper.LOGFILE.read_text() if sleeper.LOGFILE.exists() else "")
+    assert "secret" not in logged
+
+
+def test_mail_for_an_absent_session_says_so(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a") == 3
+    sleeper.flush_mail([])
+    assert held()["reason"] == sleeper.NO_LIVE_AGENT
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {**agent(), "uuid": UUID, "kind": "claude", "phase": "asleep"}})
+    sleeper.flush_mail([])
+    assert held()["reason"].startswith(sleeper.NO_LIVE_AGENT + ": asleep") and prompts(fake) == []
+
+
+def test_matched_rule_keeps_only_the_rule_never_the_screen(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = json.dumps({"matched_rule": {"id": "live_turn_working", "priority": 970, "state": "working",
+                                       "region": "bottom_non_empty_lines(12)"},
+                      "evaluated_rules": [{"evidence": {"region_preview": "❯ my secret draft"}}]})
+    runs: list[list[str]] = []
+
+    def run(argv: list[str], **kw: Any) -> Any:
+        runs.append(argv)
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+    monkeypatch.setattr(sleeper.subprocess, "run", run)
+    rule = sleeper.herdr_matched_rule("w7:pP")
+    assert rule == "live_turn_working (working, bottom_non_empty_lines(12), priority 970)"
+    assert runs[0][1:] == ["agent", "explain", "w7:pP", "--json"]
+    for bad in ("not json", json.dumps({"matched_rule": {"id": "x; rm -rf / my secret draft"}}), json.dumps([1])):
+        out = bad
+        assert sleeper.herdr_matched_rule("w7:pP") is None
+
+    def boom(argv: list[str], **kw: Any) -> Any:
+        raise OSError("no herdr")
+    monkeypatch.setattr(sleeper.subprocess, "run", boom)
+    assert sleeper.herdr_matched_rule("w7:pP") is None
+
+
+def test_resolve_by_claude_name_when_herdr_dropped_the_agent_name(fake: FakeHerdr, state: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    named_transcript(state, UUID, "taxi-orch")
+    fake.agents[0].pop("name")
+    where, hit, _ = sleeper.resolve_target("taxi-orch", fake.agents, {})
+    assert where == "live" and hit["pane_id"] == "w1:p1"
+    assert deliver(monkeypatch, "taxi-orch") == 0 and len(prompts(fake)) == 1
+    other = "6b1e7d2a-0c4f-4e8b-9a3d-5f6e7a8b9c0d"
+    named_transcript(state, other, "taxi-orch")
+    fake.agents.append({**agent(pane="w2:p1", uuid=other, name=None, terminal="t2"), "pid_hint": 102})
+    with pytest.raises(sleeper.SleeperError, match="matches 2 live agents by Claude name"):
+        sleeper.resolve_target("taxi-orch", fake.agents, {})
+    fake.agents.pop()
+    sleeping = {"w3:p1": {**agent(pane="w3:p1"), "uuid": other, "kind": "claude", "claude_name": "taxi-orch"}}
+    with pytest.raises(sleeper.SleeperError, match="by Claude name and sleeping agents"):
+        sleeper.resolve_target("taxi-orch", fake.agents, sleeping)
+
+
+def test_a_malformed_mail_file_is_moved_aside_and_the_rest_still_goes(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a", msg_id="good") == 3
+    box = sleeper.MAILBOX / UUID
+    (box / f"{time.time_ns() - 10**9}-bad.json").write_text(json.dumps({"x": 1}))   # older than `good`
+    other = "6b1e7d2a-0c4f-4e8b-9a3d-5f6e7a8b9c0d"
+    fake.agents.append({**agent(pane="w2:p1", uuid=other, name="b", terminal="t2"), "pid_hint": 102})
+    assert deliver(monkeypatch, "b", msg_id="later") == 0                # b is idle
+    fake.agents[1]["agent_status"] = "working"
+    assert deliver(monkeypatch, "b", msg_id="later2") == 3
+    fake.agents[0]["agent_status"] = fake.agents[1]["agent_status"] = "idle"
+    real = sleeper.type_mail
+
+    def flaky(pane: str, uuid: str, name: str) -> Any:
+        if uuid == UUID and not (box / "boom").exists():
+            (box / "boom").write_text("")
+            raise RuntimeError("a bug in one mailbox")
+        return real(pane, uuid, name)
+    monkeypatch.setattr(sleeper, "type_mail", flaky)
+    sleeper.flush_mail(fake.agents)                                     # one mailbox's bug costs only that one
+    assert sleeper.pending_mail(other) == [] and len(sleeper.pending_mail(UUID)) == 2
+    assert "RuntimeError: a bug in one mailbox" in sleeper.LOGFILE.read_text()
+    sleeper.flush_mail(fake.agents)
+    assert sleeper.pending_mail(UUID) == [] and sleeper.pending_mail(other) == []
+    assert any(p.suffix == ".damaged" for p in box.iterdir())
+    typed = [p[3] for p in prompts(fake)]
+    assert sum("msg good;" in t for t in typed) == 1 and sum("msg later2;" in t for t in typed) == 1
+    assert "malformed" in sleeper.LOGFILE.read_text()
+
+
+def test_mail_flush_runs_when_the_sleep_pass_fails(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a") == 3
+    fake.agents[0]["agent_status"] = "idle"
+
+    def broken(agents: list[dict]) -> None:
+        raise RuntimeError("reconcile bug")
+    monkeypatch.setattr(sleeper, "reconcile", broken)
+    with pytest.raises(RuntimeError, match="reconcile bug"):
+        sleeper.watch_tick({}, dict(sleeper.DEFAULTS))                 # the tick still fails (and backs off) ...
+    assert len(prompts(fake)) == 1 and sleeper.pending_mail(UUID) == []  # ... but the mail went in
+
+
+def test_remote_presence_carries_mail_fields_and_tolerates_old_rows(
+        ssh: FakeSsh, fake: FakeHerdr, capsys: pytest.CaptureFixture[str]) -> None:
+    new = {"state": "idle", "name": "taxi-orch", "pane": "w7:pP", "kind": "claude", "cwd": "/x", "session": "s",
+           "mail_queued": 3, "mail_oldest_s": 7320, "mail_held": "composer draft: text on the prompt line"}
+    old = {"state": "asleep", "name": "impl-1", "pane": "w2:p1", "kind": "claude", "cwd": "/y", "session": "t"}
+    ssh.reply(stdout=json.dumps([new, old]))
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "[3 queued 122m: composer draft: text on the prompt line]" in out
+    impl = next(line for line in out.splitlines() if "dev2/impl-1" in line)
+    assert "queued" not in impl
+    lines, _problems = sleeper.remote_listing()
+    assert any("dev2/taxi-orch" in l and "3 queued 122m" in l for l in lines)

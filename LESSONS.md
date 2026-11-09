@@ -228,6 +228,37 @@ observed]*
   3. Write the sleep record *before* the exit, in an "exit requested" phase. If the agent is still there after
      the wait, leave the record in that phase for the next pass.
 
+**4.6 Herdr's `agent_status` is the only readiness gate, and it can say "not idle" on a quiet prompt.**
+*[version-specific: Herdr 0.9.x, Claude Code 2.1.x]*
+- *Trap:* mail is typed in only when Herdr says idle/done *and* the composer is empty. Herdr's status comes from
+  screen and title rules, and two of them can hold on a prompt where no turn runs: a spinner OSC title outranks
+  the prompt box (`osc_title_working`, priority 1100, and the last title sticks), and `live_turn_working` scans
+  the bottom 12 lines, so a draft line like `* wait for…` or transcript output like `· … still running…` scores
+  as working. Background shells do *not* count: Herdr 0.9.x reports a pane with only `1 shell` in the footer as
+  idle. A typed draft and an open question menu (`❯ 1. Option`) look the same on the prompt line, so both hold.
+- *Evidence:* 2026-11-09, mini2 `taxi-orch`: three messages queued for about two hours. From 04:14 the composer
+  held a draft (657 sleep refusals `composer draft`), from about 16:30 Herdr reported the pane not idle although
+  its transcript shows no turn and no background shell. The owner saw the session listed as idle while every
+  `deliver` answered code 3, with no reason anywhere: `deliver` printed a fixed "not idle", the watcher skipped
+  non-idle targets silently and logged draft holds only to `sleeper.log`, and `presence` showed no mail. Both holds
+  cleared just before 18:33 and the first message went in within 28 s. `herdr agent explain --file` on
+  synthetic screens reproduced the `live_turn_working` matches.
+- *Instead:* keep the gate; holding mail on a prompt you cannot prove free is correct. Make the hold visible:
+  `deliver` names the real refusal; the reason lives in `mailbox/<session>/.held` and in `presence`
+  (`[3 queued 122m: …]`); after 10 minutes a `mail-held` event carries it, with `herdr_rule` (the rule Herdr
+  matched, from `agent explain --json`, without its screen preview, which may quote a draft) for a status
+  hold, so the next false "working" can be diagnosed from `log` alone. Never add a "deliver anyway" path for
+  a screen that looks idle: in this incident a draft also blocked.
+- *Also:* `deliver` answered 0 when it had typed only *older* queued mail and the caller's own message still
+  waited; exit 0 now means the caller's message went in.
+
+**4.7 Herdr can drop a live agent's name.** *[version-specific: Herdr 0.9.x]*
+- *Trap:* on 2026-11-09 `w7:pP` lost its Herdr name (`name=None`) while the title still read `taxi-orch`, and
+  `deliver mini2/taxi-orch` failed with "no live or sleeping agent matches" in the middle of a prod-deploy
+  hand-off. Resolution looked only at pane id, Herdr name and session id for live agents.
+- *Instead:* when nothing matches, fall back to the Claude session name in the transcript (`agent-name`
+  records), refusing on more than one match, live or sleeping, as everywhere else.
+
 ## 5. Unknown is not absent
 
 **5.1 Every missing or empty field in Herdr's API can mean "could not tell".** Each place we read one as "no"
@@ -641,3 +672,6 @@ Only the multiplexer can make these safe. Each item names the workaround it woul
 
    A supervised long-running plugin process type would remove the detached-daemon problems in 7.1–7.4. A manifest
    field naming the interpreter would remove 3.3.
+8. **Status detection that a draft or transcript text cannot trip, and names that stick.** A spinner OSC title
+   that expires, and `live_turn_working` limited to lines outside the prompt box; an agent name that survives
+   whatever dropped `taxi-orch`'s. *Removes:* the long mail holds and the Claude-name fallback in 4.6–4.7.
