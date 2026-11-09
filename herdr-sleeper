@@ -200,6 +200,11 @@ NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
 TRANSCRIPTS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")) / "projects"
+# Every Claude account on this Mac keeps its own projects/ (claude-account: slot a = ~/.claude,
+# slot b = ~/.claude-accounts/b). A session on another slot than the caller's is still a peer:
+# its transcript (Claude name, owed mail) must be found from any slot.
+ACCOUNT_CONFIG_DIRS: list[Path] = [Path(os.path.expanduser("~/.claude")),
+                                   *sorted(Path(os.path.expanduser("~/.claude-accounts")).glob("*/"))]
 
 SLEEP_MARK = "💤 "
 # printf escapes, not ESC bytes: `pane run` types this, and without bracketed paste raw ESC bytes
@@ -787,7 +792,8 @@ def claude_session_name(transcript: Path | None) -> str | None:
 
 def transcript_for(uuid: str) -> Path | None:
     """The transcript for a claude session; when several match, the most recently written one."""
-    hits = [Path(p) for p in glob.glob(str(TRANSCRIPTS / "*" / f"{uuid}.jsonl"))]
+    roots = [TRANSCRIPTS] + [d / "projects" for d in ACCOUNT_CONFIG_DIRS if d / "projects" != TRANSCRIPTS]
+    hits = [Path(p) for root in roots for p in glob.glob(str(root / "*" / f"{uuid}.jsonl"))]
     if not hits:
         return None
     try:

@@ -95,6 +95,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "projects"
     (root / "proj").mkdir(parents=True)
     monkeypatch.setattr(sleeper, "TRANSCRIPTS", root)
+    monkeypatch.setattr(sleeper, "ACCOUNT_CONFIG_DIRS", [])
     return tmp_path
 
 
@@ -526,6 +527,18 @@ def test_transcript_for_picks_newest_copy(state: Path) -> None:
     old = transcript(state, UUID, 40, proj="older")
     new = transcript(state, UUID, 0.1, proj="newer")
     assert sleeper.transcript_for(UUID) == new and sleeper.transcript_for(UUID) != old
+
+
+def test_transcript_for_finds_other_account_slots(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2026-11-10 (mini2): gpu-dev ran on slot b (~/.claude-accounts/b), the caller on slot a;
+    # deliver gpu-dev failed although ListAgents named it, because the name lives in slot b's transcript.
+    slot_b = state / "accounts" / "b"
+    (slot_b / "projects" / "proj").mkdir(parents=True)
+    other = slot_b / "projects" / "proj" / "other-slot-uuid.jsonl"
+    other.write_text('{"type":"agent-name","agentName":"gpu-dev"}\n')
+    monkeypatch.setattr(sleeper, "ACCOUNT_CONFIG_DIRS", [slot_b])
+    assert sleeper.transcript_for("other-slot-uuid") == other
+    assert sleeper.claude_session_name(other) == "gpu-dev"
 
 
 def test_assess_requires_transcript_for_claude(state: Path) -> None:
