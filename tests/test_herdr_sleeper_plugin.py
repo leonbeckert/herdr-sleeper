@@ -450,7 +450,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
-                      "restart_outdated": False, "machine": ""}
+                      "restart_outdated": False, "machine": "", "machine_aliases": []}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -3722,6 +3722,28 @@ def test_route_sends_only_saved_machine_labels_away(ssh: FakeSsh) -> None:
     assert sleeper.route("dev9/impl-1", None) == (None, "dev9/impl-1")    # not saved: a local name
     assert sleeper.route("impl-1", "dev2") == ("dev2", "impl-1")
     assert sleeper.route("impl-1", "dev1") == (None, "impl-1")
+
+
+def test_machine_aliases_route_former_labels(ssh: FakeSsh, tmp_path: Path) -> None:
+    (tmp_path / "machine.toml").write_text('machine = "dev1"\nexclude = []\n'
+                                           'machine_aliases = ["orch=dev2", "impl=dev1"]\n')
+    assert sleeper.route("orch/impl-1", None) == ("dev2", "impl-1")       # a saved machine's old label
+    assert sleeper.route("impl/impl-1", None) == (None, "impl-1")         # this machine's old label
+    assert sleeper.route("impl-1", "orch") == ("dev2", "impl-1")
+    assert sleeper.route("impl-1", "impl") == (None, "impl-1")
+    assert sleeper.machine_label("orch") == "dev2"
+    assert sleeper.machine_label("impl") is None
+    assert sleeper.route("dev9/impl-1", None) == (None, "dev9/impl-1")    # unaliased, unsaved: still local
+
+
+@pytest.mark.parametrize("bad", ['"orch"', '"orch=orch"', '"Orch=dev2"', '"orch=dev 2"', "1"])
+def test_machine_aliases_are_validated(state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                       bad: str) -> None:
+    cfg = tmp_path / "m.toml"
+    cfg.write_text(f'exclude = []\nmachine_aliases = [{bad}]\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    with pytest.raises(sleeper.ConfigError, match="machine_aliases"):
+        sleeper.load_config()
 
 
 def test_machine_label_comes_from_config_and_is_validated(state: Path, tmp_path: Path,

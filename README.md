@@ -426,6 +426,12 @@ Details:
   local name that starts with a saved label and `/` needs its pane id.
   The receiving end gets the target after `--` with an internal `--here`,
   so it never routes again.
+- **Renamed machines:** `machine_aliases = ["orch=mini2", "impl=mini1"]`
+  in the config keeps former labels working. `orch/NAME` and
+  `--machine orch` then mean `mini2`, both for a saved machine and for this
+  machine's own former label, so addresses written down before a rename
+  still reach the session. Each entry is `"old=new"` with two different
+  plain labels; anything else is a config error.
 - **SSH:** `ssh -T -a -x -o BatchMode=yes -o ClearAllForwardings=yes <target>`
   (no prompt an agent could not answer, no agent, X11 or port forwarding),
   with every argument quoted for the remote shell. Arguments with quotes,
@@ -586,7 +592,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 361 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 371 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

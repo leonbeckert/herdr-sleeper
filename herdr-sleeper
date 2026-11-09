@@ -235,6 +235,7 @@ DEFAULTS = {
     "wake_refuse_from": [],      # senders whose messages never wake a sleeper (they wait in the mailbox)
     "restart_outdated": False,   # idle claude sessions on an older build: sleep + wake onto the installed one
     "machine": "",               # this machine's label on the others (dev1); default: the short hostname
+    "machine_aliases": [],       # former labels still accepted: "old=new" (this machine's or a saved one's)
 }
 
 
@@ -744,6 +745,13 @@ def load_config() -> tuple[dict, dict[str, str]]:
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
         raise ConfigError("machine must be a label like dev1 ([a-z0-9][a-z0-9-]{0,30})")
+    aliases = values["machine_aliases"]
+    if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+        raise ConfigError('machine_aliases must be a list of "old=new" strings')
+    for a in aliases:
+        old, sep, new = a.partition("=")
+        if not sep or not MACHINE_RE.fullmatch(old) or not MACHINE_RE.fullmatch(new) or old == new:
+            raise ConfigError(f'machine_aliases entry {a!r} must be "old=new", two different labels like dev1')
     if values["watcher"] not in ("plugin", "external"):
         raise ConfigError('watcher must be "plugin" or "external"')
     return values, source
@@ -3573,16 +3581,32 @@ def this_machine() -> str:
     return host if MACHINE_RE.fullmatch(host) else "host"
 
 
+def canonical_label(label: str) -> str:
+    """A former label (config `machine_aliases`, "old=new") as the current one; any other label unchanged.
+    A config that can't be read changes nothing here: the caller's own checks still apply."""
+    try:
+        aliases = load_config()[0].get("machine_aliases") or []
+    except ConfigError:
+        return label
+    for a in aliases:
+        old, _, new = a.partition("=")
+        if old == label:
+            return new
+    return label
+
+
 def route(target: str, machine: str | None) -> tuple[str | None, str]:
     """(label, remote target) for `--machine LABEL TARGET` or a `LABEL/TARGET` whose label is a
     saved machine; (None, local target) otherwise. This machine's own label means local, with the
     label stripped. A target without `/` and without --machine never reads the config or catalog,
     and an unreadable catalog leaves `LABEL/TARGET` local (it then matches nothing here)."""
     if machine:
+        machine = canonical_label(machine)
         return (None, target) if machine == this_machine() else (machine, target)
     label, sep, rest = target.partition("/")
     if not sep or not rest or not MACHINE_RE.fullmatch(label):
         return None, target
+    label = canonical_label(label)
     if label == this_machine():
         return None, rest
     try:
@@ -3654,7 +3678,10 @@ def remote_sender(sender: str | None) -> str | None:
 
 def machine_label(machine: str | None) -> str | None:
     """The other machine a --machine option names, or None for this one."""
-    return None if not machine or machine == this_machine() else machine
+    if not machine:
+        return None
+    machine = canonical_label(machine)
+    return None if machine == this_machine() else machine
 
 
 def routed(cmd: str, args: argparse.Namespace) -> int | None:
