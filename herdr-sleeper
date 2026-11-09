@@ -2611,8 +2611,14 @@ class mailbox_lock:
 
 def envelope(msg: dict) -> str:
     """The text the target agent sees: who relayed it, the message id, and that the owner did not
-    type it (an agent running with bypassed permissions must not take it for the owner's word)."""
-    return f"[relayed from {msg['from']} via herdr-sleeper, msg {msg['id']}; not from the owner]\n\n{msg['body']}"
+    type it (an agent running with bypassed permissions must not take it for the owner's word).
+    The sender always carries its machine: a local sender gets this machine's label in front, so a
+    reader can tell `mbp/x` from `mini2/x` without knowing where the message was queued."""
+    sender = msg["from"]
+    if "/" not in sender:
+        with contextlib.suppress(ConfigError):
+            sender = f"{this_machine()}/{sender}"
+    return f"[relayed from {sender} via herdr-sleeper, msg {msg['id']}; not from the owner]\n\n{msg['body']}"
 
 
 def recently_delivered() -> dict:

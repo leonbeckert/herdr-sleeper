@@ -1115,7 +1115,7 @@ def prompts(fake: FakeHerdr) -> list[tuple[str, ...]]:
 def test_deliver_to_a_live_idle_agent(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
     assert deliver(monkeypatch, "a") == 0
     (call,) = prompts(fake)
-    assert call[2] == "w1:p1" and call[3].startswith("[relayed from orc via herdr-sleeper, msg ")
+    assert call[2] == "w1:p1" and call[3].startswith(f"[relayed from {sleeper.this_machine()}/orc via herdr-sleeper, msg ")
     assert "not from the owner]" in call[3] and call[3].endswith("please rebase")
     assert sleeper.pending_mail(UUID) == []
     rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()]
@@ -1229,7 +1229,7 @@ def test_hook_routes_send_message_to_a_sleeper(fake: FakeHerdr, state: Path, mon
     assert spawned and spawned[0][-4:] == ["deliver-pending", UUID, "--from", "orchestrator"]
     # the spawned process: wake, then type the message in with the envelope
     assert sleeper.cmd_deliver_pending(types.SimpleNamespace(uuid=UUID, sender="orchestrator")) == 0
-    assert prompts(fake)[-1][3].startswith("[relayed from orchestrator via herdr-sleeper")
+    assert prompts(fake)[-1][3].startswith(f"[relayed from {sleeper.this_machine()}/orchestrator via herdr-sleeper")
     assert sleeper.pending_mail(UUID) == []
 
 
@@ -3362,7 +3362,7 @@ def test_spawn_starts_a_named_session_and_types_its_first_prompt(fake: FakeHerdr
     start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
     assert start[2] == "impl-1" and list(start[start.index("--") + 1:]) == ["-n", "impl-1", "--model", "haiku"]
     typed = next(c for c in fake.calls if c[:2] == ("agent", "prompt"))
-    assert typed[2] == "w1:p8" and typed[3].startswith("[relayed from orc via herdr-sleeper") and typed[3].endswith("build B-1")
+    assert typed[2] == "w1:p8" and typed[3].startswith(f"[relayed from {sleeper.this_machine()}/orc via herdr-sleeper") and typed[3].endswith("build B-1")
     rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
     assert rec["by"] == "orc" and rec["uuid"] == SPAWNED_UUID and rec["cwd"] == os.path.realpath(checkout / "sub")
     assert "spawned" in events() and "delivered" in events()
@@ -3824,6 +3824,17 @@ def test_deliver_from_another_machine_shows_it_in_the_envelope(fake: FakeHerdr,
     for bad in ("dev2/x/y", "Dev2/x", "dev2/", "/x"):
         assert not sleeper.sender_ok(bad)
         assert deliver(monkeypatch, "a", sender=bad) == 2
+
+
+def test_a_local_sender_carries_this_machine_in_the_envelope(fake: FakeHerdr, tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "machine.toml"
+    cfg.write_text('machine = "mini2"\nexclude = []\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    assert deliver(monkeypatch, "a", sender="md-verteidigung") == 0
+    assert prompts(fake)[0][3].startswith("[relayed from mini2/md-verteidigung via herdr-sleeper, msg ")
+    assert deliver(monkeypatch, "a", sender="mbp/guide", body="next") == 0   # already qualified: kept
+    assert prompts(fake)[1][3].startswith("[relayed from mbp/guide via herdr-sleeper, msg ")
 
 
 def test_wake_close_and_insomnia_list_run_on_the_named_machine(ssh: FakeSsh, fake: FakeHerdr,

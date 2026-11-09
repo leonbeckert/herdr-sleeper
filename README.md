@@ -265,7 +265,7 @@ exclude each other through the session's mailbox lock. A session with pending
 mail is never put to sleep. The agent sees
 
 ```
-[relayed from orchestrator via herdr-sleeper, msg 3f9a…; not from the owner]
+[relayed from mini2/orchestrator via herdr-sleeper, msg 3f9a…; not from the owner]
 
 rebase onto main, then ping me
 ```
