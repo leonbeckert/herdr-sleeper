@@ -1147,6 +1147,19 @@ def test_deliver_wakes_a_sleeper_then_types_the_message(fake: FakeHerdr, monkeyp
     assert "w1:p1" not in journal() and prompts(fake)[-1][3].endswith("please rebase")
 
 
+def test_deliver_reaches_the_live_session_in_a_pane_with_a_displaced_row(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    slept_entry(fake)
+    other = "7d1c2a9e-5b3f-4e8a-9c1d-2f6b8a4e0c13"
+    fake.agents[0] = agent(uuid=other, name=None)                        # another session runs there now
+    j = journal(); j["w1:p1"]["phase"] = "displaced"; sleeper.write_json(sleeper.JOURNAL, j)
+    assert deliver(monkeypatch, other) == 0                               # by session id
+    assert prompts(fake)[-1][2] == "w1:p1" and prompts(fake)[-1][3].endswith("please rebase")
+    assert journal()["w1:p1"]["phase"] == "displaced"                     # the old handle stays
+    fake.agents[0] = agent(uuid=other, name=None)
+    assert deliver(monkeypatch, "w1:p1", msg_id="m-2") == 0               # by pane id
+
+
 def test_deliver_holds_mail_when_the_target_is_busy(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
     fake.agents[0]["agent_status"] = "blocked"                            # a permission prompt: never type into it
     assert deliver(monkeypatch, "w1:p1") == 3

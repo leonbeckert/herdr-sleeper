@@ -2696,7 +2696,10 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
     if agent.get("agent_status") not in SLEEPABLE_STATUSES:
         return f"status {agent.get('agent_status')}"
     row = read_json(JOURNAL).get(pane)
-    if isinstance(row, dict) and not (row.get("phase") == "waking" and row.get("uuid") == uuid):
+    # A displaced row keeps the handle of a session this pane no longer runs (manual resume
+    # only); the live session in the pane takes mail as usual (taxi-lying-73, mini2 2026-11-10).
+    if isinstance(row, dict) and not (row.get("phase") == "waking" and row.get("uuid") == uuid) \
+            and not (row.get("phase") == "displaced" and row.get("uuid") != uuid):
         return f"the pane is in the sleep journal ({row.get('phase', 'asleep')})"
     profile = PROFILES.get(agent.get("agent"), {})
     if profile.get("idle_guards") or profile.get("exit") == "prompt":
