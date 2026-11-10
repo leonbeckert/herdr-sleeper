@@ -88,7 +88,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
-    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS"):   # per-process watcher memory
+    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS", "DIALOG_SEEN"):   # per-process watcher memory
         monkeypatch.setattr(sleeper, name, {})
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
         monkeypatch.delenv(var, raising=False)
@@ -351,6 +351,10 @@ def test_replayable_argv_strips_session_selectors() -> None:
     assert ok(["--name=ts-x"]) == (["--name=ts-x"], None)
     assert ok(["--unknown-flag", "value"])[0] is None and "unrecognised" in ok(["--unknown-flag", "value"])[1]
     assert ok(["--model"])[0] is None  # value option missing its value
+    # every option our start paths pass (herdr-sleeper spawn, Herdr panes, chrome-agents)
+    assert ok(["--dangerously-skip-permissions", "--chrome", "-n", "chrome-agents"])[1] is None
+    assert ok(["--permission-mode", "auto", "--effort", "high", "--no-chrome"]) == \
+        (["--permission-mode", "auto", "--effort", "high", "--no-chrome"], None)
 
 
 @pytest.mark.parametrize(
@@ -460,7 +464,8 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
-                      "restart_outdated": False, "machine": "", "machine_aliases": []}
+                      "restart_outdated": False, "machine": "", "machine_aliases": [],
+                      "answer_dialogs": True, "limit_monitor": ""}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -4656,3 +4661,223 @@ def test_watcher_never_closes_a_wish_cancelled_since_it_looked(fake: FakeHerdr, 
     monkeypatch.setattr(sleeper, "close_session", deliver_first)
     sleeper.tend_self_closes()
     assert fake.signals == [] and fake.agents and _closing() == {} and _event_rows("self-close-held") == []
+
+
+# ------------------------------------------- v0.1.15: the limit menu and one-time dialogs
+
+LIMIT_MENU = """⏺ Running the migration tests
+  ⎿  Error: rate limited
+────────────────────────────────
+ You've hit your limit · resets Fri 6am
+ /usage-credits to finish what you're working on.
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel
+"""
+AUTO_MODE = """ Make auto mode your default permission mode?
+
+ Auto mode lets Claude decide when to ask.
+
+ {a}Yes, set auto mode as my default permission mode
+ {b}No, keep bypass permissions
+"""
+QUOTED = ("⏺ The runbook says: Claude shows a menu\n"
+          "  ❯ 1. Stop and wait for limit to reset\n  3. Switch to usage credits, /usage-credits\n" + EMPTY_SCREEN)
+PERMISSION = """ Bash command: rm -rf build
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No, and tell Claude what to do differently
+"""
+
+
+def test_match_dialog_only_the_live_menu() -> None:
+    d, sel = sleeper.match_dialog(LIMIT_MENU)
+    assert d and d.kind == "limit" and sel == "Stop and wait for limit to reset"
+    assert sleeper.match_dialog(QUOTED)[0] is None                       # quoted above a composer
+    assert sleeper.match_dialog(PERMISSION)[0] is None                   # looks alike, is not
+    moved = LIMIT_MENU.replace("❯ 1.", "  1.").replace("  3. Switch", "❯ 3. Switch")
+    d, sel = sleeper.match_dialog(moved)
+    assert d and d.kind == "limit" and sel.startswith("Switch to usage credits")
+    d, sel = sleeper.match_dialog(AUTO_MODE.format(a="❯ ", b="  "))
+    assert d and d.kind == "auto-mode-default" and sel.startswith("Yes")
+    tip = " Selected text auto-copies to your clipboard\n ❯ 1. Yes, try it\n   2. Not now\n"
+    assert sleeper.match_dialog(tip)[0].kind == "feature-tip"
+    intro = " Claude in Chrome · https://code.claude.com/docs/en/chrome\n Enter to confirm · Esc to cancel\n"
+    assert sleeper.match_dialog(intro) == (sleeper.DIALOGS[3], None)
+    assert sleeper.match_dialog(None) == (None, "screen unreadable")
+
+
+def test_slot_room_waits_for_the_reset_after_a_hit() -> None:
+    now = 1_000_000.0
+    usage = {"a": {"seven_day": {"used_percentage": 93, "resets_at": now + 3600},
+                   "five_hour": {"used_percentage": 40, "resets_at": now + 600}, "seen_at": now - 900},
+             "b": {"seven_day": {"used_percentage": 96, "resets_at": now + 7200}}}
+    assert sleeper.slot_room("a", usage, {}, now)                       # 93 %: room by the numbers
+    assert not sleeper.slot_room("a", usage, {"a": now - 60}, now)      # ... but a session just hit it
+    assert sleeper.slot_room("a", usage, {"a": now - 60}, now + 3700)   # its fullest window reset since
+    assert not sleeper.slot_room("b", usage, {}, now)                   # 96 %
+    assert sleeper.slot_room("c", usage, {}, now)                       # never seen: someone chose it
+    stale = {"a": {"seven_day": {"used_percentage": 50, "resets_at": now - 100}, "seen_at": now - 99}}
+    assert not sleeper.slot_room("a", stale, {"a": now - 60}, now)      # no reset known after the hit
+    stale["a"]["seen_at"] = now - 1
+    assert sleeper.slot_room("a", stale, {"a": now - 60}, now)          # a reading newer than the hit
+
+
+def limit_setup(fake: FakeHerdr, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, screen: str,
+                active: str = "b", usage: dict | None = None) -> dict[str, Any]:
+    fake.agents[0].update(agent_status="blocked", state_change_seq=7)
+    fake.screen = screen
+    accounts(tmp_path, active, {101: "a"})
+    if usage is not None:
+        (sleeper.ACCOUNTS_DIR / "usage.json").write_text(json.dumps(usage))
+    monkeypatch.setattr(sleeper, "process_start", lambda pid: 999.0)
+    monkeypatch.setattr(sleeper, "running_build", lambda pid: "/v/2.1.306")
+    monkeypatch.setattr(sleeper, "installed_build", lambda kind: "/v/2.1.306")
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(sleeper, "send_note", lambda target, body: notes.append((target, body)))
+    real = fake.__call__
+
+    def keys(*argv: Any, **kw: Any) -> Any:
+        if argv[:2] == ("pane", "send-keys") and argv[3] == "enter" and fake.screen == LIMIT_MENU:
+            fake.agents[0].update(agent_status="idle", state_change_seq=8)   # option 1: the pane goes idle
+            fake.screen = EMPTY_SCREEN
+        if argv[:2] == ("agent", "start"):                                   # resumed through the launcher
+            (sleeper.ACCOUNTS_DIR / "run" / "101").write_text("b\n")
+        return real(*argv, **kw)
+    monkeypatch.setattr(sleeper, "herdr", keys)
+    return {"notes": notes}
+
+
+def mailbox_bodies(fake: FakeHerdr | None = None) -> list[str]:
+    """Notes queued for UUID, and (with fake) the ones the mail flush typed in already."""
+    box = sleeper.MAILBOX / UUID
+    queued = [json.loads(p.read_text())["body"] for p in sorted(box.glob("*.json"))] if box.exists() else []
+    typed = [c[3] for c in (fake.calls if fake else []) if c[:2] == ("agent", "prompt")]
+    return typed + queued
+
+
+def test_limit_menu_moves_the_session_onto_the_active_slot(fake: FakeHerdr, tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU,
+                      usage={"b": {"seven_day": {"used_percentage": 20, "resets_at": 2e9}}})
+    cfg = {**sleeper.DEFAULTS, "limit_monitor": "mbp/dev-mini-setup"}
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, cfg)
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]   # first sighting: hands off
+    clock["t"] += 60
+    sleeper.watch_tick({}, cfg)
+    sent = [c[3:] for c in fake.calls if c[:2] == ("pane", "send-keys")]
+    assert sent[0] == ("enter",) and ("down",) not in sent                # option 1, nothing else
+    assert fake.signals == [(101, signal.SIGTERM)]                       # restarted at once, on the MacBook too
+    assert "dialog-answered" in events() and "limit-continue" in events()
+    assert len(mailbox_bodies(fake)) == 1 and sleeper.CONTINUE_NOTE.format(slot="b") in mailbox_bodies(fake)[0]
+    assert ctx["notes"] == [] and sleeper.read_limited()["sessions"] == {}
+    assert sleeper.read_limited()["hits"]["a"] == clock["t"]
+
+
+def test_limit_menu_never_presses_from_another_option(fake: FakeHerdr, tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    moved = LIMIT_MENU.replace("❯ 1.", "  1.").replace("  3. Switch", "❯ 3. Switch")
+    limit_setup(fake, tmp_path, monkeypatch, moved)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    for _ in range(3):
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+        clock["t"] += 60
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]
+    assert "unknown-dialog" in events() and fake.signals == []
+
+
+def test_every_slot_used_up_waits_and_tells_the_monitor_once(fake: FakeHerdr, tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000.0
+    usage = {"a": {"seven_day": {"used_percentage": 100, "resets_at": now + 86400}},
+             "b": {"seven_day": {"used_percentage": 97, "resets_at": now + 3600}}}
+    ctx = limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU, active="b", usage=usage)
+    cfg = {**sleeper.DEFAULTS, "limit_monitor": "mbp/dev-mini-setup"}
+    clock = {"t": now}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, cfg)
+    clock["t"] += 60
+    sleeper.watch_tick({}, cfg)
+    assert [c[3:] for c in fake.calls if c[:2] == ("pane", "send-keys")] == [("enter",)]
+    assert fake.signals == [] and "limit-wait" in events()
+    assert len(ctx["notes"]) == 1 and ctx["notes"][0][0] == "mbp/dev-mini-setup"
+    assert "slot a: 100 %" in ctx["notes"][0][1] and "slot b: 97 %" in ctx["notes"][0][1]
+    fake.agents[0].update(agent_status="blocked", state_change_seq=9)    # the next turn hits it again
+    fake.screen = LIMIT_MENU
+    for _ in range(2):
+        clock["t"] += 60
+        sleeper.watch_tick({}, cfg)
+    assert len(ctx["notes"]) == 1                                        # once per reset window
+
+
+def test_a_limited_session_goes_on_after_its_reset(fake: FakeHerdr, tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000.0
+    usage = {"a": {"five_hour": {"used_percentage": 100, "resets_at": now + 600}}}
+    limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU, active="a", usage=usage)
+    clock = {"t": now}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 60
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert fake.signals == [] and mailbox_bodies(fake) == []             # a is active and full: wait
+    clock["t"] = now + 700
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert sleeper.RESET_NOTE.format(slot="a") in "".join(mailbox_bodies(fake))
+    assert sleeper.read_limited()["sessions"] == {}
+
+
+def test_one_time_dialogs_get_the_choice_that_changes_nothing(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0].update(agent_status="blocked", state_change_seq=7)
+    screens = {"now": AUTO_MODE.format(a="❯ ", b="  ")}
+    monkeypatch.setattr(sleeper, "herdr_screen", lambda pane: screens["now"])
+    real = fake.__call__
+
+    def keys(*argv: Any, **kw: Any) -> Any:
+        if argv[:2] == ("pane", "send-keys") and argv[3] == "down":
+            screens["now"] = AUTO_MODE.format(a="  ", b="❯ ")
+        return real(*argv, **kw)
+    monkeypatch.setattr(sleeper, "herdr", keys)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 60
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert [c[3:] for c in fake.calls if c[:2] == ("pane", "send-keys")] == [("down",), ("enter",)]
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if '"dialog-answered"' in l][-1]
+    assert rec["kind"] == "auto-mode-default" and rec["choice"] == "No, keep bypass permissions"
+
+
+def test_focused_and_unknown_screens_are_left_alone(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0].update(agent_status="blocked", state_change_seq=7, focused=True)
+    fake.screen = LIMIT_MENU
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 120
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]  # someone may be looking: 5 min
+    fake.agents[0]["focused"] = False
+    fake.screen = PERMISSION
+    fake.agents[0]["state_change_seq"] = 8
+    for _ in range(2):
+        clock["t"] += 60
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")] and "unknown-dialog" in events()
+    sleeper.watch_tick({}, {**sleeper.DEFAULTS, "answer_dialogs": False})
+
+
+def test_limit_monitor_config_is_checked(state: Path) -> None:
+    sleeper.CONFIG_FILE.write_text('limit_monitor = "mbp/dev-mini-setup"\nexclude = []\n')
+    assert sleeper.load_config()[0]["limit_monitor"] == "mbp/dev-mini-setup"
+    sleeper.CONFIG_FILE.write_text('limit_monitor = "-oProxyCommand=x"\nexclude = []\n')
+    with pytest.raises(sleeper.ConfigError, match="limit_monitor"):
+        sleeper.load_config()

@@ -200,7 +200,7 @@ loops. An npm/bun install shows only its runtime to `lsof`, so it is never
 restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
-`wake_refuse_from` (see Messages below), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
+`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one, but report it when it is
@@ -209,7 +209,7 @@ overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
 idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`,
-`insomnia.json`, `spawned.json`, `names.json` (owed names).
+`insomnia.json`, `spawned.json`, `names.json` (owed names), `limited.json` (sessions and slots at their usage limit).
 The directory is 0700 and every file 0600 (files from earlier versions are
 tightened when next written); the two logs rotate to `<name>.1` at 1 MB.
 `panes.json` keeps only the argv a wake would replay, never the raw command
@@ -566,6 +566,43 @@ herdr-sleeper account --restart [--json]    # restart the idle ones on the other
   work and busy panes refuse and are reported `pending`. The watcher moves
   those at their next idle (`restart_outdated`, not in a dry run).
 
+### The usage limit and one-time dialogs (*v0.1.15*)
+
+A session that reaches its slot's usage limit stops at Claude's menu
+`1. Stop and wait for limit to reset` / … / `3. Switch to usage credits`
+(Herdr: `blocked`), and a session resumed on a slot it never ran on stops at
+one-time dialogs. The watcher answers the screens it knows exactly, on every
+machine and with `restart_outdated` off too (`answer_dialogs`, default on):
+
+| Screen | Answer |
+|---|---|
+| the limit menu (its first option line together with the `/usage-credits` hint) | `Enter` on option 1, only from there; never another option (option 3 bills credits) |
+| "Make auto mode your default permission mode?" | `No, keep bypass permissions` |
+| a feature tip (`Yes, try it` / `Not now`) | `Not now` |
+| the Claude in Chrome intro (`docs/en/chrome`, `Enter to confirm`) | `Enter` |
+
+- Only the bottom 20 lines count, and the last line with the `❯` glyph must be
+  one of the dialog's options, so the same words quoted in a transcript above
+  a composer never match. The cursor moves with `Down` only, the screen is read
+  again after each step, and `Enter` goes only onto the target.
+- A dialog is answered on a later tick than the one that first saw it (20 s;
+  5 minutes when the pane is focused: someone may be looking). Any other
+  blocked screen gets no key and one `unknown-dialog` event per state.
+- After option 1: the slot is recorded as hit (`limited.json`). When the active
+  slot is another one and has room, the session is restarted onto it at once;
+  every account restart of a limited session (this one, `restart_outdated`,
+  `account --restart`) queues `Your slot hit its usage limit; you were
+  restarted on slot <x> (same transcript). Continue the task you were on.`
+  A limited session left on its slot gets `Your slot's usage limit has reset`
+  once the reset of its fullest window has passed.
+- Room comes from claude-account's `usage.json` (both windows, a passed reset
+  counts 0, 95 % is used up). It lags, so a hit slot has no room until a reset
+  after the hit has passed or a newer reading shows room; a slot never seen has
+  room. When no slot has room, sessions wait at option 1 and `limit_monitor`
+  (e.g. `mbp/dev-mini-setup`) gets one line per slot and reset, once per reset
+  window. Events: `dialog-answered`, `limit-wait`, `limit-continue`,
+  `limit-all-used-up`, `unknown-dialog`.
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -671,13 +708,13 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 408 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 418 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close (and `close --self`), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
+and close (and `close --self`), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's
 `/usr/bin/python3`) and 3.12. The `state` fixture redirects every module-level
 path in the state dir, so a new state file cannot reach the live one. The fake does not prove what a real Herdr

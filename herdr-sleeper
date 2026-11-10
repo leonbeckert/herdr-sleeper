@@ -143,6 +143,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
+from typing import NamedTuple
 from pathlib import Path
 
 try:
@@ -244,6 +245,8 @@ DEFAULTS = {
     "restart_outdated": False,   # idle claude sessions on an older build: sleep + wake onto the installed one
     "machine": "",               # this machine's label on the others (dev1); default: the short hostname
     "machine_aliases": [],       # former labels still accepted: "old=new" (this machine's or a saved one's)
+    "answer_dialogs": True,      # answer Claude's limit menu (option 1) and known one-time dialogs
+    "limit_monitor": "",         # session told when every account slot is at its limit (mbp/dev-mini-setup)
 }
 
 
@@ -748,7 +751,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     unknown = [a for a in values["agents"] if a not in PROFILES]
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
-    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated"):
+    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -760,6 +763,9 @@ def load_config() -> tuple[dict, dict[str, str]]:
         old, sep, new = a.partition("=")
         if not sep or not MACHINE_RE.fullmatch(old) or not MACHINE_RE.fullmatch(new) or old == new:
             raise ConfigError(f'machine_aliases entry {a!r} must be "old=new", two different labels like dev1')
+    monitor = values["limit_monitor"]
+    if not isinstance(monitor, str) or (monitor and not REMOTE_TARGET_RE.fullmatch(monitor.replace("/", ":", 1))):
+        raise ConfigError("limit_monitor must be a session name or machine/name, like mbp/dev-mini-setup")
     if values["watcher"] not in ("plugin", "external"):
         raise ConfigError('watcher must be "plugin" or "external"')
     return values, source
@@ -959,10 +965,12 @@ def reap_helpers(helpers: dict[int, str]) -> list[str]:
 
 
 REFUSED_OPTIONS = {"--fork-session", "--print", "--session-id", "--new", "--replay", "-p"}
-BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d"}
+BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--verbose", "--debug",
+                   "-d", "--chrome", "--no-chrome", "--ide"}
 # Values of these are replayed and kept in the journal, so none of them may carry a secret
 # (`--env KEY=VALUE` did; an argv with it now refuses as an unrecognised option).
-VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source", "-n", "--name"}
+VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source", "-n", "--name",
+                 "--permission-mode", "--effort"}
 
 
 def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
@@ -4967,6 +4975,11 @@ def restart_agent(agent: dict, since: float | None, window: float, old: str, new
             event("restart-failed", pane=pane, name=name, uuid=uuid, reason=f"still runs {still[0]}")
             say(f"WARN restart {pane}: woken, but still on {still[0]}")
             return f"woken, but still on {still[0]}", None
+    if what == "account" and (result is True or result == DELEGATED):
+        try:
+            continue_after_account_restart(str(uuid), new)
+        except (SleeperError, OSError) as exc:
+            say(f"WARN continue note for {pane}: {exc}")
     elif result != DELEGATED:
         event("restart-failed", pane=pane, name=name, uuid=uuid, reason="wake failed; left asleep")
         notify(f"{SLEEP_MARK}restart of {name} failed", "left asleep: focus the pane or run `wake`",
@@ -4975,6 +4988,349 @@ def restart_agent(agent: dict, since: float | None, window: float, old: str, new
                else "wake failed; left asleep")
     say(f"restart {pane}: {old} -> {new}: " + ("woken" if result is True else outcome))
     return outcome, entry if result == DELEGATED else None
+
+
+# ------------------------------------------- usage limits and one-time dialogs (claude-account)
+#
+# A session that reaches its slot's usage limit stops at Claude's limit menu (Herdr: `blocked`);
+# a session restarted onto a slot it never ran on stops at one-time dialogs. Both wait for a
+# human. The watcher answers the few screens it knows exactly, with the choice that changes
+# nothing (option 1 "Stop and wait"; never usage credits, which bill), moves a limited session
+# onto the active slot when that one has room, and tells the session to go on. Anything else on
+# a blocked screen is left alone (an `unknown-dialog` event).
+
+LIMITED = STATE_DIR / "limited.json"   # {"sessions": {uuid: {slot, at, pane, name}}, "hits": {slot: at}, "notes": {key: at}}
+USED_UP_PERCENT = 95.0                 # claude-account's USED_UP: a slot at or above this has no room
+DIALOG_ACT_SECONDS = 20                # a dialog is answered on a later sighting, not the first one
+DIALOG_ACT_FOCUSED_SECONDS = 300       # ... and a focused pane (someone may be looking) gets 5 minutes
+LIMIT_SETTLE_SECONDS = 10              # how long after Enter the pane may take to report idle
+LIMIT_KEEP_SECONDS = 7 * 86400         # limited.json forgets a session or a hit after this
+MENU_TAIL_LINES = 20                   # a dialog's text must be this close to the bottom of the screen
+DIALOG_SEEN: dict[str, dict] = {}      # pane -> {seq, kind, first}: per-process watcher memory
+NOTE_JOBS: list[subprocess.Popen] = []  # detached `deliver` runs to the monitor session
+
+CONTINUE_NOTE = ("Your slot hit its usage limit; you were restarted on slot {slot} (same transcript). "
+                 "Continue the task you were on.")
+RESET_NOTE = ("Your slot's usage limit has reset (slot {slot}). "
+              "Continue the task you were on.")
+
+
+class Dialog(NamedTuple):
+    kind: str
+    markers: tuple[str, ...]     # every one of these on the bottom lines of the screen
+    options: tuple[str, ...]     # the menu's option texts; the selected line must start with one
+    target: str | None           # the option to pick; None: just Enter (no choice on screen)
+
+
+DIALOGS = (
+    Dialog("limit", ("Stop and wait for limit to reset", "/usage-credits"),
+           ("Stop and wait for limit to reset", "Switch to usage credits"), "Stop and wait for limit to reset"),
+    Dialog("auto-mode-default", ("Make auto mode your default permission mode?",),
+           ("Yes, set auto mode as my default permission mode", "No, keep bypass permissions"),
+           "No, keep bypass permissions"),
+    Dialog("feature-tip", ("Yes, try it", "Not now"), ("Yes, try it", "Not now"), "Not now"),
+    Dialog("chrome-intro", ("docs/en/chrome", "Enter to confirm"), (), None),
+)
+OPTION_LINE = re.compile(r"^\s*❯\s*(?:\d+\.\s*)?(.*\S)\s*$")
+
+
+def selected_option(lines: list[str]) -> str | None:
+    """The text of the last line that starts with the selection glyph (a menu's cursor, or the
+    composer when no menu is open), without its number."""
+    for line in reversed(lines):
+        m = OPTION_LINE.match(line)
+        if m:
+            return m.group(1)
+        if line.lstrip().startswith(PROMPT_GLYPHS):
+            return ""
+    return None
+
+
+def match_dialog(screen: str | None) -> tuple[Dialog | None, str | None]:
+    """(the known dialog on screen, its selected option) or (None, why not). Only the bottom
+    MENU_TAIL_LINES non-empty lines count, and the last glyph line must be one of the dialog's
+    options: the same words quoted in the transcript above a composer never match."""
+    if screen is None:
+        return None, "screen unreadable"
+    lines = [strip_ansi(ln).rstrip() for ln in screen.splitlines() if strip_ansi(ln).strip()][-MENU_TAIL_LINES:]
+    tail = "\n".join(lines)
+    selected = selected_option(lines)
+    for d in DIALOGS:
+        if not all(m in tail for m in d.markers):
+            continue
+        if not d.options:
+            if selected:  # an intro has no options; a glyph line with text is a menu or a draft
+                return None, f"{d.kind}: unexpected selection on screen"
+            return d, None
+        if selected and any(selected.startswith(o) for o in d.options):
+            return d, selected
+        return None, f"{d.kind}: selection not on one of its options"
+    return None, "no known dialog"
+
+
+def usage_load(entry: dict | None, now: float) -> tuple[float | None, float | None]:
+    """(highest % used over the slot's windows, that window's reset) from claude-account's
+    usage.json entry; a window whose reset has passed counts as 0. (None, None): never seen."""
+    best: tuple[float | None, float | None] = (None, None)
+    for window in ("seven_day", "five_hour"):
+        w = (entry or {}).get(window)
+        if not isinstance(w, dict) or not isinstance(w.get("used_percentage"), (int, float)):
+            continue
+        reset = w.get("resets_at") if isinstance(w.get("resets_at"), (int, float)) else None
+        used = 0.0 if reset is not None and reset <= now else float(w["used_percentage"])
+        if best[0] is None or used > best[0]:
+            best = (used, reset)
+    return best
+
+
+def read_usage() -> dict:
+    try:
+        data = json.loads((ACCOUNTS_DIR / "usage.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def slot_room(slot: str, usage: dict, hits: dict, now: float) -> bool:
+    """Whether a slot can take work. A slot a session hit the limit on has none until the reset
+    of its fullest window has passed (usage.json lags: its last reading may predate the hit); a
+    slot never seen has room (someone switched to it on purpose)."""
+    used, reset = usage_load(usage.get(slot), now)
+    hit = hits.get(slot)
+    if isinstance(hit, (int, float)):
+        if reset is None or reset <= hit:  # no reset known after the hit: wait for a fresh reading
+            fresh = isinstance((usage.get(slot) or {}).get("seen_at"), (int, float)) and usage[slot]["seen_at"] > hit
+            if not fresh:
+                return False
+        elif reset > now:
+            return False
+    return used is None or used < USED_UP_PERCENT
+
+
+def read_limited() -> dict:
+    try:
+        data = read_json(LIMITED)
+    except SleeperError:
+        data = {}
+    for key in ("sessions", "hits", "notes"):
+        if not isinstance(data.get(key), dict):
+            data[key] = {}
+    return data
+
+
+def prune_limited(data: dict, now: float) -> None:
+    for key in ("sessions", "hits", "notes"):
+        data[key] = {k: v for k, v in data[key].items()
+                     if now - float((v.get("at") if isinstance(v, dict) else v) or 0) < LIMIT_KEEP_SECONDS}
+
+
+def send_note(target: str, body: str) -> None:
+    """Deliver one line to a session (here or `machine/name`) in the background: a remote
+    delivery can take minutes, and the watcher holds the lock."""
+    global NOTE_JOBS
+    NOTE_JOBS = [j for j in NOTE_JOBS if j.poll() is None]
+    try:
+        proc = subprocess.Popen([sys.executable, str(SELF), "deliver", "--from", "herdr-sleeper", "--", target],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True, text=True)
+        assert proc.stdin is not None
+        proc.stdin.write(body)
+        proc.stdin.close()
+        NOTE_JOBS.append(proc)
+    except OSError as exc:
+        say(f"WARN note to {target} not sent: {exc}")
+
+
+def queue_note(uuid: str, body: str, msg_id: str) -> None:
+    """Queue a note into a local session's mailbox; the watcher's mail flush types it in."""
+    with mailbox_lock(uuid):
+        _msg, status = queue_message(uuid, "herdr-sleeper", body, msg_id)
+    if status == "new":
+        event("deliver-queued", id=msg_id, sender="herdr-sleeper", to=uuid, uuid=uuid, target_state="live",
+              bytes=len(body.encode()))
+
+
+def continue_after_account_restart(uuid: str, new: str) -> None:
+    """A session restarted onto another slot after it hit its limit gets told to go on (D2)."""
+    data = read_limited()
+    rec = data["sessions"].pop(str(uuid), None)
+    if not isinstance(rec, dict):
+        return
+    slot = new.removeprefix("account ")
+    queue_note(str(uuid), CONTINUE_NOTE.format(slot=slot), f"limit-{str(uuid)[:8]}-{int(float(rec.get('at') or 0))}")
+    write_json(LIMITED, data)
+    event("limit-continue", uuid=uuid, slot=slot, name=rec.get("name"))
+
+
+def wait_until_settled(pane: str, seq: object) -> dict | None:
+    """The pane's agent row once its state moved on from `seq` (Enter taken), or None."""
+    deadline = time.monotonic() + LIMIT_SETTLE_SECONDS
+    while True:
+        row = next((a for a in list_agents() if a["pane_id"] == pane), None)
+        if row is None or row.get("agent") != "claude":
+            return None
+        if row.get("state_change_seq") != seq and row.get("agent_status") in SLEEPABLE_STATUSES:
+            return row
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1)
+
+
+def press_to(pane: str, dialog: Dialog, selected: str | None) -> bool:
+    """Move the cursor onto the dialog's target (Down only, re-reading after each step) and press
+    Enter. Never Enter on any other option."""
+    if dialog.target is not None:
+        steps = 0
+        while not (selected or "").startswith(dialog.target):
+            if dialog.kind == "limit" or steps >= len(dialog.options):
+                return False  # the limit menu is answered only from its default, option 1
+            herdr("pane", "send-keys", pane, "down", check=False)
+            time.sleep(0.3)
+            steps += 1
+            found, selected = match_dialog(herdr_screen(pane))
+            if found is None or found.kind != dialog.kind:
+                return False
+    herdr("pane", "send-keys", pane, "enter", check=False)
+    return True
+
+
+def tend_dialogs(agents: list[dict], config: dict, now: float) -> dict | None:
+    """Answer the known blocking screens of claude panes (see DIALOGS); move a session that hit
+    its limit onto the active slot when that has room; tell limited sessions to go on once they
+    can. Caller holds the lock. Returns a restart entry to confirm outside the lock, like
+    restart_onto_new_build."""
+    if not config["answer_dialogs"]:
+        return None
+    live = {a["pane_id"] for a in agents}
+    for pane in [p for p in DIALOG_SEEN if p not in live]:
+        DIALOG_SEEN.pop(pane, None)
+    restarting: dict | None = None
+    for agent in agents:
+        if agent.get("agent") != "claude" or agent.get("agent_status") == "working":
+            continue
+        pane, seq = agent["pane_id"], agent.get("state_change_seq")
+        seen = DIALOG_SEEN.get(pane)
+        if seen and seen["seq"] == seq and seen["kind"] is None:
+            continue  # this state was read already and showed no dialog
+        dialog, selected = match_dialog(herdr_screen(pane))
+        kind = dialog.kind if dialog else None
+        if not seen or seen["seq"] != seq or seen["kind"] != kind:
+            DIALOG_SEEN[pane] = {"seq": seq, "kind": kind, "first": now}
+            if dialog is None and agent.get("agent_status") == "blocked":
+                event("unknown-dialog", pane=pane, name=agent.get("name"), why=selected)
+            continue
+        if dialog is None:
+            continue
+        wait = DIALOG_ACT_FOCUSED_SECONDS if agent.get("focused") is not False else DIALOG_ACT_SECONDS
+        if now - seen["first"] < wait:
+            continue
+        if config["dry_run"]:
+            note_skip(pane, f"would answer {dialog.kind} (dry run)")
+            continue
+        uuid = (agent.get("agent_session") or {}).get("value")
+        if not press_to(pane, dialog, selected):
+            event("unknown-dialog", pane=pane, name=agent.get("name"), why=f"{dialog.kind}: target not reachable")
+            DIALOG_SEEN[pane] = {"seq": seq, "kind": None, "first": now}
+            continue
+        DIALOG_SEEN.pop(pane, None)
+        event("dialog-answered", pane=pane, name=agent.get("name"), uuid=uuid, kind=dialog.kind,
+              choice=dialog.target or "enter")
+        say(f"answered {dialog.kind} in {pane} ({agent.get('name') or '-'}): {dialog.target or 'enter'}")
+        if dialog.kind == "limit" and restarting is None:
+            restarting = after_limit(agent, uuid, seq, config, now)
+    if restarting is None:
+        restarting = remind_limited(agents, config, now)
+    return restarting
+
+
+def after_limit(agent: dict, uuid: object, seq: object, config: dict, now: float) -> dict | None:
+    """Option 1 was taken. Record the hit; restart onto the active slot if it has room, else wait
+    and tell the monitor session when no slot has any."""
+    pane = agent["pane_id"]
+    present, _argv, pid = agent_process(pane, "claude")
+    slot = session_account(pid) if present is True else None
+    active = active_account()
+    data = read_limited()
+    if slot and slot != "explicit":
+        data["hits"][slot] = now
+    if valid_session_id(uuid):
+        data["sessions"][str(uuid)] = {"slot": slot, "at": now, "pane": pane, "name": agent.get("name")}
+    prune_limited(data, now)
+    write_json(LIMITED, data)
+    usage = read_usage()
+    if active and slot and slot not in ("explicit", active) and slot_room(active, usage, data["hits"], now):
+        fresh = wait_until_settled(pane, seq)
+        if fresh is None:
+            event("limit-wait", pane=pane, uuid=uuid, slot=slot, why="pane did not settle after Enter")
+            return None
+        outcome, delegated = restart_agent(fresh, None, 0.0, f"account {slot}", f"account {active}", "account",
+                                           config, now)
+        if outcome.startswith("refused") or outcome.startswith("wake failed"):
+            event("limit-wait", pane=pane, uuid=uuid, slot=slot, why=outcome)
+        return delegated
+    slots = sorted({*usage.keys(), *(s for s in (slot, active) if s and s != "explicit")})
+    slots = [s for s in slots if ACCOUNT_SLOT.fullmatch(str(s))]
+    room = [s for s in slots if slot_room(s, usage, data["hits"], now)]
+    event("limit-wait", pane=pane, uuid=uuid, slot=slot, active=active, room=room)
+    if not room and slots:
+        note_monitor(slots, usage, data, config, now)
+    return None
+
+
+def note_monitor(slots: list[str], usage: dict, data: dict, config: dict, now: float) -> None:
+    """One line per slot and its reset to the monitor session, once per reset window."""
+    target = config["limit_monitor"]
+    lines = []
+    resets = []
+    for s in slots:
+        used, reset = usage_load(usage.get(s), now)
+        resets.append(reset or math.inf)
+        when = dt.datetime.fromtimestamp(reset).strftime("%a %H:%M") if reset else "reset unknown"
+        lines.append(f"slot {s}: {'?' if used is None else f'{used:.0f} %'}, resets {when}")
+    key = f"all-used-up:{int(min(resets)) if min(resets) < math.inf else 'unknown'}"
+    if key in data["notes"]:
+        return
+    data["notes"][key] = now
+    write_json(LIMITED, data)
+    body = (f"{this_machine()}: every Claude slot is at its usage limit; sessions wait at option 1. "
+            + "; ".join(lines) + ".")
+    event("limit-all-used-up", slots=lines, monitor=target or None)
+    if target:
+        send_note(target, body)
+
+
+def remind_limited(agents: list[dict], config: dict, now: float) -> dict | None:
+    """Limited sessions still waiting idle: the one whose slot has room again (its reset passed)
+    is told to go on; one on another slot than the active one with room is restarted."""
+    data = read_limited()
+    if not data["sessions"]:
+        return None
+    usage = read_usage()
+    active = active_account()
+    by_uuid = {(a.get("agent_session") or {}).get("value"): a for a in agents if a.get("agent") == "claude"}
+    changed = False
+    for uuid, rec in list(data["sessions"].items()):
+        agent = by_uuid.get(uuid)
+        if not isinstance(rec, dict) or agent is None or agent.get("agent_status") not in SLEEPABLE_STATUSES:
+            continue
+        slot = rec.get("slot")
+        if now - float(rec.get("at") or 0) < 60 or now - RESTART_TRIED.get(uuid, -math.inf) < RESTART_COOLDOWN_SECONDS:
+            continue
+        if active and slot and slot != active and slot_room(active, usage, data["hits"], now):
+            outcome, delegated = restart_agent(agent, None, 0.0, f"account {slot}", f"account {active}", "account",
+                                               config, now)
+            if not outcome.startswith(("refused", "wake failed")):
+                return delegated  # restart_agent queued the continue note
+            continue
+        if slot and slot_room(slot, usage, data["hits"], now):
+            data["sessions"].pop(uuid)
+            data["hits"].pop(slot, None)
+            changed = True
+            queue_note(uuid, RESET_NOTE.format(slot=slot), f"limit-reset-{uuid[:8]}-{int(float(rec['at']))}")
+            event("limit-continue", uuid=uuid, slot=slot, name=rec.get("name"), why="reset passed")
+    if changed:
+        write_json(LIMITED, data)
+    return None
 
 
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
@@ -5138,7 +5494,12 @@ def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> Non
                 LAST_SKIP.pop(pane, None)
             elif not outcome.startswith(QUIET_OUTCOMES):
                 note_skip(pane, outcome)
-        if config["restart_outdated"] and not STOP["requested"]:
+        if not STOP["requested"]:
+            try:  # runs with restart_outdated off too: a session at its limit can't go on anyway
+                restarting = tend_dialogs(agents, config, now)
+            except SleeperError as exc:
+                say(f"dialogs: {exc}")
+        if config["restart_outdated"] and not STOP["requested"] and restarting is None:
             try:
                 restarting = restart_onto_new_build(agents, clocks, {a["pane_id"] for a in due + early},
                                                     read_json(JOURNAL), config, now)
