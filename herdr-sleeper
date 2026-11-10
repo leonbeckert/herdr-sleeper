@@ -4957,6 +4957,10 @@ def restart_agent(agent: dict, since: float | None, window: float, old: str, new
     confirm outside the lock when the wake went to the pane's stub)."""
     pane = agent["pane_id"]
     uuid = (agent.get("agent_session") or {}).get("value")
+    held = read_json(JOURNAL).get(pane)
+    if isinstance(held, dict) and held.get("uuid") != uuid and held.get("phase") == "displaced":
+        # the pane keeps a handle for another session; the journal has no room for this one's
+        return restart_in_place(agent, since, window, old, new, what, config, now), None
     did, outcome = sleep_agent(agent, window, set(), dry_run=False, idle_since=since, notify_enabled=False,
                                restart=True, allow_focused=since is None)
     if not did:
@@ -5024,7 +5028,8 @@ class Dialog(NamedTuple):
 
 DIALOGS = (
     Dialog("limit", ("Stop and wait for limit to reset", "/usage-credits"),
-           ("Stop and wait for limit to reset", "Switch to usage credits"), "Stop and wait for limit to reset"),
+           ("Stop and wait for limit to reset", "Wait here, then continue automatically", "Switch to usage credits"),
+           "Stop and wait for limit to reset"),
     Dialog("auto-mode-default", ("Make auto mode your default permission mode?",),
            ("Yes, set auto mode as my default permission mode", "No, keep bypass permissions"),
            "No, keep bypass permissions"),
@@ -5265,7 +5270,7 @@ def after_limit(agent: dict, uuid: object, seq: object, config: dict, now: float
             return None
         outcome, delegated = restart_agent(fresh, None, 0.0, f"account {slot}", f"account {active}", "account",
                                            config, now)
-        if outcome.startswith("refused") or outcome.startswith("wake failed"):
+        if outcome.startswith(("refused", "wake failed", "restart failed")):
             event("limit-wait", pane=pane, uuid=uuid, slot=slot, why=outcome)
         return delegated
     slots = sorted({*usage.keys(), *(s for s in (slot, active) if s and s != "explicit")})
@@ -5319,7 +5324,7 @@ def remind_limited(agents: list[dict], config: dict, now: float) -> dict | None:
         if active and slot and slot != active and slot_room(active, usage, data["hits"], now):
             outcome, delegated = restart_agent(agent, None, 0.0, f"account {slot}", f"account {active}", "account",
                                                config, now)
-            if not outcome.startswith(("refused", "wake failed")):
+            if not outcome.startswith(("refused", "wake failed", "restart failed")):
                 return delegated  # restart_agent queued the continue note
             continue
         if slot and slot_room(slot, usage, data["hits"], now):
@@ -5331,6 +5336,79 @@ def remind_limited(agents: list[dict], config: dict, now: float) -> dict | None:
     if changed:
         write_json(LIMITED, data)
     return None
+
+
+def restart_in_place(agent: dict, since: float | None, window: float, old: str, new: str, what: str,
+                     config: dict, now: float) -> str:
+    """Restart a claude session in a pane whose journal row is a displaced handle of another session
+    (2026-11-10, mini2 w3:p3): exit it and `agent start --resume` it in the same pane, the journal
+    untouched (the displaced row stays as it was). The same checks as a sleep; a failed start after
+    the exit is reported with the manual command, since no row holds this session."""
+    pane = agent["pane_id"]
+    uuid = str((agent.get("agent_session") or {}).get("value"))
+    name = agent.get("name") or wake_name({"pane_id": pane})
+    journal = {k: v for k, v in read_json(JOURNAL).items() if k != pane}
+    stop, live = recheck(agent, window, journal, set(), since, since is None, restart=True)
+    if stop or live is None:
+        note_skip(pane, f"restart onto {new} refused: {stop or 'agent gone'}")
+        return f"refused: {stop or 'agent gone'}"
+    if transcript_for(uuid) is None:
+        return "refused: no transcript on disk (nothing to resume)"
+    present, raw_argv, pid = agent_process(pane, "claude")
+    replay, why = replayable_argv(raw_argv) if raw_argv is not None else (None, "could not read agent argv")
+    if present is not True or replay is None or not isinstance(pid, int):
+        note_skip(pane, f"restart onto {new} refused: {why or 'agent process not identified'}")
+        return f"refused: {why or 'agent process not identified'}"
+    argv = resume_argv("claude", uuid, replay or None)
+    manual = shlex.join(["claude", *(argv or [])])
+    with mailbox_lock(uuid, wait=False) as free:
+        if not free:
+            return "refused: a message to this session is being delivered"
+        RESTART_TRIED[uuid] = now
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            return f"refused: signal failed: {exc}"
+        deadline = time.monotonic() + EXIT_WAIT_SECONDS
+        gone = False
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            pane_now = herdr("pane", "get", pane, check=False).get("pane")
+            if isinstance(pane_now, dict) and "agent" not in pane_now and agent_process(pane, "claude")[0] is False:
+                gone = True
+                break
+        failure = None if gone else "the session did not exit"
+        if gone and pane_at_shell(pane) is not True:
+            failure = "the pane is not at its shell after the exit"
+        got = None
+        if failure is None and argv:
+            try:
+                result = herdr("agent", "start", name, "--kind", "claude", "--pane", pane, "--timeout",
+                               str(WAKE_TIMEOUT_MS), "--", *argv, timeout=WAKE_TIMEOUT_MS / 1000 + 30)
+                got = ((result.get("agent") or {}).get("agent_session") or {}).get("value")
+                for _ in range(WAKE_CONFIRM_SECONDS if got is None else 0):
+                    time.sleep(1)
+                    got = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session")
+                           or {}).get("value")
+                    if got:
+                        break
+            except SleeperError as exc:
+                failure = f"start failed: {exc}"
+            if failure is None and got != uuid:
+                failure = f"the pane runs session {got} after the start"
+    if failure:
+        event("restart-failed", pane=pane, name=name, uuid=uuid, reason=failure, manual=manual, in_place=True)
+        say(f"WARN restart {pane} in place: {failure}; resume by hand: {manual}")
+        notify(f"{SLEEP_MARK}restart of {name} failed", f"resume by hand: {manual}", enabled=config["notify"])
+        return f"restart failed: {failure}"
+    event("restarted", pane=pane, name=name, uuid=uuid, old=old, new=new, kind=what, woke=True, in_place=True)
+    say(f"restart {pane} in place (displaced row kept): {old} -> {new}")
+    if what == "account":
+        try:
+            continue_after_account_restart(uuid, new)
+        except (SleeperError, OSError) as exc:
+            say(f"WARN continue note for {pane}: {exc}")
+    return "restarted"
 
 
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}

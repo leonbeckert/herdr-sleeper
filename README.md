@@ -595,6 +595,14 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
   restarted on slot <x> (same transcript). Continue the task you were on.`
   A limited session left on its slot gets `Your slot's usage limit has reset`
   once the reset of its fullest window has passed.
+- A pane whose journal row is a displaced handle of another session
+  (*v0.1.16*) has no room for a second row: its live session is restarted in
+  place instead (exit, then `agent start --resume` in the same pane), the
+  displaced row untouched. A start that fails after the exit is reported with
+  the manual `claude --resume …` command (event `restart-failed`, `in_place`).
+- The menu's option 2 (`Wait here, then continue automatically at …`) is
+  recognised and never sent; only option 1 is, and only from its default
+  position.
 - Room comes from claude-account's `usage.json` (both windows, a passed reset
   counts 0, 95 % is used up). It lags, so a hit slot has no room until a reset
   after the hit has passed or a newer reading shows room; a slot never seen has
@@ -708,7 +716,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 418 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 420 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

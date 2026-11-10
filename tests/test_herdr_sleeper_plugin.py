@@ -4674,7 +4674,7 @@ LIMIT_MENU = """⏺ Running the migration tests
  What do you want to do?
 
  ❯ 1. Stop and wait for limit to reset
-   2. Upgrade your plan
+   2. Wait here, then continue automatically at Fri 6am
    3. Switch to usage credits
 
  Enter to confirm · Esc to cancel
@@ -4881,3 +4881,44 @@ def test_limit_monitor_config_is_checked(state: Path) -> None:
     sleeper.CONFIG_FILE.write_text('limit_monitor = "-oProxyCommand=x"\nexclude = []\n')
     with pytest.raises(sleeper.ConfigError, match="limit_monitor"):
         sleeper.load_config()
+
+
+def test_option_two_selected_is_never_answered(fake: FakeHerdr, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    two = LIMIT_MENU.replace("❯ 1.", "  1.").replace("   2. Wait", " ❯ 2. Wait")
+    d, sel = sleeper.match_dialog(two)
+    assert d and d.kind == "limit" and sel.startswith("Wait here")
+    limit_setup(fake, tmp_path, monkeypatch, two)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    for _ in range(3):
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+        clock["t"] += 60
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]
+
+
+def test_limit_restart_in_a_pane_with_a_displaced_row(fake: FakeHerdr, tmp_path: Path,
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """mini2 w3:p3, 2026-11-10: the pane kept a displaced handle for another session; the limited
+    live session is restarted in place onto b, and the displaced row stays exactly as it was."""
+    other = "b28ffddd-0000-4000-8000-000000000000"
+    displaced = {"pane_id": "w1:p1", "uuid": other, "kind": "claude", "phase": "displaced", "wake_got": UUID,
+                 "argv": ["--dangerously-skip-permissions"], "cwd": "/tmp/proj", "terminal_id": "term-1",
+                 "slept_at": "2026-11-09T10:00:00"}
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": displaced})
+    ctx = limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU,
+                      usage={"b": {"seven_day": {"used_percentage": 20, "resets_at": 2e9}}})
+    monkeypatch.setattr(sleeper, "pane_at_shell", lambda pane: True)
+    monkeypatch.setattr(sleeper, "reconcile", lambda agents: None)   # not what this test is about
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 60
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert fake.signals == [(101, signal.SIGTERM)]
+    starts = [c for c in fake.calls if c[:2] == ("agent", "start")]
+    assert len(starts) == 1 and "--resume" in starts[0] and UUID in starts[0]
+    assert journal() == {"w1:p1": displaced}                                  # untouched
+    assert sleeper.CONTINUE_NOTE.format(slot="b") in "".join(mailbox_bodies(fake))
+    assert ctx["notes"] == []
+    rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if '"restarted"' in l][-1]
+    assert rec["in_place"] is True and rec["new"] == "account b"
