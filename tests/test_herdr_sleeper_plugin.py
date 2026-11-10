@@ -4442,3 +4442,204 @@ def test_remote_presence_carries_mail_fields_and_tolerates_old_rows(
     assert "queued" not in impl
     lines, _problems = sleeper.remote_listing()
     assert any("dev2/taxi-orch" in l and "3 queued 122m" in l for l in lines)
+
+
+# ------------------------------------------------------------ close --self
+
+def _self_close(monkeypatch: pytest.MonkeyPatch, reason: str | None = None, cancel: bool = False,
+                pane: str | None = "w1:p1", parent_chain: list[int] | None = None, **kw: Any) -> int:
+    """`close --self` from inside the agent in `pane` (its pid 101 is our ancestor unless told otherwise)."""
+    if pane:
+        monkeypatch.setenv("HERDR_PANE_ID", pane)
+    else:
+        monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1] if parent_chain is None else parent_chain)
+    args = {"target": None, "force": False, "sender": None, "machine": None, "self_close": True,
+            "reason": reason, "cancel": cancel, **kw}
+    return sleeper.cmd_close(types.SimpleNamespace(**args))
+
+
+def _closing() -> dict[str, Any]:
+    return sleeper.read_json(sleeper.SELF_CLOSE)
+
+
+def test_close_self_records_the_request_and_acts_on_nothing(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent_status"] = "working"                          # the turn that asks is still running
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
+    assert _self_close(monkeypatch, reason="B-17 done") == 0
+    out = capsys.readouterr().out
+    assert "a closes after this turn ends; a message delivered before then cancels it" in out
+    rec = _closing()[UUID]
+    assert rec["at"] == 1_000_000.0 and rec["reason"] == "B-17 done" and rec["pane"] == "w1:p1"
+    assert rec["name"] == "a" and rec["by"] == "a"
+    assert oct(sleeper.SELF_CLOSE.stat().st_mode & 0o777) == "0o600"
+    assert _event_rows("self-close-requested")[-1]["renewed"] is False
+    monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_100.0)
+    assert _self_close(monkeypatch) == 0                                 # idempotent: same wish, same start
+    assert _closing()[UUID]["at"] == 1_000_000.0 and _closing()[UUID]["reason"] == "B-17 done"
+    assert list(_closing()) == [UUID] and _event_rows("self-close-requested")[-1]["renewed"] is True
+    assert fake.signals == [] and not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
+
+
+def test_close_self_names_insomnia_that_would_hold_it(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    assert _claim(monkeypatch) == 0
+    assert _self_close(monkeypatch) == 0
+    assert "holds insomnia (ssh master): release it, or the close waits" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kw, code, needle", [
+    ({"pane": None}, 1, "no HERDR_PANE_ID"),
+    ({"parent_chain": [7, 1]}, 1, "does not run under the agent"),
+    ({"pane": "w9:p9"}, 1, "runs no agent"),
+    ({"target": "a"}, 2, "--self takes no target"),
+    ({"force": True}, 2, "--self takes no target"),
+    ({"machine": "dev2"}, 2, "on this machine"),
+    ({"reason": "a\x1b[2Jb"}, 2, "control characters"),
+])
+def test_close_self_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+                             kw: dict[str, Any], code: int, needle: str) -> None:
+    assert _self_close(monkeypatch, **kw) == code
+    assert needle in capsys.readouterr().err and not sleeper.SELF_CLOSE.exists()
+
+
+def test_close_self_needs_a_claude_session_with_an_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent"] = "opencode"
+    assert _self_close(monkeypatch) == 1 and "composer cannot be checked" in capsys.readouterr().err
+    fake.agents[0]["agent"] = "claude"
+    fake.agents[0].pop("agent_session")
+    assert _self_close(monkeypatch) == 1 and "no session id" in capsys.readouterr().err
+    assert not sleeper.SELF_CLOSE.exists()
+
+
+def test_close_flags_that_need_self_and_a_missing_target(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    assert sleeper.cmd_close(types.SimpleNamespace(target="a", force=False, sender="orc", cancel=True)) == 2
+    assert "go with --self" in capsys.readouterr().err
+    assert sleeper.cmd_close(types.SimpleNamespace(target=None, force=False, sender="orc")) == 2
+    assert "name the session to close" in capsys.readouterr().err and fake.agents
+
+
+def test_watcher_closes_a_self_close_only_when_idle_and_nothing_refuses(fake: FakeHerdr,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch, reason="done") == 0
+    monkeypatch.delenv("HERDR_PANE_ID")                                 # the watcher runs in no pane
+    cfg = dict(sleeper.DEFAULTS)
+    sleeper.watch_tick({}, cfg)                                         # the turn still runs
+    assert fake.signals == [] and UUID in _closing()
+    fake.agents[0]["agent_status"] = "idle"
+    fake.screen = CLAUDE_SCREEN.format(composer="half a thought")      # the owner types into it
+    sleeper.watch_tick({}, cfg)
+    assert fake.signals == [] and UUID in _closing() and _event_rows("self-close-held") == []  # quiet: a draft
+    fake.screen = EMPTY_SCREEN
+    assert _claim(monkeypatch) == 0                                     # insomnia is a refusal, never forced
+    monkeypatch.delenv("HERDR_PANE_ID")
+    sleeper.watch_tick({}, cfg)
+    sleeper.watch_tick({}, cfg)
+    held = _event_rows("self-close-held")
+    assert fake.signals == [] and UUID in _closing() and len(held) == 1  # logged once, kept pending
+    assert "holds insomnia (ssh master)" in held[0]["why"]
+    assert _release(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    sleeper.watch_tick({}, cfg)
+    assert fake.signals == [(101, signal.SIGTERM)] and ("tab", "close", "w1:t1") in fake.calls
+    assert fake.agents == [] and _closing() == {}
+    rec = _event_rows("closed")[-1]
+    assert rec["by"] == "self" and rec["forced"] is False and rec["via"] == "close --self" and rec["reason"] == "done"
+
+
+def test_watcher_closes_a_self_close_that_fell_asleep(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _self_close(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    slept_entry(fake)
+    fake.stub_panes.add("w1:p1")
+    sleeper.tend_self_closes()
+    assert journal() == {} and ("tab", "close", "w1:t1") in fake.calls and _closing() == {}
+    assert _event_rows("closed")[-1]["state"] == "asleep"
+
+
+def test_delivery_cancels_a_pending_self_close_and_says_so(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _self_close(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    assert deliver(monkeypatch, "a") == 0
+    (call,) = prompts(fake)
+    assert call[3].endswith("please rebase\n\n" + sleeper.SELF_CLOSE_CANCELLED)
+    assert sleeper.SELF_CLOSE_CANCELLED == ("[herdr-sleeper: your pending close --self was cancelled by this "
+                                            "message; run it again when you are done]")
+    assert _closing() == {}
+    rec = _event_rows("self-close-cancelled")[-1]
+    assert rec["via"] == "deliver" and rec["by"] == ["orc"]
+    assert deliver(monkeypatch, "a", body="again") == 0                 # nothing pending: nothing appended
+    assert prompts(fake)[-1][3].endswith("again")
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.signals == [] and fake.agents
+
+
+def test_queued_mail_flushed_by_the_watcher_cancels_too(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    assert deliver(monkeypatch, "a") == 3                               # queued: the turn still runs
+    assert UUID in _closing()
+    fake.agents[0]["agent_status"] = "idle"
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))                      # the flush types it in, then no close
+    assert prompts(fake)[-1][3].endswith(sleeper.SELF_CLOSE_CANCELLED)
+    assert _closing() == {} and fake.signals == [] and fake.agents
+
+
+def test_close_self_cancel(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                           capsys: pytest.CaptureFixture[str]) -> None:
+    assert _self_close(monkeypatch) == 0
+    capsys.readouterr()
+    assert _self_close(monkeypatch, cancel=True) == 0
+    assert "close --self cancelled for a" in capsys.readouterr().out and _closing() == {}
+    assert _event_rows("self-close-cancelled")[-1]["via"] == "cancel"
+    assert _self_close(monkeypatch, cancel=True) == 0
+    assert "nothing to cancel" in capsys.readouterr().out
+
+
+def test_pending_self_close_expires_after_a_day(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch, reason="done") == 0
+    clock["t"] += 24 * 3600 - 1
+    sleeper.tend_self_closes()
+    assert UUID in _closing()
+    clock["t"] += 1
+    fake.agents[0]["agent_status"] = "idle"                             # too late: the wish is gone, not acted on
+    sleeper.tend_self_closes()
+    assert _closing() == {} and fake.signals == [] and fake.agents
+    assert _event_rows("self-close-expired")[-1]["reason"] == "done"
+
+
+def test_presence_shows_a_pending_self_close(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.cmd_presence(types.SimpleNamespace(json=True))
+    assert json.loads(capsys.readouterr().out)[0]["closing"] is None
+    assert _self_close(monkeypatch, reason="B-17 done") == 0
+    capsys.readouterr()
+    sleeper.cmd_presence(types.SimpleNamespace(json=True))
+    assert json.loads(capsys.readouterr().out)[0]["closing"] == "B-17 done"
+    sleeper.cmd_presence(types.SimpleNamespace(json=False))
+    assert "[closing: B-17 done]" in capsys.readouterr().out
+    assert _self_close(monkeypatch, cancel=True) == 0 and _self_close(monkeypatch, reason=None) == 0
+    capsys.readouterr()
+    sleeper.cmd_presence(types.SimpleNamespace(json=True))
+    assert json.loads(capsys.readouterr().out)[0]["closing"] == "pending"
+
+
+def test_watcher_never_closes_a_wish_cancelled_since_it_looked(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _self_close(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    real = sleeper.close_session
+
+    def deliver_first(*a: Any, **k: Any) -> Any:
+        assert deliver(monkeypatch, "a") == 0                          # typed in; Herdr still shows `idle`
+        return real(*a, **k)
+    monkeypatch.setattr(sleeper, "close_session", deliver_first)
+    sleeper.tend_self_closes()
+    assert fake.signals == [] and fake.agents and _closing() == {} and _event_rows("self-close-held") == []

@@ -34,6 +34,7 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper insomnia claim|release|list   keep the calling agent's own session awake
   herdr-sleeper spawn --cwd DIR --name NAME [-- FLAGS]   new tab + named agent, first prompt on stdin
   herdr-sleeper close NAME [--force]    close a session's pane (refuses busy, draft, insomnia)
+  herdr-sleeper close --self [--reason T|--cancel]   close the calling session once its turn ends
   herdr-sleeper … --machine M | M/NAME  deliver, wake, close, presence, insomnia list, spawn on a
                                         Herdr saved machine (over SSH); presence --all merges them
   herdr-sleeper claude-hook             Claude Code hook: ListAgents shows sleepers, SendMessage wakes them
@@ -2744,11 +2745,17 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
         refusal = mail_refusal(pane, uuid)
         if refusal:
             return sent, refusal
+        # a pending `close --self` is cancelled by what is typed in now, and the text says so
+        closing = read_self_closes().get(uuid)
+        text = "\n\n".join(envelope(m) for _p, m in batch) + (f"\n\n{SELF_CLOSE_CANCELLED}" if closing else "")
         try:
-            herdr("agent", "prompt", pane, "\n\n".join(envelope(m) for _p, m in batch))
+            herdr("agent", "prompt", pane, text)
         except SleeperError:
             # Herdr's error detail may quote what it was asked to type: the message stays out of the log
             raise SleeperError("herdr agent prompt failed") from None
+        if closing and drop_self_close(uuid, closing["at"]) is not None:
+            event("self-close-cancelled", uuid=uuid, name=name, pane=pane, via="deliver",
+                  by=sorted({str(m.get("from")) for _p, m in batch}))
         for path, msg in batch:
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
@@ -3571,7 +3578,20 @@ def close_refusals(state: str, hit: dict, uuid: str) -> list[str]:
 def cmd_close(args: argparse.Namespace) -> int:
     """Close a live or sleeping session's pane (its tab when that is all the tab holds). Refuses a
     busy session, a draft, background work, undelivered mail or insomnia unless --force; never acts
-    on a pane whose sleep row is not provably ours (orphaned, displaced, waking)."""
+    on a pane whose sleep row is not provably ours (orphaned, displaced, waking). `--self` asks for
+    the calling session's own close once its turn has ended (close_self)."""
+    if getattr(args, "self_close", False):
+        if args.target or args.force or getattr(args, "machine", None) or getattr(args, "here", False):
+            print("close: --self takes no target, --force or --machine: it closes the calling session, "
+                  "on this machine, once its turn ends", file=sys.stderr)
+            return 2
+        return close_self(args)
+    if getattr(args, "cancel", False) or getattr(args, "reason", None) is not None:
+        print("close: --cancel and --reason go with --self", file=sys.stderr)
+        return 2
+    if not args.target:
+        print("close: name the session to close (or --self for the calling one)", file=sys.stderr)
+        return 2
     remote = routed("close", args)
     if remote is not None:
         return remote
@@ -3596,16 +3616,36 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 1
     me, _why = calling_agent(agents)
     if me and me["agent_session"]["value"] == uuid:
-        print("close: refusing to close the calling session", file=sys.stderr)
+        print("close: refusing to close the calling session (`close --self` closes it once this turn ends)",
+              file=sys.stderr)
         return 1
+    closed, text, _refusals = close_session(uuid, args.target, by, args.force)
+    if not closed:
+        print(f"close: {text}", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: float | None = None,
+                  **fields: object) -> tuple[bool, str, list[str]]:
+    """The core of `close`, also the watcher's for `close --self` (by "self", never forced): under the
+    global lock and the session's mailbox lock, from fresh state, refuse what would lose work, else
+    shut the agent down and close its pane. Returns (closed, the line for the caller, why not: the
+    refusals, or the one problem). Never called for the calling session (its own SIGTERM).
+    self_close_at: close only while that `close --self` wish is still pending, checked under the
+    mailbox lock (a delivery cancels it under the same lock, before Herdr may show the turn)."""
+    def refused(text: str, why: list[str] | None = None) -> tuple[bool, str, list[str]]:
+        return False, text, why or [text]
+
     with locked(), mailbox_lock(uuid, wait=False) as free:
         if not free:
-            print("close: a message to this session is being delivered; try again", file=sys.stderr)
-            return 1
+            return refused(MAIL_BUSY + "; try again", [MAIL_BUSY])
+        if self_close_at is not None and read_self_closes().get(uuid, {}).get("at") != self_close_at:
+            return refused(SELF_CLOSE_GONE)
         where = session_state(uuid)  # fresh, under both locks
         if where is None:
-            print(f"close: {args.target} is neither live nor asleep any more", file=sys.stderr)
-            return 1
+            return refused(f"{target} is neither live nor asleep any more")
         state, hit, key = where
         name = (hit.get("name") or hit["pane_id"]) if state == "live" else wake_name(hit)
         if state == "asleep":
@@ -3613,23 +3653,18 @@ def cmd_close(args: argparse.Namespace) -> int:
             phase = "orphaned" if is_orphan(str(key), hit) else hit.get("phase", "asleep")
             if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
                     or info.get("agent") not in (None, CLAIM_AGENT):
-                print(f"close: the sleep row for {name} is {phase} and its pane is not provably its own; "
-                      f"resolve it by hand (`herdr-sleeper list`)", file=sys.stderr)
-                return 1
+                return refused(f"the sleep row for {name} is {phase} and its pane is not provably its own; "
+                               f"resolve it by hand (`herdr-sleeper list`)")
             # our stub, or nothing but the shell: anything else is someone's work (the stub was left
             # with ctrl-c and the pane reused by hand), and --force does not override that
             if stub_running(str(hit["pane_id"]), uuid) is not True and pane_at_shell(str(hit["pane_id"])) is not True:
-                print(f"close: {name}'s pane runs something other than its wake stub or a bare shell; "
-                      "close it by hand if that is meant", file=sys.stderr)
-                return 1
+                return refused(f"{name}'s pane runs something other than its wake stub or a bare shell; "
+                               "close it by hand if that is meant")
         elif any(valid_entry(e) and e["uuid"] == uuid for e in read_json(JOURNAL).values()):
-            print(f"close: {name} has a sleep row still being settled (waking); try again in a minute",
-                  file=sys.stderr)
-            return 1
+            return refused(f"{name} has a sleep row still being settled (waking); try again in a minute")
         refusals = close_refusals(state, hit, uuid)
-        if refusals and not args.force:
-            print(f"close: {name} " + "; ".join(refusals) + ". Pass --force to close it anyway", file=sys.stderr)
-            return 1
+        if refusals and not force:
+            return refused(f"{name} " + "; ".join(refusals) + ". Pass --force to close it anyway", refusals)
         pane = hit["pane_id"]
         tab = hit.get("tab_id") if state == "live" else (herdr("pane", "get", pane, check=False).get("pane") or {}).get("tab_id")
         cwd, kind = hit.get("cwd"), hit.get("agent") if state == "live" else hit.get("kind")
@@ -3649,8 +3684,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         try:
             closed = close_tab_or_pane(pane, tab)
         except SleeperError as exc:
-            print(f"close: closing {pane} failed: {exc}", file=sys.stderr)
-            return 1
+            return refused(f"closing {pane} failed: {exc}")
         reap_helpers(helpers)
         if state == "asleep":
             release(pane)  # best effort: a closed pane takes its claim and saved resume command along
@@ -3667,26 +3701,162 @@ def cmd_close(args: argparse.Namespace) -> int:
         for spawned_name, rec in spawned_records().items():
             if rec.get("uuid") == uuid:
                 record_spawned(spawned_name, None)
+        drop_self_close(uuid)  # a pending `close --self` is done, whoever closed it
     event("closed", name=name, pane=pane, uuid=uuid, state=state, closed=closed, by=by, forced=bool(refusals),
-          overridden=refusals or None, exited=exited)
+          overridden=refusals or None, exited=exited, **fields)
     if refusals:
         say(f"close {name}: forced by {by} past: {'; '.join(refusals)}")
     resume = manual_command({"cwd": cwd, "argv": hit.get("argv") or [], "uuid": uuid, "kind": kind or "claude"})
-    print(f"closed {name} ({closed}); its transcript stays: {resume}")
+    return True, f"closed {name} ({closed}); its transcript stays: {resume}", []
+
+
+# ------------------------------------------------------------ close --self
+
+# A session that is done closes itself: `close --self` from its own shell tool records the wish, and
+# the watcher closes it through close_session once the turn has ended (closing it at once would
+# SIGTERM the very turn that asked). Anything typed into it before then (`deliver`, a peer's
+# SendMessage, mail the watcher flushes) cancels the wish and says so in the typed text. A wish is
+# never forced: busy, a draft, mail, insomnia or background work hold it; after 24 h it is dropped.
+SELF_CLOSE = STATE_DIR / "closing.json"     # session id -> {at, since, name, pane, reason, by}
+SELF_CLOSE_MAX_SECONDS = 24 * 3600
+SELF_CLOSE_CANCELLED = ("[herdr-sleeper: your pending close --self was cancelled by this message; "
+                        "run it again when you are done]")
+MAIL_BUSY = "a message to this session is being delivered"
+SELF_CLOSE_GONE = "its close --self was cancelled meanwhile"
+SELF_CLOSE_QUIET = ("is busy (status", "composer ", MAIL_BUSY, SELF_CLOSE_GONE)  # transient or moot: never logged
+
+
+def self_close_lock():
+    return flocked(SELF_CLOSE.with_name(SELF_CLOSE.name + ".lock"))
+
+
+def read_self_closes() -> dict[str, dict]:
+    """Pending `close --self` wishes. A damaged file is moved aside (losing it only keeps sessions
+    open); malformed rows are ignored."""
+    try:
+        data = read_json(SELF_CLOSE)
+    except DamagedState as exc:
+        say(f"WARN {exc}; damaged close --self records moved to {quarantine(SELF_CLOSE)}")
+        return {}
+    except SleeperError:
+        return {}
+    return {u: r for u, r in data.items() if valid_session_id(u) and isinstance(r, dict) and _number(r.get("at"))}
+
+
+def drop_self_close(uuid: str, at: object = None) -> dict | None:
+    """Remove a session's pending close --self (only the one recorded `at`, when given). Returns it."""
+    with self_close_lock():
+        pending = read_self_closes()
+        rec = pending.get(uuid)
+        if rec is None or (at is not None and rec.get("at") != at):
+            return None
+        pending.pop(uuid)
+        write_json(SELF_CLOSE, pending)
+    return rec
+
+
+def close_self(args: argparse.Namespace) -> int:
+    """`close --self [--reason TEXT]` / `close --self --cancel`: always this machine, always the
+    calling agent's own session (calling_agent: HERDR_PANE_ID plus the agent as an ancestor)."""
+    problem = reason_problem(args.reason)
+    if problem:
+        print(f"close: {problem}", file=sys.stderr)
+        return 2
+    agents = list_agents()
+    me, why = calling_agent(agents)
+    if me is None:
+        print(f"close --self: {why}; run it from the agent's own shell tool, inside the session to close",
+              file=sys.stderr)
+        return 1
+    uuid = me["agent_session"]["value"]
+    name = me.get("name") or (claude_session_name(transcript_for(uuid)) if me.get("agent") == "claude" else None) \
+        or me["pane_id"]
+    if args.cancel:
+        rec = drop_self_close(uuid)
+        if rec is None:
+            print(f"no close --self pending for {name}; nothing to cancel")
+            return 0
+        event("self-close-cancelled", uuid=uuid, name=name, pane=me["pane_id"], via="cancel")
+        print(f"close --self cancelled for {name}; the session stays open")
+        return 0
+    if me.get("agent") != "claude":  # close_refusals: no other kind's composer can be checked for a draft
+        print(f"close --self: {name} runs {me.get('agent')}, whose composer cannot be checked for a draft, so "
+              "it is never closed unattended; ask its spawner to close it", file=sys.stderr)
+        return 1
+    now = time.time()
+    with self_close_lock():
+        pending = read_self_closes()
+        old = pending.get(uuid)
+        rec = {"at": old["at"] if old else now, "since": (old or {}).get("since") or _iso(now), "name": name,
+               "pane": me["pane_id"], "reason": args.reason if args.reason is not None else (old or {}).get("reason"),
+               "by": context_sender(agents) or me["pane_id"], "refused": (old or {}).get("refused")}
+        pending[uuid] = rec
+        write_json(SELF_CLOSE, pending)
+    event("self-close-requested", uuid=uuid, name=name, pane=me["pane_id"], reason=rec["reason"],
+          renewed=old is not None)
+    held = insomnia_reason(uuid, me["pane_id"], me.get("terminal_id"))
+    note = f" (it holds {held}: release it, or the close waits)" if held else ""
+    print(f"close --self: {name} closes after this turn ends; a message delivered before then cancels it{note}")
     return 0
+
+
+def self_close_label(rec: dict | None) -> str | None:
+    return None if rec is None else (rec.get("reason") or "pending")
+
+
+def tend_self_closes(now: float | None = None) -> None:
+    """Watcher, outside the global lock (close_session takes it): close every session with a pending
+    `close --self` whose turn has ended and that close_session does not refuse. A refused one stays
+    pending and is retried next tick; a refusal other than busy or a draft is logged once. A wish
+    older than 24 h is dropped (logged). A session that is not running now (a Herdr restart) waits."""
+    now = time.time() if now is None else now
+    for uuid, rec in read_self_closes().items():
+        if STOP["requested"]:
+            return
+        name = rec.get("name") or uuid
+        if now - rec["at"] >= SELF_CLOSE_MAX_SECONDS:
+            if drop_self_close(uuid, rec["at"]) is not None:
+                event("self-close-expired", uuid=uuid, name=name, reason=rec.get("reason"))
+                say(f"close --self of {name} expired after 24 h; the session stays open")
+            continue
+        where = session_state(uuid)
+        if where is None:
+            continue
+        state, hit, _key = where
+        if state == "live" and hit.get("agent_status") not in SLEEPABLE_STATUSES:
+            continue  # its turn still runs (the one that asked, most likely): next tick
+        try:
+            closed, text, why = close_session(uuid, name, "self", False, self_close_at=rec["at"],
+                                              via="close --self", reason=rec.get("reason"))
+        except SleeperError as exc:
+            closed, text, why = False, str(exc), [str(exc)]
+        if closed:
+            say(f"close --self: {text}")
+            continue
+        loud = "; ".join(w for w in why if not w.startswith(SELF_CLOSE_QUIET))
+        if loud and loud != rec.get("refused"):
+            with self_close_lock():
+                pending = read_self_closes()
+                if pending.get(uuid, {}).get("at") == rec["at"]:
+                    pending[uuid]["refused"] = loud
+                    write_json(SELF_CLOSE, pending)
+            event("self-close-held", uuid=uuid, name=name, why=loud)
+            say(f"close --self of {name} waits: {loud}")
 
 
 # --------------------------------------------------------------- presence
 
 def presence_rows() -> list[dict]:
     """Every live agent and every sleeping one: who can be messaged, and how. No argv. `insomnia`
-    is the claim's reason (or "claimed") for a session that holds one."""
+    is the claim's reason (or "claimed") for a session that holds one; `closing` the reason of a
+    pending `close --self` (or "pending")."""
     rows: list[dict] = []
     try:
         claims = insomnia_claims()
     except SleeperError:
         claims = {}  # cmd_presence prints the warning
     spawners = {r.get("uuid"): r.get("by") for r in spawned_records().values() if r.get("uuid")}
+    closing = read_self_closes()
     for a in list_agents():
         if not a.get("agent") or a.get("agent") == CLAIM_AGENT:
             continue
@@ -3708,6 +3878,7 @@ def presence_rows() -> list[dict]:
     now = time.time()
     for r in rows:
         r["spawned_by"] = spawners.get(r["session"])
+        r["closing"] = self_close_label(closing.get(r["session"]))
         r.update(mail_summary(r["session"], now))
     return rows
 
@@ -3743,8 +3914,9 @@ def cmd_presence(args: argparse.Namespace) -> int:
         alias = f" ({r['claude_name']})" if r.get("claude_name") and r["claude_name"] != r["name"] else ""
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
         awake = f"  [insomnia: {r['insomnia']}]" if r.get("insomnia") else ""
+        closing = f"  [closing: {r['closing']}]" if r.get("closing") else ""
         print(f"{r['state']:14} {where + str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
-              f"{r['cwd'] or ''}{since}{awake}{mail_tag(r)}")
+              f"{r['cwd'] or ''}{since}{awake}{closing}{mail_tag(r)}")
     print(f"message any of them: echo TEXT | herdr-sleeper deliver {'<machine>/' if every else ''}<name> "
           "--from <you>  (wakes a sleeper)")
     return 0
@@ -3767,7 +3939,8 @@ REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for al
 REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
 REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
 PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "kind", "cwd", "session", "slept_at", "insomnia",
-                   "spawned_by", "mail_queued", "mail_oldest_s", "mail_held")  # an older machine sends no mail_*
+                   "spawned_by", "mail_queued", "mail_oldest_s", "mail_held",
+                   "closing")  # an older machine sends no mail_* or closing
 
 
 def saved_machines() -> dict[str, str]:
@@ -4843,7 +5016,8 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
 
 def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     """One watcher tick: sleep_tick, then the mail flush, which runs even when sleep_tick failed
-    (a broken sleep or reconcile must not hold mail back; mail_refusal re-reads fresh state)."""
+    (a broken sleep or reconcile must not hold mail back; mail_refusal re-reads fresh state), then
+    pending `close --self` wishes (after the flush: mail typed in cancels them)."""
     agents = list_agents()
     try:
         sleep_tick(clocks, config, agents)
@@ -4852,6 +5026,8 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
             flush_mail_safely(agents)
         raise
     flush_mail_safely(agents)
+    if not STOP["requested"]:
+        tend_self_closes()
 
 
 def flush_mail_safely(agents: list[dict]) -> None:
@@ -5518,7 +5694,12 @@ def main(argv: list[str] | None = None) -> int:
     spp.add_argument("agent_args", nargs=argparse.REMAINDER, help="-- then extra agent flags (claude: must be replayable)")
     spp.set_defaults(fn=cmd_spawn)
     clp = sub.add_parser("close", help="close a live or sleeping session's pane/tab (refuses busy, draft, insomnia)")
-    clp.add_argument("target", help="session name, pane id, agent name, wake name, or session id")
+    clp.add_argument("target", nargs="?", help="session name, pane id, agent name, wake name, or session id")
+    clp.add_argument("--self", dest="self_close", action="store_true",
+                     help="close the calling session (this machine) once its turn has ended; a message "
+                          "delivered before then cancels it")
+    clp.add_argument("--reason", help="with --self: why, shown in presence (up to 120 characters)")
+    clp.add_argument("--cancel", action="store_true", help="with --self: drop the calling session's pending close")
     clp.add_argument("--force", action="store_true", help="close past a busy turn, a draft, mail or insomnia (logged)")
     clp.add_argument("--from", dest="sender", help="who closes it (default: the calling pane's agent name)")
     clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop

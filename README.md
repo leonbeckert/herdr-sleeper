@@ -391,6 +391,8 @@ echo "build B-17 in this worktree" | herdr-sleeper spawn --cwd ~/development/app
     --name app-b17 [--kind claude|codex] [--from orc] [--workspace w3] [--json] \
     [-- --dangerously-skip-permissions --model opus]
 herdr-sleeper close app-b17 [--force]
+herdr-sleeper close --self [--reason "B-17 done"]   # from inside the session: close me once this turn ends
+herdr-sleeper close --self --cancel
 ```
 
 `spawn` refuses a working directory that is not inside a git checkout below
@@ -431,6 +433,44 @@ may hold someone's work); its journal row is dropped and its claim released.
 An orphaned, displaced or waking row is never closed, not even with
 `--force`. Either way the transcript stays on disk, and `close` prints
 the line that resumes it by hand.
+
+### Closing yourself (`close --self`, *v0.1.13*)
+
+A session that is done closes itself: it runs `herdr-sleeper close --self
+[--reason TEXT]` from its own shell tool as the last step of its final turn.
+`close NAME` refuses the calling session, because the SIGTERM would end the
+very turn that asked; `--self` only records the wish and prints one line
+(`<name> closes after this turn ends; a message delivered before then
+cancels it`). It is always local: no `--machine`, no target, no `--force`.
+
+- The caller is identified like an insomnia claim (`HERDR_PANE_ID`, and that
+  pane's agent process must be an ancestor of the command); outside an agent
+  pane, without a session id, or for a kind whose composer cannot be checked
+  for a draft (anything but claude), it refuses (exit 1). Running it again
+  keeps the wish and its start (`--reason` replaces the reason).
+- The wish lives in `closing.json` in the state dir, keyed by session id
+  (`at`, `name`, `pane`, `reason`, `by`), and logs `self-close-requested`.
+- Each watcher tick, after the mail flush, closes a session with a pending
+  wish once it is idle or done, through the same code as `close` (every
+  refusal and the asleep-pane checks unchanged, never `--force`, `closed`
+  logged with `by: "self"`, `via: "close --self"`). A session that fell
+  asleep meanwhile is closed through the sleeping path. A refused close stays
+  pending and is retried next tick; a busy turn or a draft is retried
+  silently, any other refusal (insomnia, undelivered mail, background work, a
+  sleep row in flux) logs `self-close-held` once. Holding insomnia therefore
+  keeps the session open until it is released.
+- Anything typed into the session before then cancels the wish: `deliver`,
+  a peer's SendMessage, or mail the watcher flushes. The typed prompt gets one
+  more line, `[herdr-sleeper: your pending close --self was cancelled by this
+  message; run it again when you are done]`, and `self-close-cancelled` is
+  logged (`via: "deliver"`). The watcher re-checks the wish under the
+  session's mailbox lock, so a message typed in a moment before the close,
+  while Herdr still shows the turn as idle, wins. `close --self --cancel`
+  drops the wish by hand (`via: "cancel"`).
+- A wish older than 24 h is dropped with `self-close-expired`; the session
+  stays open. `presence` shows a pending wish as `[closing: <reason>]`
+  (`closing` in `--json`: the reason, `"pending"` without one, else null).
+  `scan` does not act on wishes; only the watcher does.
 
 ## Other machines
 
@@ -631,13 +671,13 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 382 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 408 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close, against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
+and close (and `close --self`), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's
 `/usr/bin/python3`) and 3.12. The `state` fixture redirects every module-level
 path in the state dir, so a new state file cannot reach the live one. The fake does not prove what a real Herdr

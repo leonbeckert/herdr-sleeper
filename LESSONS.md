@@ -376,6 +376,14 @@ label, or leave `done` panes alone for longer. (Review v0.1.0 F22.)
   because the stub needs that lock.
 - *Instead:* release the lock, then wait. Report a slow start as "started, not yet confirmed", not as a failure.
 
+**8.7 An agent cannot close itself synchronously; defer it, and let any new input cancel it.**
+- *Trap:* "close the calling session" from the agent's own shell tool SIGTERMs the turn that asked, mid-tool-call,
+  so `close` refuses the calling session. Done sessions then waited for a spawner or the owner to close them.
+- *Instead (v0.1.13):* `close --self` only records the wish; the watcher closes the session once Herdr shows it
+  idle, through the normal close with every refusal. A message typed in before then cancels the wish, and that
+  check runs under the mailbox lock the delivery holds: Herdr can still show `idle` a moment after a prompt went
+  in, and a status-only check would SIGTERM the turn the message just started.
+
 ## 9. Testing against a real multiplexer
 
 **9.1 Isolate the plugin registry, not only the session.**
