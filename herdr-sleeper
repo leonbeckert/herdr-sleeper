@@ -3309,6 +3309,8 @@ SPAWN_KINDS = ("claude", "codex")
 SPAWN_ROOT = Path(os.path.expanduser("~/development"))  # spawned sessions work in checkouts below this
 SPAWN_READY_MS = 120_000
 SPAWN_SHELL_SECONDS = 20         # how long a new tab may take to show its shell prompt
+SPAWN_BUSY_RETRIES = 3           # more `agent start` tries when a fresh pane answers agent_pane_busy
+SPAWN_BUSY_PAUSE_SECONDS = 2
 SPAWNED = STATE_DIR / "spawned.json"  # session name -> who spawned it and where (close, presence)
 
 
@@ -3494,12 +3496,23 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         return 1
     argv = (["-n", args.name] if args.kind == "claude" else []) + extra
     try:
-        started = herdr("agent", "start", args.name, "--kind", args.kind, "--pane", pane,
-                        "--timeout", str(SPAWN_READY_MS), "--", *argv, timeout=SPAWN_READY_MS / 1000 + 30)
+        # agent_pane_busy is a refusal before anything is typed: a fresh shell still busy with its
+        # startup (prompt hooks, a slow `git status` in a big checkout) answers it for a moment, and
+        # a retry seconds later starts fine (2026-11-10 on the MacBook, three times). Other codes fail.
+        for attempt in range(SPAWN_BUSY_RETRIES + 1):
+            try:
+                started = herdr("agent", "start", args.name, "--kind", args.kind, "--pane", pane,
+                                "--timeout", str(SPAWN_READY_MS), "--", *argv, timeout=SPAWN_READY_MS / 1000 + 30)
+                break
+            except SleeperError as exc:
+                if getattr(exc, "code", None) != "agent_pane_busy" or attempt == SPAWN_BUSY_RETRIES:
+                    raise
+                time.sleep(SPAWN_BUSY_PAUSE_SECONDS)
     except SleeperError as exc:
         code = getattr(exc, "code", None)
         hint = (" (a folder-trust or login prompt? Start it once by hand in that checkout)"
-                if code == "agent_not_ready" else "")
+                if code == "agent_not_ready" else
+                f" (still busy after {SPAWN_BUSY_RETRIES + 1} tries)" if code == "agent_pane_busy" else "")
         with contextlib.suppress(SleeperError):
             close_tab_or_pane(pane, tab)  # nothing was typed into it: no session worth keeping
         event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code=code)

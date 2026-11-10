@@ -142,6 +142,7 @@ class FakeHerdr:
         self.reject_resume: str | None = None    # error code a report-agent carrying a resume command gets
         self.spawn_uuid = "5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f"  # what a fresh `agent start` (no --resume) reports
         self.start_error: str | None = None      # error code `agent start` fails with
+        self.start_errors: list[str] = []        # codes the next `agent start` calls fail with, one each
         self.tabs_made = 0
 
     def restart(self, keep_resume: bool = True) -> None:
@@ -254,6 +255,9 @@ class FakeHerdr:
             pane = args[args.index("--pane") + 1]
             if args[2] in self.taken_names:
                 raise sleeper.SleeperError(f"herdr agent start failed: {{'code': 'agent_name_taken', 'name': '{args[2]}'}}")
+            if self.start_errors:
+                code = self.start_errors.pop(0)
+                raise sleeper.HerdrError(f"herdr agent start failed: {{'code': '{code}'}}", code)
             if self.start_error:
                 raise sleeper.HerdrError(f"herdr agent start failed: {{'code': '{self.start_error}'}}", self.start_error)
             uuid = self.start_uuid or (args[args.index("--resume") + 1] if "--resume" in args else self.spawn_uuid)
@@ -3433,6 +3437,28 @@ def test_spawn_that_does_not_start_closes_its_tab(fake: FakeHerdr, checkout: Pat
     assert "folder-trust" in err and "tab w1:t8 closed" in err
     assert ("tab", "close", "w1:t8") in fake.calls and not any(a["pane_id"] == "w1:p8" for a in fake.agents)
     assert "spawn-failed" in events() and not sleeper.SPAWNED.exists()
+
+
+def test_spawn_retries_a_pane_that_is_busy_for_a_moment(fake: FakeHerdr, checkout: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.start_errors = ["agent_pane_busy", "agent_pane_busy"]
+    assert _spawn(monkeypatch, checkout) == 0
+    assert sum(1 for c in fake.calls if c[:2] == ("agent", "start")) == 3
+    assert "spawn-failed" not in events() and sleeper.SPAWNED.exists()
+
+
+def test_spawn_gives_up_on_a_pane_that_stays_busy(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    fake.start_error = "agent_pane_busy"
+    assert _spawn(monkeypatch, checkout) == 1
+    assert sum(1 for c in fake.calls if c[:2] == ("agent", "start")) == sleeper.SPAWN_BUSY_RETRIES + 1
+    assert "still busy after" in capsys.readouterr().err and ("tab", "close", "w1:t8") in fake.calls
+
+
+def test_spawn_does_not_retry_other_refusals(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.start_error = "agent_not_ready"
+    assert _spawn(monkeypatch, checkout) == 1
+    assert sum(1 for c in fake.calls if c[:2] == ("agent", "start")) == 1
 
 
 def test_close_shuts_an_idle_spawned_session_down_and_closes_its_tab(fake: FakeHerdr, checkout: Path,
