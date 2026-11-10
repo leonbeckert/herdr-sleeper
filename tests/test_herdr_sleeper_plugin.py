@@ -4937,3 +4937,52 @@ def test_suggestion_cursor_cell_is_not_a_draft() -> None:
     assert sleeper.typed_text(lone).strip("❯ ") == "y"
     assert sleeper.sgr_attrs("38;2;7;7;7", False, False) == (False, False)   # colour args are no attributes
     assert sleeper.sgr_attrs("7;2", False, False) == (True, True) and sleeper.sgr_attrs("27", True, True) == (True, False)
+
+
+def test_unnamed_agent_sleeps_under_its_title_and_wakes_with_that_name(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """dev-mini-setup 2026-11-10: a pane restarted outside Herdr has no agent name but its session's
+    title; it sleeps and wakes under that title, so a deliver by the visible name finds it."""
+    fake.agents[0].update(name=None, terminal_title_stripped="ansible-orch-arana")
+    sleeper.sleep_agent(dict(fake.agents[0]), 12, set(), dry_run=False)
+    assert journal()["w1:p1"]["name"] == "ansible-orch-arana"
+    assert sleeper.resolve_target("ansible-orch-arana", [], journal())[0] == "asleep"
+    fake.stub_panes.add("w1:p1")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    monkeypatch.setattr(sleeper.os, "getcwd", lambda: "/tmp/proj")
+    monkeypatch.setattr(sleeper.shutil, "which", lambda b: f"/opt/bin/{b}")
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    sleeper.cmd_stub("w1:p1", UUID)
+    fake.stub_panes.discard("w1:p1")
+    fake.agents[0].update(agent="claude", agent_session={"value": UUID}, name=None)
+    sleeper.reconcile(fake.agents)
+    assert fake.agents[0]["name"] == "ansible-orch-arana" and journal() == {}
+
+
+@pytest.mark.parametrize("title, named, other", [
+    ("two words", None, None),          # not a name
+    ("claude", None, None),             # the agent kind, not a name
+    ("busy-title", "a", None),          # has a Herdr name: that one wins
+    ("shared", None, "shared"),         # another live pane shows the same title
+])
+def test_title_is_no_name_when_invalid_taken_or_already_named(title: str, named: str | None,
+                                                              other: str | None) -> None:
+    me = agent(name=named)
+    me["terminal_title_stripped"] = title
+    others = [me]
+    if other:
+        twin = agent(pane="w1:p2", uuid="30603f77-21a6-4a16-9f2b-77a87efbc665", name=None)
+        twin["terminal_title_stripped"] = other
+        others.append(twin)
+    assert sleeper.title_name(me, others, {}) is None
+
+
+def test_title_is_no_name_when_a_sleeping_session_goes_by_it() -> None:
+    me = agent(name=None)
+    me["terminal_title_stripped"] = "dev-mini-setup"
+    row = {"pane_id": "w2:p1", "uuid": "30603f77-21a6-4a16-9f2b-77a87efbc665", "name": "dev-mini-setup",
+           "kind": "claude", "argv": [], "cwd": "/tmp", "phase": "asleep"}
+    journal_rows = {"w2:p1": row} if sleeper.valid_entry(row) else {}
+    assert journal_rows, "fixture row must be a valid journal entry"
+    assert sleeper.title_name(me, [me], journal_rows) is None
+    assert sleeper.title_name(me, [me], {}) == "dev-mini-setup"

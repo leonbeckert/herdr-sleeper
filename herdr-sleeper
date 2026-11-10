@@ -1554,6 +1554,25 @@ def merge_snapshot(agents: list[dict]) -> None:
     write_json(SNAPSHOT, snap)
 
 
+def title_name(agent: dict, agents: list[dict], journal: dict) -> str | None:
+    """The name an agent Herdr lists unnamed goes by: its terminal title, when that is a valid name
+    nobody else on the machine uses. A pane restarted outside Herdr loses its agent name but keeps
+    the title its session sets (mbp w5:pS 'ansible-orch-arana', 2026-11-10); recorded as the sleep
+    row's name, the wake hands it to the resumed agent and deliveries by that name reach it."""
+    title = agent.get("terminal_title_stripped")
+    if agent.get("name") or not isinstance(title, str) or not SPAWN_NAME_RE.fullmatch(title) \
+            or title in PROFILES or title.startswith("wake-"):
+        return None
+    uuid = (agent.get("agent_session") or {}).get("value")
+    if any(a["pane_id"] != agent["pane_id"] and title in (a.get("name"), a.get("terminal_title_stripped"))
+           for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT):
+        return None
+    if any(valid_entry(e) and e["uuid"] != uuid and title in (e.get("name"), e.get("claude_name"), wake_name(e))
+           for e in journal.values()):
+        return None
+    return title
+
+
 def wake_name(entry: dict) -> str:
     return entry.get("name") or "wake-" + entry["pane_id"].replace(":", "-")
 
@@ -1806,7 +1825,8 @@ def _sleep_transaction(agent: dict, profile: dict, replay: list[str], idle_hours
     entry = {
         "pane_id": pane, "workspace_id": agent.get("workspace_id"), "tab_id": agent.get("tab_id"),
         "terminal_id": agent.get("terminal_id") or pane_info.get("terminal_id"),
-        "name": agent.get("name"), "label": label, "title": agent.get("terminal_title_stripped"),
+        "name": agent.get("name") or title_name(agent, list_agents(), read_json(JOURNAL)),
+        "label": label, "title": agent.get("terminal_title_stripped"),
         "cwd": agent.get("cwd"), "uuid": uuid, "kind": kind,
         "argv": replay, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
         "status": agent.get("agent_status"), "phase": "exit-requested",

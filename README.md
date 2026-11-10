@@ -75,6 +75,12 @@ Wake paths:
    30 s for the session to come back before reporting success (a stub that
    exec'd but whose session Herdr has not reported yet counts as started).
 
+An agent Herdr lists without a name (a pane restarted outside Herdr keeps
+its session's title but not its agent name) sleeps under that title when it
+is a valid name no other live pane or sleeping session goes by (*v0.1.18*);
+the wake hands it to the resumed agent, so a `deliver` by the visible name
+reaches it.
+
 Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
 state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
 `uninstall` runs before removing the plugin: it stops the watcher, wakes
@@ -719,7 +725,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 421 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 427 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
