@@ -600,6 +600,9 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
   place instead (exit, then `agent start --resume` in the same pane), the
   displaced row untouched. A start that fails after the exit is reported with
   the manual `claude --resume …` command (event `restart-failed`, `in_place`).
+- *v0.1.17:* Claude Code draws its cursor in reverse video over the first
+  letter of a dim prompt suggestion; that cell counts as part of the
+  suggestion, not as a draft, so mail reaches idle sessions that show one.
 - The menu's option 2 (`Wait here, then continue automatically at …`) is
   recognised and never sent; only option 1 is, and only from its default
   position.
@@ -716,7 +719,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 420 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 421 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

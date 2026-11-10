@@ -1027,8 +1027,8 @@ def strip_ansi(line: str) -> str:
     return ANSI_ANY.sub("", line)
 
 
-def sgr_dim(params: str, dim: bool) -> bool:
-    """Whether text is dim after one SGR sequence. Colour arguments are skipped, not read as
+def sgr_attrs(params: str, dim: bool, reverse: bool) -> tuple[bool, bool]:
+    """(dim, reverse video) after one SGR sequence. Colour arguments are skipped, not read as
     attributes: the `2` in `38;2;r;g;b` is truecolour, not dim."""
     codes = (params or "0").split(";")
     i = 0
@@ -1037,34 +1037,53 @@ def sgr_dim(params: str, dim: bool) -> bool:
         if code in ("38", "48", "58") and ":" not in codes[i]:
             i += 1 + (1 + SGR_COLOR_ARGS[codes[i + 1]] if i + 1 < len(codes) and codes[i + 1] in SGR_COLOR_ARGS else 0)
             continue
-        if code in ("", "0", "22"):
+        if code in ("", "0"):
+            dim = reverse = False
+        elif code == "22":
             dim = False
         elif code == "2":
             dim = True
+        elif code == "7":
+            reverse = True
+        elif code == "27":
+            reverse = False
         i += 1
-    return dim
+    return dim, reverse
 
 
-def typed_text(line: str) -> str:
-    """The characters of a screen line not rendered dim. Claude Code shows a prompt suggestion in
-    an empty composer as dim (SGR 2) text; that is not a draft. Plain-text input has no styling,
-    so everything in it counts as typed."""
-    out: list[str] = []
-    dim, i = False, 0
+def sgr_dim(params: str, dim: bool) -> bool:
+    return sgr_attrs(params, dim, False)[0]
+
+
+def styled_chars(line: str) -> list[tuple[str, bool, bool]]:
+    """(character, dim, reverse video) for every visible character of a screen line."""
+    out: list[tuple[str, bool, bool]] = []
+    dim = reverse = False
+    i = 0
     while i < len(line):
         m = ANSI_SGR.match(line, i)
         if m:
-            dim = sgr_dim(m.group(1), dim)
+            dim, reverse = sgr_attrs(m.group(1), dim, reverse)
             i = m.end()
             continue
         m = ANSI_ANY.match(line, i)
         if m:
             i = m.end()
             continue
-        if not dim:
-            out.append(line[i])
+        out.append((line[i], dim, reverse))
         i += 1
-    return "".join(out)
+    return out
+
+
+def typed_text(line: str) -> str:
+    """The characters of a screen line not rendered dim. Claude Code shows a prompt suggestion in
+    an empty composer as dim (SGR 2) text; that is not a draft. It draws its cursor in reverse
+    video over the suggestion's first character, which is not dim: a reverse character right
+    before a dim run is that cursor cell, not typed text (a real draft has its cursor after the
+    text). Plain-text input has no styling, so everything in it counts as typed."""
+    chars = styled_chars(line)
+    return "".join(c for j, (c, dim, reverse) in enumerate(chars)
+                   if not dim and not (reverse and j + 1 < len(chars) and chars[j + 1][1]))
 
 
 def is_rule(line: str) -> bool:

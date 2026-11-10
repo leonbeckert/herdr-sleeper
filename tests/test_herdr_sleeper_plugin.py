@@ -4922,3 +4922,18 @@ def test_limit_restart_in_a_pane_with_a_displaced_row(fake: FakeHerdr, tmp_path:
     assert ctx["notes"] == []
     rec = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines() if '"restarted"' in l][-1]
     assert rec["in_place"] is True and rec["new"] == "account b"
+
+
+# ------------------------------------------- v0.1.17: the cursor cell of a prompt suggestion
+
+def test_suggestion_cursor_cell_is_not_a_draft() -> None:
+    """mini2 mbeg-orch 2026-11-10: `❯ ok` suggestion, cursor (SGR 7) over its first letter."""
+    raw = "❯\xa0\x1b[0m\x1b[7mo\x1b[0m\x1b[2mk\x1b[0m"
+    assert sleeper.typed_text(raw).strip("❯\xa0 ") == ""
+    assert sleeper.composer_state(f"⏺ done\n────────\n{raw}\n────────\n  footer\n") == ("empty", "")
+    draft = "❯ ok\x1b[7m \x1b[0m"                                   # typed, cursor after it
+    assert sleeper.typed_text(draft).strip("❯ ") == "ok"
+    lone = "❯ \x1b[7my\x1b[0m"                                       # reverse with no dim run after: typed
+    assert sleeper.typed_text(lone).strip("❯ ") == "y"
+    assert sleeper.sgr_attrs("38;2;7;7;7", False, False) == (False, False)   # colour args are no attributes
+    assert sleeper.sgr_attrs("7;2", False, False) == (True, True) and sleeper.sgr_attrs("27", True, True) == (True, False)
