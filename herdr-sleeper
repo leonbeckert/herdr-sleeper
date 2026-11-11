@@ -1974,6 +1974,28 @@ def set_state_dir(state_dir: Path) -> None:
     WATCHER_MISSING = STATE_DIR / "watcher-missing"
 
 
+def sane_tty(fd: int | None = None) -> None:
+    """Give the pane's terminal a usable line discipline before the stub reads from it.
+
+    An agent killed by SIGTERM leaves its raw-ish termios on the tty (seen 2026-11-11:
+    icanon but -icrnl -isig -iexten -ixon). Enter then sends CR, which input() never
+    sees as end of line, and ctrl-c is a literal ^C: the pane can't be woken by hand.
+    MODE_RESET_PRINTF resets terminal escape modes, not termios. Not a tty (tests,
+    pipes): nothing to do.
+    """
+    try:
+        if fd is None:
+            fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+    except (termios.error, OSError, ValueError, AttributeError):
+        return
+    attrs[0] = (attrs[0] | termios.ICRNL) & ~(termios.INLCR | termios.IGNCR)
+    attrs[1] |= termios.OPOST | termios.ONLCR
+    attrs[3] |= termios.ICANON | termios.ECHO | termios.ECHOE | termios.ECHOK | termios.ISIG | termios.IEXTEN
+    with contextlib.suppress(termios.error, OSError):
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
     """The in-pane wake stub: waits for a bare Enter, then execs the agent back into its session.
 
@@ -1997,6 +2019,7 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
     HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
     if state_dir:
         set_state_dir(Path(state_dir))
+    sane_tty()
     journal = read_json(JOURNAL)
     entry = journal.get(pane) or {}
     if entry.get("uuid") != uuid or not valid_entry(entry):

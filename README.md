@@ -81,6 +81,10 @@ is a valid name no other live pane or sleeping session goes by (*v0.1.18*);
 the wake hands it to the resumed agent, so a `deliver` by the visible name
 reaches it.
 
+The stub resets the pane's line discipline before it waits for Enter (*v0.1.19*): an agent killed
+by a signal can leave the tty without CR-to-NL and signal keys, so Enter echoed `^M` and ctrl-c `^C`
+and the pane could not be woken by hand.
+
 Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
 state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
 `uninstall` runs before removing the plugin: it stops the watcher, wakes

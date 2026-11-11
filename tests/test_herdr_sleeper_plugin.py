@@ -4986,3 +4986,35 @@ def test_title_is_no_name_when_a_sleeping_session_goes_by_it() -> None:
     assert journal_rows, "fixture row must be a valid journal entry"
     assert sleeper.title_name(me, [me], journal_rows) is None
     assert sleeper.title_name(me, [me], {}) == "dev-mini-setup"
+
+
+def test_sane_tty_restores_enter_and_ctrl_c_after_a_killed_agent() -> None:
+    """2026-11-11: a claude killed by SIGTERM left icanon -icrnl -isig -iexten on the pane's tty;
+    Enter (CR) never ended input() and ctrl-c was a literal ^C, so the slept pane could not wake."""
+    import pty
+    import select
+    import termios
+    leader, follower = pty.openpty()
+    try:
+        attrs = termios.tcgetattr(follower)
+        attrs[0] &= ~termios.ICRNL
+        attrs[0] |= termios.IGNCR
+        attrs[3] &= ~(termios.ISIG | termios.IEXTEN | termios.ECHO)
+        attrs[3] |= termios.ICANON
+        termios.tcsetattr(follower, termios.TCSANOW, attrs)
+        sleeper.sane_tty(follower)
+        iflag, _oflag, _cflag, lflag = termios.tcgetattr(follower)[:4]
+        assert iflag & termios.ICRNL and not iflag & termios.IGNCR
+        assert lflag & termios.ISIG and lflag & termios.ICANON and lflag & termios.ECHO and lflag & termios.IEXTEN
+        os.write(leader, b"\r")   # Enter on such a terminal is CR: it now ends the line as \n
+        ready, _w, _x = select.select([follower], [], [], 2)
+        assert ready and os.read(follower, 16) == b"\n"
+    finally:
+        os.close(leader)
+        os.close(follower)
+
+
+def test_sane_tty_ignores_a_non_tty(tmp_path: Path) -> None:
+    with open(tmp_path / "f", "w") as fh:
+        sleeper.sane_tty(fh.fileno())   # no exception
+    sleeper.sane_tty(-1)
