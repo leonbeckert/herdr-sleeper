@@ -5018,3 +5018,62 @@ def test_sane_tty_ignores_a_non_tty(tmp_path: Path) -> None:
     with open(tmp_path / "f", "w") as fh:
         sleeper.sane_tty(fh.fileno())   # no exception
     sleeper.sane_tty(-1)
+
+
+# Claude Code 2.1 once the turn is over while a background agent and a workflow still run
+# (md-verteidigung, mini2 2026-11-11): Herdr says `working`, the prompt takes input.
+BG_WAIT_SCREEN = (
+    "⏺ Runde 2 schicke ich, sobald die Kritikpunkte umgesetzt sind.\n\n"
+    "\x1b[38;2;153;153;153m✻ Waiting for \x1b[1m1\x1b[0m background agent and \x1b[1m1\x1b[0m dynamic workflow to finish\n\n"
+    + "─" * 60 + " md-verteidigung ─\n❯ {composer}\n" + "─" * 80 + "\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n\n"
+    "  ⏺ main\n"
+    "  ◯ general-purpose        Fixing assertions        32m 18s · ↓ 214.1k tokens\n"
+    "  ◯ kritikrunde-1-analyse  ▰▰▰▰▱▱  6/7 · 17m27s · ↓ 1.7m tokens · /workflows to stop\n")
+
+
+def test_background_wait_reads_only_the_line_over_the_composer() -> None:
+    assert sleeper.background_wait(BG_WAIT_SCREEN.format(composer=""))
+    assert sleeper.composer_state(BG_WAIT_SCREEN.format(composer="")) == ("empty", "")   # the task panel is footer
+    busy = BG_WAIT_SCREEN.replace("Waiting for", "Thinking… (esc to interrupt) Waiting for")
+    assert not sleeper.background_wait(busy.format(composer=""))
+    quoted = ("✻ Waiting for 1 background agent to finish\n⏺ later output\n✻ Clauding… (esc to interrupt)\n"
+              + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+    assert not sleeper.background_wait(quoted)                     # transcript text further up never counts
+    assert not sleeper.background_wait(None)
+
+
+def test_composer_with_a_task_panel_below_still_sees_a_draft() -> None:
+    state, _ = sleeper.composer_state(BG_WAIT_SCREEN.format(composer="half a thought"))
+    assert state == "draft"
+    # a prompt whose box is not the last one on screen is no composer we can vouch for
+    odd = "❯ \n" + "─" * 40 + "\n⏺ more\n" + "─" * 40 + "\n  footer\n"
+    assert sleeper.composer_state(odd)[0] == "unknown"
+
+
+def test_mail_goes_into_a_claude_pane_waiting_on_background_work(fake: FakeHerdr,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    fake.screen = BG_WAIT_SCREEN.format(composer="")
+    assert deliver(monkeypatch, "a") == 0
+    assert prompts(fake)[-1][3].endswith("please rebase") and sleeper.pending_mail(UUID) == []
+
+
+def test_mail_waits_while_the_turn_itself_runs_or_a_draft_is_open(fake: FakeHerdr,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    fake.screen = BG_WAIT_SCREEN.replace("Waiting for", "Thinking… (esc to interrupt)").format(composer="")
+    assert deliver(monkeypatch, "a") == 3 and prompts(fake) == []
+    fake.screen = BG_WAIT_SCREEN.format(composer="unsent words")
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1
+    fake.screen = BG_WAIT_SCREEN.format(composer="")
+    sleeper.flush_mail(fake.agents)                                # the watcher types it in once the prompt waits
+    assert len(prompts(fake)) == 1 and sleeper.pending_mail(UUID) == []
+
+
+def test_background_wait_is_claude_only(fake: FakeHerdr) -> None:
+    other = {**fake.agents[0], "agent": "opencode", "agent_status": "working"}
+    assert not sleeper.mail_ready_status(other, BG_WAIT_SCREEN.format(composer=""), read_screen=False)
+    blocked = {**fake.agents[0], "agent_status": "blocked"}         # a permission prompt never takes mail
+    assert not sleeper.mail_ready_status(blocked, BG_WAIT_SCREEN.format(composer=""), read_screen=False)

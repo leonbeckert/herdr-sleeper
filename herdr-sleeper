@@ -1091,6 +1091,13 @@ def is_rule(line: str) -> bool:
     return len(text) >= 3 and set(text) <= {"─"}
 
 
+def is_box_top(line: str) -> bool:
+    """The rule over Claude Code's composer: plain, or with the session's name set into it by
+    /rename ("──── md-verteidigung ─")."""
+    text = line.strip()
+    return is_rule(text) or (text.startswith("───") and text.endswith("─"))
+
+
 def composer_state(screen: str | None) -> tuple[str, str]:
     """('empty' | 'draft' | 'unknown', detail) judged from the pane screen, failing closed.
 
@@ -1103,7 +1110,10 @@ def composer_state(screen: str | None) -> tuple[str, str]:
         return "unknown", "screen unreadable"
     raw = [ln.rstrip() for ln in screen.splitlines() if strip_ansi(ln).strip()]
     lines = [strip_ansi(ln) for ln in raw]
-    for idx in range(len(lines) - 1, -1, -1):
+    # below the last rule is the footer: its background-task panel starts with "⏺ main", which
+    # is not transcript under the composer (md-verteidigung, mini2 2026-11-11)
+    rules = [i for i, ln in enumerate(lines) if is_rule(ln)]
+    for idx in range((rules[-1] if rules else len(lines)) - 1, -1, -1):
         stripped = lines[idx].lstrip()
         if stripped.startswith(PROMPT_GLYPHS):
             # the detail is logged: say where the text is and its shape, never what it says. A typed
@@ -1117,6 +1127,8 @@ def composer_state(screen: str | None) -> tuple[str, str]:
             rule = next((j for j, ln in enumerate(rest) if is_rule(ln)), None)
             if rule is None:  # a bare glyph with no box under it is not a composer we can vouch for
                 return "unknown", "no rule below the prompt"
+            if idx + 1 + rule != rules[-1]:  # the footer is skipped only below the composer's own box
+                return "unknown", "another rule below the prompt's box"
             below = sum(1 for ln in raw[idx + 1:idx + 1 + rule] if typed_text(ln).strip())
             if below:
                 return "draft", (f"text below the prompt line (a multi-line draft or an open menu), "
@@ -1125,6 +1137,45 @@ def composer_state(screen: str | None) -> tuple[str, str]:
         if stripped.startswith(("⏺", "✻", "⎿")):
             return "unknown", "composer not visible below transcript"
     return "unknown", "no prompt glyph on screen"
+
+
+# Claude Code's spinner line once the turn is over and only background agents, shells or
+# workflows still run ("✻ Waiting for 1 background agent and 1 dynamic workflow to finish").
+# Herdr reports such a pane as `working`, yet its prompt takes input like an idle one.
+BACKGROUND_WAIT = re.compile(r"^\S Waiting for \d+ .+ to finish$")
+
+
+def background_wait(screen: str | None) -> bool:
+    """True when the line right above the composer box is Claude Code's background-wait spinner.
+
+    Only that one line counts (the nearest non-empty one above the rule over the prompt), so
+    transcript text cannot match, and a turn still running ("✻ Thinking… (esc to interrupt)")
+    never does.
+    """
+    if screen is None:
+        return False
+    lines = [strip_ansi(ln).strip() for ln in screen.splitlines()]
+    lines = [ln for ln in lines if ln]
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].startswith(PROMPT_GLYPHS):
+            if idx < 2 or not is_box_top(lines[idx - 1]):
+                return False
+            return BACKGROUND_WAIT.match(lines[idx - 2]) is not None
+    return False
+
+
+def mail_ready_status(agent: dict, screen: str | None = None, read_screen: bool = True) -> bool:
+    """May mail go into this agent as far as its status goes: idle or done, or a Claude pane that
+    is `working` only because background work runs while its prompt waits (md-verteidigung,
+    mini2 2026-11-11, held 13 min behind a workflow)."""
+    status = agent.get("agent_status")
+    if status in SLEEPABLE_STATUSES:
+        return True
+    if status != "working" or not PROFILES.get(agent.get("agent"), {}).get("idle_guards"):
+        return False
+    if screen is None and read_screen:
+        screen = herdr_screen(agent["pane_id"])
+    return background_wait(screen)
 
 
 BG_ITEM = re.compile(r"^(\d+) (monitor|shell)s?$")
@@ -2754,7 +2805,8 @@ def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tupl
 def mail_refusal(pane: str, uuid: str) -> str | None:
     """Why nothing may be typed into pane for uuid right now, from fresh state; None when it may.
 
-    The pane must run that session, idle or done, with no sleep row on it (a `waking` row whose
+    The pane must run that session, idle or done (or a Claude pane `working` only on background
+    work while its prompt waits, see mail_ready_status), with no sleep row on it (a `waking` row whose
     session is back is the one exception) and, for kinds we can read, an empty composer: `agent
     prompt` into a draft would send the draft with it.
     """
@@ -2763,7 +2815,9 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
         return "no live agent in the pane"
     if (agent.get("agent_session") or {}).get("value") != uuid:
         return "the pane runs another session"
-    if agent.get("agent_status") not in SLEEPABLE_STATUSES:
+    profile = PROFILES.get(agent.get("agent"), {})
+    screen = herdr_screen(pane) if profile.get("idle_guards") or profile.get("exit") == "prompt" else None
+    if not mail_ready_status(agent, screen, read_screen=False):
         return f"status {agent.get('agent_status')}"
     row = read_json(JOURNAL).get(pane)
     # A displaced row keeps the handle of a session this pane no longer runs (manual resume
@@ -2771,9 +2825,8 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
     if isinstance(row, dict) and not (row.get("phase") == "waking" and row.get("uuid") == uuid) \
             and not (row.get("phase") == "displaced" and row.get("uuid") != uuid):
         return f"the pane is in the sleep journal ({row.get('phase', 'asleep')})"
-    profile = PROFILES.get(agent.get("agent"), {})
     if profile.get("idle_guards") or profile.get("exit") == "prompt":
-        state, detail = composer_state(herdr_screen(pane))
+        state, detail = composer_state(screen)
         if state != "empty":
             return f"composer {state}: {detail}"
     return None
@@ -4462,7 +4515,8 @@ def flush_box(uuid: str, agents: list[dict], now: float | None) -> None:
         return
     live = [a for a in agents if a.get("agent") and a.get("agent") != CLAIM_AGENT
             and (a.get("agent_session") or {}).get("value") == uuid]
-    target = next((a for a in live if a.get("agent_status") in SLEEPABLE_STATUSES), None)
+    target = next((a for a in live if a.get("agent_status") in SLEEPABLE_STATUSES), None) \
+        or next((a for a in live if mail_ready_status(a)), None)
     shown = target or (live[0] if live else None)
     name = (shown.get("name") or shown["pane_id"]) if shown else uuid
     with mailbox_lock(uuid, wait=False) as got:

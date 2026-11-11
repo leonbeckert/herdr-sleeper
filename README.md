@@ -85,6 +85,11 @@ The stub resets the pane's line discipline before it waits for Enter (*v0.1.19*)
 by a signal can leave the tty without CR-to-NL and signal keys, so Enter echoed `^M` and ctrl-c `^C`
 and the pane could not be woken by hand.
 
+Mail also goes into a Claude pane that Herdr reports as `working` only because background agents,
+shells or workflows still run while its prompt waits (*v0.1.20*): the line over the composer reads
+`✻ Waiting for … to finish` and the composer is empty. A running turn, a draft or an open menu still
+hold it. The background-task panel under the composer (`⏺ main`, one row per task) counts as footer.
+
 Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
 state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
 `uninstall` runs before removing the plugin: it stops the watcher, wakes
@@ -729,7 +734,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 427 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 434 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
