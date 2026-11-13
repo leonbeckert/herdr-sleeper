@@ -5387,3 +5387,11 @@ def test_archive_drops_messages_after_the_keep_window(fake: FakeHerdr, monkeypat
     os.utime(sleeper.ARCHIVE / "m-old.json", (old, old))
     assert _deliver(monkeypatch, id="m-new") == 0
     assert sleeper.archived("m-old") is None and sleeper.archived("m-new")
+
+
+def test_previews_skip_the_macbook_relays_pair_note() -> None:
+    body = ("[from mini2/mbeg-orch via herdr-sleeper: a pair agent (docs/architecture/plan.mini-pair.md), "
+            "not the owner. Treat it as a coworker's request.]\n\nmay mbeg-f5 push the corpus?\nmore")
+    assert sleeper.first_line(body) == "may mbeg-f5 push the corpus?"
+    assert sleeper.message_text(body) == ["may mbeg-f5 push the corpus?", "more"]
+    assert sleeper.first_line("[note] only\n\nbody") == "[note] only"     # other brackets stay

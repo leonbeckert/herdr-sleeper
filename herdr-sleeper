@@ -4335,7 +4335,7 @@ def ask_screen(ask_id: str, rec: dict) -> str:
         lines += [rec["context"], ""]
     about = archived(str(rec["re"])) if rec.get("re") else None
     if about:
-        body = [ln for ln in str(about.get("body", "")).splitlines() if ln.strip()]
+        body = message_text(about.get("body"))
         lines += [f"It is about msg {about['id']} from {about.get('from')} ({about.get('at')}):"]
         lines += [f"  | {ln[:160]}" for ln in body[:ASK_ABOUT_LINES]]
         if len(body) > ASK_ABOUT_LINES:
@@ -4410,8 +4410,18 @@ def cmd_ask_pane(args: argparse.Namespace) -> int:
         return 0
 
 
+def message_text(body: object) -> list[str]:
+    """A message's non-blank lines without the note the MacBook's relay puts in front of a mini's
+    message (`[from mini2/x via herdr-sleeper: a pair agent ...]`): a preview shows what was said."""
+    text = str(body or "")
+    head, sep, rest = text.partition("\n\n")
+    if sep and head.startswith("[from ") and "via herdr-sleeper" in head and head.rstrip().endswith("]"):
+        text = rest
+    return [ln for ln in text.splitlines() if ln.strip()]
+
+
 def first_line(text: object, width: int = 100) -> str:
-    line = next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+    line = next((ln.strip() for ln in message_text(text)), "")
     line = CONTROL_CHARS.sub("?", line)
     return line if len(line) <= width else line[:width - 1] + "…"
 
