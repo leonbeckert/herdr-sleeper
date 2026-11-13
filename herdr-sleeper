@@ -2927,9 +2927,13 @@ def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str,
                            "name the pane id instead")
     if live:
         return "live", live[0], None
+    # A displaced row answers to its session id or journal key only: its pane, and with it the
+    # pane's wake name, went to another session, and a delivery by that name belongs to the
+    # newcomer (mini2 wake-w3-p3: three days of mail for taxi-lying sat in a displaced row's box).
     hits = [(k, e) for k, e in journal.items()
-            if valid_entry(e) and target in (k, e["uuid"], e.get("name") or None, wake_name(e),
-                                             e.get("claude_name") or None)]
+            if valid_entry(e) and (target in (k, e["uuid"]) or (
+                e.get("phase") != "displaced"
+                and target in (e.get("name") or None, wake_name(e), e.get("claude_name") or None)))]
     # Herdr can drop a live agent's name (it keeps the pane and the title); the Claude session
     # name in its transcript survives. Only when nothing above matched by pane, name or session id.
     named = [a for a in agents if a.get("agent") == "claude"
@@ -3753,6 +3757,40 @@ def cmd_close(args: argparse.Namespace) -> int:
     return 0
 
 
+def pane_exists(pane: str) -> bool | None:
+    """Whether Herdr still has pane, from `pane list`; None when that could not be read."""
+    try:
+        panes = herdr("pane", "list").get("panes")
+    except SleeperError:
+        return None
+    if not isinstance(panes, list):
+        return None
+    return any(isinstance(p, dict) and p.get("pane_id") == pane for p in panes)
+
+
+def retire_displaced_row(key: str, entry: dict, name: str, by: str) -> tuple[bool, str, list[str]]:
+    """Drop a displaced row whose pane is gone: nothing on this machine is left to protect, and its
+    session runs elsewhere if anywhere (mini2 wake-w3-p3 resumed on mini1). Its queued mail is set
+    aside in the mailbox's retired-<time>/ directory, never deleted. Caller holds both locks."""
+    uuid = entry["uuid"]
+    journal = read_json(JOURNAL)
+    if not (isinstance(journal.get(key), dict) and journal[key].get("uuid") == uuid):
+        return False, f"the sleep row for {name} changed meanwhile; try again", ["row changed"]
+    mail = pending_mail(uuid)
+    if mail:
+        aside = MAILBOX / uuid / f"retired-{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}"
+        aside.mkdir(mode=0o700, exist_ok=True)
+        for path in mail:
+            os.replace(path, aside / path.name)
+    clear_mail_hold(uuid)
+    journal.pop(key)
+    write_json(JOURNAL, journal)
+    event("displaced-retired", uuid=uuid, name=name, pane=entry.get("pane_id"), by=by, mail_set_aside=len(mail))
+    kept = f"; {len(mail)} queued message(s) set aside in its mailbox (retired-*)" if mail else ""
+    return True, (f"dropped the displaced sleep row {name} ({uuid}): its pane {entry.get('pane_id')} is gone"
+                  f"{kept}. Resume it by hand with `claude --resume {uuid}` if it is still wanted"), []
+
+
 def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: float | None = None,
                   **fields: object) -> tuple[bool, str, list[str]]:
     """The core of `close`, also the watcher's for `close --self` (by "self", never forced): under the
@@ -3777,6 +3815,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
         if state == "asleep":
             info = herdr("pane", "get", str(hit["pane_id"]), check=False).get("pane") or {}
             phase = "orphaned" if is_orphan(str(key), hit) else hit.get("phase", "asleep")
+            if phase == "displaced" and not info and pane_exists(str(hit["pane_id"])) is False:
+                return retire_displaced_row(str(key), hit, name, by)
             if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
                     or info.get("agent") not in (None, CLAIM_AGENT):
                 return refused(f"the sleep row for {name} is {phase} and its pane is not provably its own; "

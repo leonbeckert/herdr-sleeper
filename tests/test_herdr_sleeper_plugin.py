@@ -5110,3 +5110,36 @@ def test_background_wait_is_claude_only(fake: FakeHerdr) -> None:
     assert not sleeper.mail_ready_status(other, BG_WAIT_SCREEN.format(composer=""), read_screen=False)
     blocked = {**fake.agents[0], "agent_status": "blocked"}         # a permission prompt never takes mail
     assert not sleeper.mail_ready_status(blocked, BG_WAIT_SCREEN.format(composer=""), read_screen=False)
+
+
+def test_a_displaced_row_answers_to_its_session_id_only(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    """mini2 wake-w3-p3, 2026-11-10..13: deliveries by the pane's wake name went into a displaced
+    row's mailbox while the pane's newcomer, which senders meant, never saw them."""
+    slept_entry(fake)
+    fake.agents[0] = agent(uuid="7d1c2a9e-5b3f-4e8a-9c1d-2f6b8a4e0c13", name="taxi-lying")  # the newcomer
+    j = journal(); j["w1:p1"]["phase"] = "displaced"; sleeper.write_json(sleeper.JOURNAL, j)
+    assert deliver(monkeypatch, "wake-w1-p1") == 1                   # no silent queue for a dead handle
+    assert "no live or sleeping agent matches 'wake-w1-p1'" in capsys.readouterr().err
+    assert sleeper.pending_mail(UUID) == []
+    assert deliver(monkeypatch, UUID, msg_id="m-uuid") == 3           # by session id it still queues
+    assert len(sleeper.pending_mail(UUID)) == 1
+
+
+def test_close_drops_a_displaced_row_whose_pane_is_gone_and_sets_its_mail_aside(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    j = journal(); j["w1:p1"]["phase"] = "displaced"; sleeper.write_json(sleeper.JOURNAL, j)
+    fake.agents[0] = agent(uuid="7d1c2a9e-5b3f-4e8a-9c1d-2f6b8a4e0c13", name="taxi-lying")
+    assert deliver(monkeypatch, UUID, msg_id="m-old") == 3
+    # while the pane is there (someone else's now), the row is still not ours to drop
+    assert _close(monkeypatch, UUID) == 1
+    assert "not provably its own" in capsys.readouterr().err and "w1:p1" in journal()
+    fake.agents.clear()                                                # the pane was closed
+    assert _close(monkeypatch, UUID) == 0
+    out = capsys.readouterr().out
+    assert "dropped the displaced sleep row" in out and "1 queued message(s) set aside" in out
+    assert journal() == {} and sleeper.pending_mail(UUID) == []
+    aside = list((sleeper.MAILBOX / UUID).glob("retired-*/*.json"))
+    assert len(aside) == 1 and "displaced-retired" in events()
+    assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)

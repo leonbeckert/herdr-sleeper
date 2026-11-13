@@ -90,6 +90,11 @@ shells or workflows still run while its prompt waits (*v0.1.20*): the line over 
 `✻ Waiting for … to finish` and the composer is empty. A running turn, a draft or an open menu still
 hold it. The background-task panel under the composer (`⏺ main`, one row per task) counts as footer.
 
+A displaced sleep row answers to its session id or journal key only (*v0.1.22*): its pane, and the
+pane's wake name with it, went to another session, so `deliver wake-w3-p3` reaches the newcomer or
+refuses, never the dead handle's mailbox. `close <session id>` drops a displaced row whose pane is
+gone and sets its queued mail aside in the mailbox's `retired-<time>/` directory.
+
 Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
 state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
 `uninstall` runs before removing the plugin: it stops the watcher, wakes
@@ -734,7 +739,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 434 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 437 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
