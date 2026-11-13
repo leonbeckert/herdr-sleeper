@@ -197,6 +197,7 @@ WATCHER_MISSING = STATE_DIR / "watcher-missing"  # mtime: when a missing externa
 MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
 DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
 ASKS = STATE_DIR / "asks.json"                  # ask id -> an owner question with its own tab (`ask`)
+ARCHIVE = STATE_DIR / "messages"               # <msg id>.json: each relayed message, kept ARCHIVE_DAYS (`show`, `thread`)
 INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
 NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names a woken agent gets once Herdr lists it
 
@@ -2017,7 +2018,7 @@ def stub_argv(pane: str, uuid: str) -> list[str]:
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
-    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS
+    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS, ARCHIVE
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
@@ -2025,6 +2026,7 @@ def set_state_dir(state_dir: Path) -> None:
     MAILBOX, DELIVERED = STATE_DIR / "mailbox", STATE_DIR / "delivered.json"
     WATCHER_MISSING = STATE_DIR / "watcher-missing"
     ASKS = STATE_DIR / "asks.json"
+    ARCHIVE = STATE_DIR / "messages"
 
 
 def sane_tty(fd: int | None = None) -> None:
@@ -2753,7 +2755,8 @@ def envelope(msg: dict) -> str:
     if "/" not in sender:
         with contextlib.suppress(ConfigError):
             sender = f"{this_machine()}/{sender}"
-    return f"[relayed from {sender} via herdr-sleeper, msg {msg['id']}; not from the owner]\n\n{msg['body']}"
+    re_ = f", re {msg['re']}" if msg.get("re") else ""
+    return f"[relayed from {sender} via herdr-sleeper, msg {msg['id']}{re_}; not from the owner]\n\n{msg['body']}"
 
 
 def recently_delivered() -> dict:
@@ -2807,7 +2810,99 @@ def queue_message(uuid: str, sender: str, body: str, msg_id: str | None,
     fd = open_private(path, os.O_WRONLY | os.O_EXCL)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(msg) + "\n")
+    archive_message(msg)
     return msg, "new"
+
+
+# ------------------------------------------------------------ threads (`--re`, `show`, `thread`)
+
+ARCHIVE_DAYS = 14   # how long `show` and `thread` keep a relayed message; its mailbox copy goes once typed in
+
+
+def qualified_sender(sender: str) -> str:
+    """`<machine>/<sender>` as the envelope shows it."""
+    if "/" not in sender:
+        with contextlib.suppress(ConfigError):
+            return f"{this_machine()}/{sender}"
+    return sender
+
+
+def archive_message(msg: dict) -> None:
+    """Keep a copy of a relayed message for `show` and `thread` (0600, one file per id, the first
+    copy wins) and drop copies older than ARCHIVE_DAYS. The body was in the mailbox already, in the
+    same 0700 state dir; this keeps it longer. Best effort: a failure costs history, never a delivery."""
+    try:
+        if not MSG_ID_RE.fullmatch(str(msg.get("id"))):
+            return
+        rec = dict(msg, **{"from": qualified_sender(str(msg.get("from", "?")))})
+        rec.setdefault("thread", msg.get("thread") or msg["id"])
+        rec.setdefault("at_ns", time.time_ns())  # orders messages of the same second
+        ensure_state_dir()
+        ARCHIVE.mkdir(mode=0o700, exist_ok=True)
+        path = ARCHIVE / f"{msg['id']}.json"
+        if not path.exists():
+            with os.fdopen(open_private(path, os.O_WRONLY | os.O_EXCL), "w") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        cutoff = time.time() - ARCHIVE_DAYS * 86400
+        for entry in os.scandir(ARCHIVE):
+            if entry.name.endswith(".json") and entry.stat().st_mtime < cutoff:
+                with contextlib.suppress(OSError):
+                    os.unlink(entry.path)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+
+def archived(msg_id: str) -> dict | None:
+    """The archived message with this id, or None."""
+    if not MSG_ID_RE.fullmatch(msg_id):
+        return None
+    try:
+        rec = json.loads((ARCHIVE / f"{msg_id}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def archive_all() -> list[dict]:
+    out: list[dict] = []
+    with contextlib.suppress(OSError):
+        for entry in os.scandir(ARCHIVE):
+            if entry.name.endswith(".json"):
+                rec = archived(entry.name[:-5])
+                if rec:
+                    out.append(rec)
+    return out
+
+
+def thread_of(ref: str) -> str:
+    """The thread a message or ask belongs to: its root's id. An id unknown here is its own root."""
+    rec = archived(ref)
+    if rec:
+        return str(rec.get("thread") or rec["id"])
+    ask = read_asks().get(ref)
+    if isinstance(ask, dict):
+        return str(ask.get("thread") or ref)
+    return ref
+
+
+def reply_target(ref: str, me: str | None) -> str:
+    """Where `deliver --re REF` with no target goes: back to whoever sent REF to the caller, by
+    session id when the sender's is known (it survives renames and sleep)."""
+    rec = archived(ref)
+    if rec is None:
+        raise SleeperError(f"no message {ref} on this machine to reply to; name the target")
+    if rec.get("kind") == OWNER_ANSWER:
+        raise SleeperError(f"msg {ref} is the owner's answer to an ask; answer the owner in your own session")
+    if not me or rec.get("to") != me:
+        raise SleeperError(f"msg {ref} was not sent to you; name the target")
+    sender = str(rec.get("from") or "")
+    machine, _, name = sender.rpartition("/")
+    session = rec.get("from_session")
+    if valid_session_id(session) and machine:
+        return f"{machine}/{session}"
+    if not sender_ok(sender):
+        raise SleeperError(f"msg {ref} has no sender to reply to; name the target")
+    return sender
 
 
 def mail_refusal(pane: str, uuid: str) -> str | None:
@@ -2973,6 +3068,18 @@ def context_sender(agents: list[dict]) -> str | None:
     return (hit or {}).get("name") or pane
 
 
+def calling_session() -> str | None:
+    """The session id of the agent in the calling pane, or None (a shell, another machine)."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return None
+    with contextlib.suppress(SleeperError):
+        hit = next((a for a in list_agents() if a["pane_id"] == pane), None)
+        uuid = ((hit or {}).get("agent_session") or {}).get("value")
+        return uuid if valid_session_id(uuid) else None
+    return None
+
+
 def cmd_deliver(args: argparse.Namespace) -> int:
     """Deliver a message (stdin) to a live or sleeping agent. Exit 0 delivered, 3 queued (it is
     typed in once the target is live and idle), 1 refused, 2 bad input."""
@@ -2984,6 +3091,29 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     if args.id is not None and not MSG_ID_RE.fullmatch(args.id):
         print("deliver: --id must match [A-Za-z0-9_-]{1,64}", file=sys.stderr)
         return 2
+    re_ref, thread = getattr(args, "re", None), getattr(args, "thread", None)
+    for flag, value in (("--re", re_ref), ("--thread", thread)):
+        if value is not None and not MSG_ID_RE.fullmatch(value):
+            print(f"deliver: {flag} must be a message or ask id ([A-Za-z0-9_-]{{1,64}})", file=sys.stderr)
+            return 2
+    from_session = getattr(args, "from_session", None)
+    if from_session is not None and not valid_session_id(from_session):
+        from_session = None
+    if not getattr(args, "here", False):
+        mine = calling_session()
+        from_session = mine
+        if re_ref and thread is None:
+            thread = thread_of(re_ref)
+        if not args.target:
+            if not re_ref:
+                print("deliver: name a target, or pass --re MSG to reply to its sender", file=sys.stderr)
+                return 2
+            try:
+                args.target = reply_target(re_ref, mine)
+            except SleeperError as exc:
+                print(f"deliver: {exc}", file=sys.stderr)
+                return 1
+    threading_ = {"re": re_ref, "thread": thread, "from_session": from_session}
     if not getattr(args, "here", False):
         try:
             label, args.target = route(args.target, getattr(args, "machine", None))
@@ -2991,7 +3121,7 @@ def cmd_deliver(args: argparse.Namespace) -> int:
             print(f"deliver: {exc}", file=sys.stderr)
             return 1
         if label:
-            return deliver_remote(label, args.target, body, args.sender, args.id)
+            return deliver_remote(label, args.target, body, args.sender, args.id, threading_)
     try:
         config, _src = load_config()
     except ConfigError as exc:
@@ -3015,7 +3145,8 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         return 1
     from_pane = os.environ.get("HERDR_PANE_ID")
     with mailbox_lock(uuid):
-        msg, status = queue_message(uuid, sender, body, args.id)
+        extra = {k: v for k, v in threading_.items() if v}
+        msg, status = queue_message(uuid, sender, body, args.id, extra=dict(extra, to_name=name))
         if status == "delivered":
             print(f"msg {msg['id']} was delivered already; not sent twice")
             return 0
@@ -4099,6 +4230,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         problem = f"at most {ASK_OPTIONS_MAX} options"
     if not problem and args.recommend is not None and not 1 <= args.recommend <= len(options):
         problem = "--recommend names an option by its number (1 = the first --option)"
+    ask_re = getattr(args, "re", None)
+    if not problem and ask_re is not None and not MSG_ID_RE.fullmatch(ask_re):
+        problem = "--re must be a message id"
     context = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read(DELIVER_MAX_BYTES + 1)
     if not problem and context.strip():
         problem = body_problem(context)
@@ -4126,6 +4260,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
            "question": args.question, "options": options, "recommend": args.recommend, "context": context.strip(),
            "pane": pane, "tab": tab, "tab_place": tab_place,
            "created": dt.datetime.now().isoformat(timespec="seconds")}
+    if ask_re:  # the relayed message this ask is about: the ask tab shows it, `thread` links them
+        rec.update(re=ask_re, thread=thread_of(ask_re))
     with locked():
         asks = read_asks()
         superseded = [(k, v) for k, v in asks.items() if v.get("uuid") == uuid and v.get("state") == "open"]
@@ -4189,11 +4325,22 @@ def withdraw_ask(ask_id: str, uuid: str) -> int:
     return 0
 
 
+ASK_ABOUT_LINES = 8
+
+
 def ask_screen(ask_id: str, rec: dict) -> str:
     lines = [f"{ASK_MARK}{rec.get('asker')} asks ({rec.get('asker_place') or '-'}, ask {ask_id}, "
              f"{rec.get('created')}):", "", f"  {rec.get('question')}", ""]
     if rec.get("context"):
         lines += [rec["context"], ""]
+    about = archived(str(rec["re"])) if rec.get("re") else None
+    if about:
+        body = [ln for ln in str(about.get("body", "")).splitlines() if ln.strip()]
+        lines += [f"It is about msg {about['id']} from {about.get('from')} ({about.get('at')}):"]
+        lines += [f"  | {ln[:160]}" for ln in body[:ASK_ABOUT_LINES]]
+        if len(body) > ASK_ABOUT_LINES:
+            lines.append(f"  | … `herdr-sleeper show {about['id']}` prints all of it")
+        lines.append("")
     for i, o in enumerate(rec.get("options") or [], 1):
         lines.append(f"  {i}) {o}" + ("   (recommended)" if rec.get("recommend") == i else ""))
     lines += [f"  {ASK_DISCUSS}) discuss it in the session first (it is told you are coming; this tab closes)", "",
@@ -4249,7 +4396,9 @@ def cmd_ask_pane(args: argparse.Namespace) -> int:
             config, _src = load_config()
             with mailbox_lock(rec["uuid"]):
                 msg, _status = queue_message(rec["uuid"], f"ask.{ask_id}", body, f"ask-{ask_id}",
-                                             extra={"kind": OWNER_ANSWER, "ask": ask_id})
+                                             extra={"kind": OWNER_ANSWER, "ask": ask_id, "re": ask_id,
+                                                    "thread": rec.get("thread") or ask_id,
+                                                    "to_name": rec.get("asker")})
                 code, text = finish_delivery(rec["uuid"], msg["id"], f"ask.{ask_id}", pane, config)
         except SleeperError as exc:
             print(f"Could not send it: {exc}\nPress Enter to try again.")
@@ -4259,6 +4408,132 @@ def cmd_ask_pane(args: argparse.Namespace) -> int:
         print(text)
         drop_ask_tab(rec)
         return 0
+
+
+def first_line(text: object, width: int = 100) -> str:
+    line = next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+    line = CONTROL_CHARS.sub("?", line)
+    return line if len(line) <= width else line[:width - 1] + "…"
+
+
+def thread_row(item: dict) -> str:
+    """One line of `thread`: when, who to whom, what."""
+    if item.get("kind") == "ask":
+        return (f"{str(item.get('created', '?'))[:16]}  ask {item['id']} [{item.get('state', '?')}] by "
+                f"{item.get('asker', '?')} ({item.get('asker_place') or '-'}) to the owner: {first_line(item.get('question'))}")
+    re_ = f" re {item['re']}" if item.get("re") else ""
+    who = "the owner" if item.get("kind") == OWNER_ANSWER else item.get("from", "?")
+    return (f"{str(item.get('at', '?'))[:16]}  msg {item['id']}{re_}  {who} -> {item.get('to_name') or item.get('to', '?')}: "
+            f"{first_line(item.get('body'))}")
+
+
+def item_order(item: dict) -> tuple[str, int]:
+    """Oldest first: by second, then by the archive's nanosecond stamp (asks have none)."""
+    at_ns = item.get("at_ns")
+    return str(item.get("at") or item.get("created") or "")[:19], at_ns if isinstance(at_ns, int) else 0
+
+
+def local_lookup(ref: str) -> dict | None:
+    rec = archived(ref)
+    if rec:
+        return dict(rec, kind=rec.get("kind") or "message")
+    ask = read_asks().get(ref)
+    return dict(ask, id=ref, kind="ask") if isinstance(ask, dict) else None
+
+
+def other_machines() -> list[str]:
+    try:
+        me = this_machine()
+        return sorted(m for m in saved_machines() if m != me)
+    except (SleeperError, ConfigError):
+        return []
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """`show ID`: a relayed message (or an ask) with what it answers and its replies here; looked
+    up on the other machines when this one does not have it."""
+    ref = args.id
+    if not MSG_ID_RE.fullmatch(ref):
+        print("show: give a message or ask id", file=sys.stderr)
+        return 2
+    item = local_lookup(ref)
+    if item is None:
+        if getattr(args, "here", False):
+            print(f"show: no message or ask {ref} on {this_machine()}", file=sys.stderr)
+            return 1
+        for label in other_machines():
+            with contextlib.suppress(SleeperError):
+                done = remote_sleeper(label, ["show", "--here", *(["--json"] if args.json else []), ref])
+                if done.returncode == 0:
+                    sys.stdout.write(done.stdout)
+                    return 0
+        print(f"show: no message or ask {ref} here or on {', '.join(other_machines()) or 'any saved machine'} "
+              f"(messages are kept {ARCHIVE_DAYS} days)", file=sys.stderr)
+        return 1
+    replies = sorted((r for r in archive_all() if r.get("re") == ref), key=item_order)
+    parent = local_lookup(str(item["re"])) if item.get("re") else None
+    if args.json:
+        print(json.dumps({"item": item, "parent": parent, "replies": replies}, indent=2))
+        return 0
+    if parent:
+        print(f"in reply to: {thread_row(parent)}\n")
+    if item["kind"] == "ask":
+        print(thread_row(item))
+        if item.get("context"):
+            print(f"\n{item['context']}")
+        for i, o in enumerate(item.get("options") or [], 1):
+            print(f"  {i}) {o}" + ("   (recommended)" if item.get("recommend") == i else ""))
+        if item.get("answer"):
+            print(f"\nanswer ({item.get('closed', '?')}): {item['answer']}")
+    else:
+        print(thread_row(item))
+        print(f"\n{item.get('body', '')}")
+    for r in replies:
+        print(f"\nreply: {thread_row(r)}")
+    print(f"\nthread {item.get('thread') or ref}: `herdr-sleeper thread {item.get('thread') or ref}`")
+    return 0
+
+
+def cmd_thread(args: argparse.Namespace) -> int:
+    """`thread ID`: every message and ask of ID's thread, on this machine and the others, oldest
+    first: who asked whom, and what came back."""
+    ref = args.id
+    if not MSG_ID_RE.fullmatch(ref):
+        print("thread: give a message or ask id", file=sys.stderr)
+        return 2
+    root = thread_of(ref)
+    items: dict[str, dict] = {}
+    for r in archive_all():
+        if (r.get("thread") or r.get("id")) == root:
+            items[r["id"]] = dict(r, kind=r.get("kind") or "message")
+    for k, v in read_asks().items():
+        if isinstance(v, dict) and (v.get("thread") or k) == root:
+            items[k] = dict(v, id=k, kind="ask")
+    problems: list[str] = []
+    if not getattr(args, "here", False):
+        for label in other_machines():
+            try:
+                done = remote_sleeper(label, ["thread", "--here", "--json", root])
+                for r in json.loads(done.stdout or "[]") if done.returncode == 0 else []:
+                    if isinstance(r, dict) and MSG_ID_RE.fullmatch(str(r.get("id"))):
+                        # the receiving side's copy knows the session it went to; the sent copy does not
+                        if r["id"] not in items or items[r["id"]].get("sent"):
+                            items[r["id"]] = r
+            except (SleeperError, ValueError) as exc:
+                problems.append(f"{label}: {exc}")
+    rows = sorted(items.values(), key=item_order)
+    if args.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print(f"thread {root}: nothing kept here (messages are kept {ARCHIVE_DAYS} days)")
+    else:
+        print(f"thread {root}: {len(rows)} item(s), oldest first")
+        for r in rows:
+            print("  " + thread_row(r))
+    for p_ in problems:
+        print(f"thread: {p_}", file=sys.stderr)
+    return 0
 
 
 # --------------------------------------------------------------- presence
@@ -4638,7 +4913,8 @@ def machines_presence(timeout: float, connect_timeout: int = 10) -> tuple[list[d
     return rows, problems
 
 
-def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_id: str | None) -> int:
+def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_id: str | None,
+                   threading_: dict | None = None) -> int:
     """deliver on another machine. The id is fixed here and printed when the outcome is unknown,
     so a retry with --id is deduplicated by the remote mailbox instead of typed in twice."""
     problem = remote_target_problem(target)
@@ -4655,8 +4931,13 @@ def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_i
         return 2
     msg_id = msg_id or hashlib.sha256(f"{who}\0{label}/{target}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
     event("deliver-remote", id=msg_id, sender=who, machine=label, to=target, bytes=len(body.encode()))
+    flags = [x for k in ("re", "thread", "from_session") if (threading_ or {}).get(k)
+             for x in (f"--{k.replace('_', '-')}", threading_[k])]  # only when set: an older remote knows none
+    archive_message({"id": msg_id, "from": who, "to": f"{label}/{target}", "to_name": f"{label}/{target}",
+                     "at": dt.datetime.now().isoformat(timespec="seconds"), "body": body, "sent": True,
+                     **{k: v for k, v in (threading_ or {}).items() if v}})
     try:
-        done = remote_sleeper(label, ["deliver", "--here", "--from", who, "--id", msg_id, "--", target], body,
+        done = remote_sleeper(label, ["deliver", "--here", "--from", who, "--id", msg_id, *flags, "--", target], body,
                               REMOTE_WAIT_SECONDS)
     except SleeperError as exc:
         event("deliver-remote-done", id=msg_id, machine=label, to=target, code=None, error=str(exc))
@@ -6575,7 +6856,11 @@ def main(argv: list[str] | None = None) -> int:
     lp.set_defaults(fn=cmd_log)
     sub.add_parser("on-focus", help="pane.focused hook (internal)").set_defaults(fn=lambda a: cmd_on_focus())
     dp = sub.add_parser("deliver", help="deliver a message (stdin) to a live or sleeping agent, waking it")
-    dp.add_argument("target", help="pane id, agent name, wake name, or session id")
+    dp.add_argument("target", nargs="?", help="pane id, agent name, wake name, or session id "
+                    "(with --re and no target: back to that message's sender)")
+    dp.add_argument("--re", help="the message or ask id this one answers; shown in the header, kept as a thread")
+    dp.add_argument("--thread", help=argparse.SUPPRESS)        # set by the sending machine
+    dp.add_argument("--from-session", dest="from_session", help=argparse.SUPPRESS)  # likewise: reply route
     dp.add_argument("--from", dest="sender", help="who sends it (default: the calling pane's agent name)")
     dp.add_argument("--id", help="message id for deduplication (default: generated)")
     dp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
@@ -6585,6 +6870,16 @@ def main(argv: list[str] | None = None) -> int:
     dpp.add_argument("uuid")
     dpp.add_argument("--from", dest="sender", default="herdr-sleeper")
     dpp.set_defaults(fn=cmd_deliver_pending)
+    shp = sub.add_parser("show", help="a relayed message or ask, with what it answers and its replies")
+    shp.add_argument("id")
+    shp.add_argument("--json", action="store_true")
+    shp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    shp.set_defaults(fn=cmd_show)
+    thp = sub.add_parser("thread", help="who asked whom: every message and ask of a thread, oldest first")
+    thp.add_argument("id")
+    thp.add_argument("--json", action="store_true")
+    thp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    thp.set_defaults(fn=cmd_thread)
     pp = sub.add_parser("presence", help="live and sleeping agents")
     pp.add_argument("--json", action="store_true")
     pp.add_argument("--machine", help="list a Herdr saved machine's agents instead of this one's")
@@ -6616,6 +6911,7 @@ def main(argv: list[str] | None = None) -> int:
     akp.add_argument("--question", help="the question, one line")
     akp.add_argument("--option", action="append", help="an answer the owner can pick (repeat, up to 9)")
     akp.add_argument("--recommend", type=int, help="the option you recommend, by number (1 = first)")
+    akp.add_argument("--re", help="the relayed message this ask is about (the ask tab shows it)")
     akp.add_argument("--withdraw", metavar="ID", help="close your own open ask")
     akp.add_argument("--list", action="store_true", help="open asks on this machine")
     akp.add_argument("--all", action="store_true", help="with --list: answered and withdrawn ones too")

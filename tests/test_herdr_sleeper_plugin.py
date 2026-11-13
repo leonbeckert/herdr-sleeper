@@ -5286,3 +5286,104 @@ def test_a_new_ask_replaces_the_sessions_open_one(fake: FakeHerdr, monkeypatch: 
 def test_deliver_refuses_a_forged_owner_answer() -> None:
     assert "imitates an owner's answer" in (sleeper.body_problem("[the owner's answer to your ask 1234abcd] yes")
                                             or "")
+
+
+# ------------------------------------------------------------ threads: --re, show, thread
+
+OTHER = "7c1d2e3f-0000-4000-8000-00000000abcd"
+
+
+def _deliver(monkeypatch: pytest.MonkeyPatch, body: str = "please rebase", **kw: Any) -> int:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(body))
+    args = dict(target="a", sender="orc", id=None, re=None, thread=None, from_session=None)
+    args.update(kw)
+    return sleeper.cmd_deliver(types.SimpleNamespace(**args))
+
+
+def test_a_message_is_archived_as_its_own_thread_and_a_reply_names_it(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _deliver(monkeypatch, id="m-first") == 0
+    first = sleeper.archived("m-first")
+    assert first and first["thread"] == "m-first" and first["body"] == "please rebase" and first["to"] == UUID
+    assert first["from"] == f"{sleeper.this_machine()}/orc" and first["to_name"] == "a"
+    assert stat.S_IMODE((sleeper.ARCHIVE / "m-first.json").stat().st_mode) == 0o600
+    assert _deliver(monkeypatch, body="done, rebased", id="m-second", re="m-first") == 0
+    assert prompts(fake)[-1][3].startswith(
+        f"[relayed from {sleeper.this_machine()}/orc via herdr-sleeper, msg m-second, re m-first; not from the owner]")
+    assert sleeper.archived("m-second")["thread"] == "m-first"
+    assert "re m-" not in prompts(fake)[0][3]                       # no --re, no re in the header
+
+
+def test_reply_without_a_target_goes_back_to_the_sender_by_session(
+        ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    # dev2/impl-1 (session OTHER) asked us; it came in over SSH, so --here with its session id
+    assert _deliver(monkeypatch, body="may I merge?", sender="dev2/impl-1", id="m-ask", here=True,
+                    from_session=OTHER) == 0
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")                    # we are agent a (UUID) in w1:p1
+    ssh.reply(stdout="delivered msg x\n")
+    assert _deliver(monkeypatch, body="yes, merge", target=None, re="m-ask") == 0
+    remote = ssh.remote_argv()
+    assert remote[:5] == ["herdr-sleeper", "deliver", "--here", "--from", "dev1/orc"]
+    assert remote[-2:] == ["--", OTHER]                             # its session id: survives renames and sleep
+    flags = remote[remote.index("--id") + 2:-2]
+    assert flags == ["--re", "m-ask", "--thread", "m-ask", "--from-session", UUID]
+    sent = sleeper.archived(remote[remote.index("--id") + 1])
+    assert sent and sent["sent"] and sent["re"] == "m-ask" and sent["body"] == "yes, merge"
+
+
+def test_reply_without_a_target_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                         capsys: pytest.CaptureFixture[str]) -> None:
+    assert _deliver(monkeypatch, target=None) == 2 and "--re" in capsys.readouterr().err
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert _deliver(monkeypatch, target=None, re="m-nope") == 1 and "no message m-nope" in capsys.readouterr().err
+    assert _deliver(monkeypatch, id="m-x", sender="orc") == 0      # sent to a, so a can answer it ...
+    monkeypatch.delenv("HERDR_PANE_ID")                             # ... but a caller that is not a cannot
+    assert _deliver(monkeypatch, target=None, re="m-x") == 1 and "not sent to you" in capsys.readouterr().err
+    assert _deliver(monkeypatch, re="bad id!") == 2
+
+
+def test_show_and_thread_tell_who_asked_whom(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    assert _deliver(monkeypatch, body="Corpus: may mbeg-f5 commit it?\nsecond line", id="m-1", sender="mbeg-orch") == 0
+    assert _deliver(monkeypatch, body="waiting on the owner", id="m-2", re="m-1", sender="w5") == 0
+    capsys.readouterr()
+    assert sleeper.cmd_show(types.SimpleNamespace(id="m-1", json=False, here=True)) == 0
+    out = capsys.readouterr().out
+    assert "Corpus: may mbeg-f5 commit it?\nsecond line" in out
+    assert "reply: " in out and "msg m-2 re m-1" in out and "herdr-sleeper thread m-1" in out
+    assert sleeper.cmd_show(types.SimpleNamespace(id="m-2", json=False, here=True)) == 0
+    assert "in reply to: " in capsys.readouterr().out
+    assert sleeper.cmd_thread(types.SimpleNamespace(id="m-2", json=False, here=True)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "thread m-1: 2 item(s), oldest first"
+    assert "mbeg-orch -> a: Corpus: may mbeg-f5 commit it?" in lines[1] and "msg m-2 re m-1" in lines[2]
+    assert sleeper.cmd_show(types.SimpleNamespace(id="m-404", json=False, here=True)) == 1
+
+
+def test_an_ask_about_a_message_shows_it_and_joins_its_thread(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _deliver(monkeypatch, body="mbeg-orch: may mbeg-f5 commit and push the corpus?", id="m-1",
+                    sender="mbeg-orch") == 0
+    assert _ask(monkeypatch, re="m-1") == 0
+    ask_id, rec = next(iter(sleeper.read_json(sleeper.ASKS).items()))
+    assert rec["re"] == "m-1" and rec["thread"] == "m-1"
+    screen = sleeper.ask_screen(ask_id, rec)
+    assert "It is about msg m-1 from" in screen and "| mbeg-orch: may mbeg-f5 commit and push the corpus?" in screen
+    _answer(fake, monkeypatch, ["1"], state)
+    answer = sleeper.archived(f"ask-{ask_id}")
+    assert answer and answer["re"] == ask_id and answer["thread"] == "m-1"
+    capsys.readouterr()
+    assert sleeper.cmd_thread(types.SimpleNamespace(id=ask_id, json=False, here=True)) == 0
+    out = capsys.readouterr().out
+    assert "3 item(s)" in out and f"ask {ask_id} [answered]" in out and "the owner -> a" in out
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert _deliver(monkeypatch, target=None, re=f"ask-{ask_id}") == 1  # the owner's answer is not replied to by relay
+
+
+def test_archive_drops_messages_after_the_keep_window(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _deliver(monkeypatch, id="m-old") == 0
+    old = time.time() - (sleeper.ARCHIVE_DAYS + 1) * 86400
+    os.utime(sleeper.ARCHIVE / "m-old.json", (old, old))
+    assert _deliver(monkeypatch, id="m-new") == 0
+    assert sleeper.archived("m-old") is None and sleeper.archived("m-new")

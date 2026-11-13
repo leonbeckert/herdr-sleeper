@@ -339,6 +339,37 @@ in `--json` (0/null without mail; a row from an older machine has none,
 which reads as unknown), and `[3 queued 122m: <reason>]` in the text listing
 and in the other-machine lines `ListAgents` gets.
 
+### Replies and threads (*v0.1.25*)
+
+A relayed message names its message id, and a reply names the message it
+answers, so a reader who sees only the reply can still reach the question:
+
+```sh
+echo "yes, merge it" | herdr-sleeper deliver --re 3f9a…        # no target: back to 3f9a's sender
+herdr-sleeper show 3f9a…      # the message, what it answers, and its replies
+herdr-sleeper thread 3f9a…    # who asked whom: every message and ask of the thread, oldest first
+```
+
+- `--re ID` takes a message id or an ask id. It shows in the header
+  (`[relayed from mini2/orc via herdr-sleeper, msg 7b2c…, re 3f9a…; not from
+  the owner]`), and the message joins ID's thread (a message without `--re`
+  starts its own).
+- **No target:** `deliver --re ID` goes back to whoever sent ID to the
+  calling session, by that sender's session id when it is known (it survives
+  renames and sleep; from another machine as `<machine>/<session id>`). It
+  refuses a message that was not sent to the caller, and an owner's answer
+  (answer the owner in your own session).
+- **Archive:** every message queued here is also kept in
+  `messages/<id>.json` (0600, in the same 0700 state dir whose mailbox held
+  the body already) for 14 days, then dropped; a message sent to another
+  machine keeps a sent copy here. `show` and `thread` read it. `show` looks
+  on the other saved machines when this one lacks the id, and `thread` asks
+  every saved machine, so a conversation that crossed machines reads as one.
+- **Asks:** `ask --re ID` ties an owner question to the relayed message it
+  is about. The ask tab then shows that message's first lines, so the owner
+  answers with the original ask in front of them, and the owner's answer
+  (msg `ask-<ask id>`, `re` the ask) joins the same thread.
+
 **Claude Code hooks.** `claude-hook` is a hook command for two built-in
 tools. Register it in `~/.claude/settings.json` as a `PostToolUse` hook with
 matcher `ListAgents` and a `PreToolUse` hook with matcher `SendMessage`:
