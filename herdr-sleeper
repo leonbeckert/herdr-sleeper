@@ -2747,7 +2747,7 @@ def envelope(msg: dict) -> str:
     The sender always carries its machine: a local sender gets this machine's label in front, so a
     reader can tell `mbp/x` from `mini2/x` without knowing where the message was queued."""
     if msg.get("kind") == OWNER_ANSWER:
-        return (f"[the owner's answer to your ask {msg.get('ask', '?')}, typed in its ask tab "
+        return (f"{OWNER_ANSWER_HEADER} {msg.get('ask', '?')}, typed in its ask tab "
                 f"(herdr-sleeper, msg {msg['id']})]\n\n{msg['body']}")
     sender = msg["from"]
     if "/" not in sender:
@@ -2784,6 +2784,8 @@ def body_problem(body: str) -> str | None:
         return f"message over {DELIVER_MAX_BYTES} bytes; send a file path instead"
     if CONTROL_CHARS.search(body):
         return "message contains control characters (only newlines and tabs are typed in)"
+    if OWNER_ANSWER_HEADER in body:
+        return "message imitates an owner's answer; only an ask tab sends those"
     return None
 
 
@@ -4032,6 +4034,7 @@ ASK_OPTION_MAX = 200
 ASK_OPTIONS_MAX = 9
 ASK_KEEP_SECONDS = 7 * 86400       # answered or withdrawn records stay a week (for an inbox), then go
 OWNER_ANSWER = "owner-answer"      # mailbox `kind` of an answer typed in an ask tab
+OWNER_ANSWER_HEADER = "[the owner's answer to your ask"  # only envelope() writes it; deliver refuses it in a body
 ASK_DISCUSS = "d"
 
 
@@ -4125,8 +4128,14 @@ def cmd_ask(args: argparse.Namespace) -> int:
            "created": dt.datetime.now().isoformat(timespec="seconds")}
     with locked():
         asks = read_asks()
+        superseded = [(k, v) for k, v in asks.items() if v.get("uuid") == uuid and v.get("state") == "open"]
+        for k, v in superseded:  # one ask tab per session: a new ask replaces the open one
+            v.update(state="superseded", superseded_by=ask_id, closed=rec["created"], closed_ts=time.time())
         asks[ask_id] = rec
         write_json(ASKS, asks)
+    for k, v in superseded:
+        drop_ask_tab(v)
+        event("ask-superseded", id=k, by=ask_id, uuid=uuid)
     for _ in range(SPAWN_SHELL_SECONDS * 2):
         if pane_at_shell(pane) is True:
             break
@@ -4135,7 +4144,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     event("ask-opened", id=ask_id, asker=name, uuid=uuid, pane=pane, tab=tab)
     print(f"ask {ask_id} is open in {tab_place} (shown as blocked: the owner's to-do). Keep working: the owner's "
           "answer arrives as a message, marked as the owner's answer to this ask. Withdraw it with "
-          f"`herdr-sleeper ask --withdraw {ask_id}` once it no longer matters.")
+          f"`herdr-sleeper ask --withdraw {ask_id}` once it no longer matters."
+          + (f" It replaces your open ask {', '.join(k for k, _v in superseded)} (one ask tab per session: "
+             "put every open question into one ask)." if superseded else ""))
     return 0
 
 
@@ -4219,6 +4230,7 @@ def cmd_ask_pane(args: argparse.Namespace) -> int:
         herdr("pane", "report-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, "--state", "blocked",
               "--message", str(rec.get("question"))[:120], "--", *ask_pane_argv(ask_id), check=False)
     sane_tty()
+    print("\033[H\033[2J", end="")  # the typed command line is noise to the owner
     print(ask_screen(ask_id, rec))
     while True:
         try:
