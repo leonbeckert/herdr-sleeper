@@ -289,7 +289,9 @@ class FakeHerdr:
                     raise sleeper.HerdrError(f"herdr pane report-agent failed: {{'code': '{self.reject_resume}'}}",
                                              self.reject_resume)
                 return {}
-            by_pane[args[2]]["agent"] = sleeper.CLAIM_AGENT
+            by_pane[args[2]]["agent"] = args[args.index("--agent") + 1] if "--agent" in args else sleeper.CLAIM_AGENT
+            if args[args.index("--agent") + 1:][:1] == [sleeper.ASK_AGENT]:
+                by_pane[args[2]]["agent_status"] = args[args.index("--state") + 1]
             if resume is not None:
                 self.resumes[args[2]] = resume
             return {}
@@ -297,6 +299,8 @@ class FakeHerdr:
             a = by_pane.get(args[2])
             if a is None:   # a closed pane: real herdr answers an error (callers pass check=False)
                 return {}
+            if a.get("agent") == sleeper.ASK_AGENT:
+                a.pop("agent", None)
             if a.get("agent") == sleeper.CLAIM_AGENT:
                 # Herdr forgets the releasing reporter's resume command, but only from a holder: a
                 # release with no claim (none survives a restart) leaves the saved command (lab, v0.9.5)
@@ -5143,3 +5147,125 @@ def test_close_drops_a_displaced_row_whose_pane_is_gone_and_sets_its_mail_aside(
     aside = list((sleeper.MAILBOX / UUID).glob("retired-*/*.json"))
     assert len(aside) == 1 and "displaced-retired" in events()
     assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
+
+
+
+# ------------------------------------------------------------- ask the owner
+
+def _ask(monkeypatch: pytest.MonkeyPatch, context: str = "", **kw: Any) -> int:
+    """`ask` from inside the agent in w1:p1 (its pid 101 is our ancestor)."""
+    import io
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1])
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(context))
+    args = dict(question="Deploy now or tonight?", option=["now", "tonight"], recommend=2, withdraw=None,
+                list=False, all=False, json=False)
+    args.update(kw)
+    return sleeper.cmd_ask(types.SimpleNamespace(**args))
+
+
+def test_ask_opens_a_tab_next_to_the_asker(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0].update(tab_id="w1:t1", workspace_id="w1")
+    fake.tab_labels, fake.workspace_labels = {"w1:t1": "api"}, {"w1": "ts"}
+    assert _ask(monkeypatch, context="The canary is green.\n") == 0
+    out = capsys.readouterr().out
+    (ask_id, rec), = sleeper.read_json(sleeper.ASKS).items()
+    assert rec["state"] == "open" and rec["uuid"] == UUID and rec["options"] == ["now", "tonight"]
+    assert rec["context"] == "The canary is green." and rec["asker"] == "a"
+    create = next(c for c in fake.calls if c[:2] == ("tab", "create"))
+    assert "❓ a" in create and create[create.index("--workspace") + 1] == "w1"
+    run = next(c for c in fake.calls if c[:2] == ("pane", "run"))
+    assert run[2] == rec["pane"] and f"ask-pane {ask_id}" in run[3]
+    assert f"ask {ask_id} is open in {sleeper.this_machine()} › ts › ❓ a" in out
+    assert _ask(monkeypatch, list=True) == 0 and ask_id in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"question": ""}, "--question is empty"),
+    ({"question": "two\nlines"}, "one line"),
+    ({"option": ["x"] * 10, "recommend": None}, "at most 9"),
+    ({"recommend": 3}, "--recommend names an option"),
+])
+def test_ask_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+                      kw: dict[str, Any], needle: str) -> None:
+    assert _ask(monkeypatch, **kw) == 2
+    assert needle in capsys.readouterr().err and not sleeper.ASKS.exists()
+
+
+def test_ask_needs_the_calling_agent(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                     capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [7])
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    args = types.SimpleNamespace(question="q?", option=None, recommend=None, withdraw=None, list=False,
+                                 all=False, json=False)
+    assert sleeper.cmd_ask(args) == 1 and "does not run under the agent" in capsys.readouterr().err
+
+
+def _answer(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, typed: list[str], state: Path) -> dict:
+    ask_id, rec = next(iter(sleeper.read_json(sleeper.ASKS).items()))
+    monkeypatch.setenv("HERDR_PANE_ID", rec["pane"])
+    monkeypatch.setattr(sleeper, "sane_tty", lambda fd=None: None)
+    feed = iter(typed)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(feed))
+    assert sleeper.cmd_ask_pane(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    return dict(sleeper.read_json(sleeper.ASKS)[ask_id], id=ask_id)
+
+
+def test_ask_pane_shows_blocked_and_sends_the_pick_as_the_owners_answer(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _ask(monkeypatch) == 0
+    prompts: list[str] = []
+    real = fake.__call__
+
+    def spy(*args: str, **kw: Any) -> Any:
+        if args[:2] == ("agent", "prompt"):
+            prompts.append(args[3])
+        if args[:2] == ("pane", "report-agent") and sleeper.ASK_AGENT in args:
+            assert "blocked" in args
+        return real(*args, **kw)
+    monkeypatch.setattr(sleeper, "herdr", spy)
+    rec = _answer(fake, monkeypatch, ["", "2"], state)
+    assert rec["state"] == "answered" and rec["answer"] == "option 2: tonight" and rec["delivered"]
+    assert prompts and prompts[-1].startswith(f"[the owner's answer to your ask {rec['id']}")
+    assert "relayed from" not in prompts[-1] and "A: option 2: tonight" in prompts[-1]
+    assert ("tab", "close", rec["tab"]) in fake.calls
+    assert not any(a.get("agent") == sleeper.ASK_AGENT for a in fake.agents)
+    assert "(recommended)" in capsys.readouterr().out
+
+
+def test_ask_pane_takes_free_text_and_discuss(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch) == 0
+    assert _answer(fake, monkeypatch, ["wait for Monday"], state)["answer"] == "wait for Monday"
+    assert _ask(monkeypatch) == 0
+    asks = sleeper.read_json(sleeper.ASKS)
+    open_id = next(k for k, v in asks.items() if v["state"] == "open")
+    sleeper.write_json(sleeper.ASKS, {open_id: asks[open_id]})
+    assert _answer(fake, monkeypatch, ["D"], state)["state"] == "discuss"
+
+
+def test_presence_does_not_list_ask_tabs(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                         capsys: pytest.CaptureFixture[str]) -> None:
+    assert _ask(monkeypatch) == 0
+    rec = next(iter(sleeper.read_json(sleeper.ASKS).values()))
+    fake("pane", "report-agent", rec["pane"], "--source", sleeper.ASK_SOURCE, "--agent", sleeper.ASK_AGENT,
+         "--state", "blocked")
+    capsys.readouterr()
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True)) == 0
+    assert [r["pane"] for r in json.loads(capsys.readouterr().out)] == ["w1:p1"]
+
+
+def test_ask_withdraw_is_the_askers_and_closes_the_tab(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    assert _ask(monkeypatch) == 0
+    ask_id, rec = next(iter(sleeper.read_json(sleeper.ASKS).items()))
+    other = dict(rec, uuid="someone-else")
+    sleeper.write_json(sleeper.ASKS, {ask_id: other})
+    assert _ask(monkeypatch, withdraw=ask_id) == 1 and "another session's ask" in capsys.readouterr().err
+    sleeper.write_json(sleeper.ASKS, {ask_id: rec})
+    assert _ask(monkeypatch, withdraw=ask_id) == 0
+    assert sleeper.read_json(sleeper.ASKS)[ask_id]["state"] == "withdrawn" and ("tab", "close", rec["tab"]) in fake.calls
+    # the tab's program, started again after a restart, sees it closed and closes the tab
+    monkeypatch.setenv("HERDR_PANE_ID", rec["pane"])
+    assert sleeper.cmd_ask_pane(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    assert "no longer open" in capsys.readouterr().out

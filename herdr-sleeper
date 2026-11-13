@@ -196,6 +196,7 @@ STOPPED = STATE_DIR / "stopped"                # `stop` was run: no watcher tick
 WATCHER_MISSING = STATE_DIR / "watcher-missing"  # mtime: when a missing external watcher was last reported
 MAILBOX = STATE_DIR / "mailbox"                # <uuid>/<ns>-<id>.json: messages not yet typed into their agent
 DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, so a retried send is not doubled
+ASKS = STATE_DIR / "asks.json"                  # ask id -> an owner question with its own tab (`ask`)
 INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
 NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names a woken agent gets once Herdr lists it
 
@@ -2016,13 +2017,14 @@ def stub_argv(pane: str, uuid: str) -> list[str]:
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
-    global MAILBOX, DELIVERED, WATCHER_MISSING
+    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
     WATCHER_LOCK, IDLE_FILE, STOPPED = STATE_DIR / "watcher.lock", STATE_DIR / "idle.json", STATE_DIR / "stopped"
     MAILBOX, DELIVERED = STATE_DIR / "mailbox", STATE_DIR / "delivered.json"
     WATCHER_MISSING = STATE_DIR / "watcher-missing"
+    ASKS = STATE_DIR / "asks.json"
 
 
 def sane_tty(fd: int | None = None) -> None:
@@ -2744,6 +2746,9 @@ def envelope(msg: dict) -> str:
     type it (an agent running with bypassed permissions must not take it for the owner's word).
     The sender always carries its machine: a local sender gets this machine's label in front, so a
     reader can tell `mbp/x` from `mini2/x` without knowing where the message was queued."""
+    if msg.get("kind") == OWNER_ANSWER:
+        return (f"[the owner's answer to your ask {msg.get('ask', '?')}, typed in its ask tab "
+                f"(herdr-sleeper, msg {msg['id']})]\n\n{msg['body']}")
     sender = msg["from"]
     if "/" not in sender:
         with contextlib.suppress(ConfigError):
@@ -2782,7 +2787,8 @@ def body_problem(body: str) -> str | None:
     return None
 
 
-def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tuple[dict, str]:
+def queue_message(uuid: str, sender: str, body: str, msg_id: str | None,
+                  extra: dict | None = None) -> tuple[dict, str]:
     """Write the message into the session's mailbox (0600). Returns (message, status): "new", or
     "pending" / "delivered" for an id already queued or delivered recently (never queued twice).
     Caller holds the mailbox lock."""
@@ -2794,7 +2800,7 @@ def queue_message(uuid: str, sender: str, body: str, msg_id: str | None) -> tupl
         if path.stem.split("-", 1)[-1] == msg_id:
             return {"id": msg_id}, "pending"
     msg = {"id": msg_id, "from": sender, "to": uuid, "at": dt.datetime.now().isoformat(timespec="seconds"),
-           "body": body}
+           "body": body, **(extra or {})}
     path = MAILBOX / uuid / f"{time.time_ns()}-{msg_id}.json"
     fd = open_private(path, os.O_WRONLY | os.O_EXCL)
     with os.fdopen(fd, "w") as fh:
@@ -4010,6 +4016,239 @@ def tend_self_closes(now: float | None = None) -> None:
             say(f"close --self of {name} waits: {loud}")
 
 
+# -------------------------------------------------------------------- ask
+# An agent that needs the owner's decision must not wait in a menu: a Claude menu turns its pane
+# `blocked` and no mail can be typed into it. `ask` opens a tab next to the asker instead. The tab
+# runs `ask-pane` (no LLM): it shows the question, reports itself to Herdr as agent "ask" in state
+# `blocked` (the owner's "needs me" in the sidebar), takes the owner's pick or text and queues it
+# for the asker like any mail (waking it), then closes. The asker keeps working meanwhile.
+
+ASK_AGENT = "ask"
+ASK_SOURCE = "herdr-sleeper-ask"
+ASK_MARK = "❓ "
+ASK_ID_RE = re.compile(r"[0-9a-f]{8}")
+ASK_QUESTION_MAX = 300
+ASK_OPTION_MAX = 200
+ASK_OPTIONS_MAX = 9
+ASK_KEEP_SECONDS = 7 * 86400       # answered or withdrawn records stay a week (for an inbox), then go
+OWNER_ANSWER = "owner-answer"      # mailbox `kind` of an answer typed in an ask tab
+ASK_DISCUSS = "d"
+
+
+def text_problem(text: str | None, what: str, limit: int) -> str | None:
+    if not text or not text.strip():
+        return f"{what} is empty"
+    if len(text) > limit:
+        return f"{what} is over {limit} characters"
+    if CONTROL_CHARS.search(text) or "\n" in text:
+        return f"{what} must be one line without control characters"
+    return None
+
+
+def read_asks() -> dict:
+    """Every ask record, dropping closed ones older than ASK_KEEP_SECONDS. A damaged file is set aside."""
+    try:
+        asks = read_json(ASKS)
+    except DamagedState as exc:
+        say(f"WARN {exc}; damaged ask records moved to {quarantine(ASKS)}")
+        return {}
+    now = time.time()
+    return {k: v for k, v in asks.items() if isinstance(v, dict)
+            and (v.get("state") == "open" or now - float(v.get("closed_ts") or now) < ASK_KEEP_SECONDS)}
+
+
+def ask_pane_argv(ask_id: str) -> list[str]:
+    """The ask tab's program as an argv (typed into the tab, and Herdr's resume command after a restart)."""
+    env_args = [f"{var}={os.environ[var]}" for var in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH") if os.environ.get(var)]
+    env_args.append(f"HERDR_SESSION={SESSION}")
+    return ["env", *env_args, str(SELF), "ask-pane", ask_id, str(STATE_DIR)]
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """`ask --question Q [--option O ...] [--recommend N]`, context on stdin: open an ask tab for
+    the calling agent's session. `ask --list [--json]`; `ask --withdraw ID` (the asker only)."""
+    if args.list:
+        asks = read_asks()
+        rows = [dict(v, id=k) for k, v in sorted(asks.items(), key=lambda kv: kv[1].get("created", ""))
+                if args.all or v.get("state") == "open"]
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        for r in rows:
+            print(f"{r['id']}  {r.get('state', '?'):9} {r.get('asker', '?'):28} {r.get('tab_place') or '-':40} "
+                  f"{r.get('question', '')}")
+        if not rows:
+            print("no open asks")
+        return 0
+    agents = list_agents()
+    hit, why = calling_agent(agents)
+    if hit is None:
+        print(f"ask: {why}; run it from your own agent's shell tool", file=sys.stderr)
+        return 1
+    uuid = hit["agent_session"]["value"]
+    if args.withdraw:
+        return withdraw_ask(args.withdraw, uuid)
+    problem = (text_problem(args.question, "--question", ASK_QUESTION_MAX)
+               or next((text_problem(o, "--option", ASK_OPTION_MAX) for o in args.option or []
+                        if text_problem(o, "--option", ASK_OPTION_MAX)), None))
+    options = list(args.option or [])
+    if not problem and len(options) > ASK_OPTIONS_MAX:
+        problem = f"at most {ASK_OPTIONS_MAX} options"
+    if not problem and args.recommend is not None and not 1 <= args.recommend <= len(options):
+        problem = "--recommend names an option by its number (1 = the first --option)"
+    context = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    if not problem and context.strip():
+        problem = body_problem(context)
+    if problem:
+        print(f"ask: {problem}", file=sys.stderr)
+        return 2
+    name = hit.get("name") or claude_session_name(transcript_for(uuid)) or hit["pane_id"]
+    places = ui_places(agents)
+    me = None
+    with contextlib.suppress(SleeperError):
+        me = this_machine()
+    asker_place = ui_place({"place": places.get(hit["pane_id"]), "machine": me})
+    ask_id = hashlib.sha256(f"{uuid}\0{time.time_ns()}\0{args.question}".encode()).hexdigest()[:8]
+    label = (ASK_MARK + name)[:40]
+    try:
+        made = herdr("tab", "create", "--cwd", str(hit.get("cwd") or Path.home()), "--label", label, "--no-focus",
+                     *(["--workspace", hit["workspace_id"]] if hit.get("workspace_id") else []))
+        pane, tab = made["root_pane"]["pane_id"], made["tab"]["tab_id"]
+    except (SleeperError, KeyError, TypeError) as exc:
+        print(f"ask: could not create a tab: {exc}", file=sys.stderr)
+        return 1
+    ws_label = (places.get(hit["pane_id"]) or "").split(PLACE_SEP)[0]
+    tab_place = ui_place({"place": f"{ws_label}{PLACE_SEP}{label}" if ws_label else None, "machine": me})
+    rec = {"state": "open", "uuid": uuid, "asker": name, "asker_pane": hit["pane_id"], "asker_place": asker_place,
+           "question": args.question, "options": options, "recommend": args.recommend, "context": context.strip(),
+           "pane": pane, "tab": tab, "tab_place": tab_place,
+           "created": dt.datetime.now().isoformat(timespec="seconds")}
+    with locked():
+        asks = read_asks()
+        asks[ask_id] = rec
+        write_json(ASKS, asks)
+    for _ in range(SPAWN_SHELL_SECONDS * 2):
+        if pane_at_shell(pane) is True:
+            break
+        time.sleep(0.5)
+    herdr("pane", "run", pane, shlex.join(ask_pane_argv(ask_id)), check=False)
+    event("ask-opened", id=ask_id, asker=name, uuid=uuid, pane=pane, tab=tab)
+    print(f"ask {ask_id} is open in {tab_place} (shown as blocked: the owner's to-do). Keep working: the owner's "
+          "answer arrives as a message, marked as the owner's answer to this ask. Withdraw it with "
+          f"`herdr-sleeper ask --withdraw {ask_id}` once it no longer matters.")
+    return 0
+
+
+def close_ask(ask_id: str, state: str, **fields: object) -> dict | None:
+    """Mark an open ask closed (answered, discuss, withdrawn) and return its record, or None if it
+    was not open. Takes the global lock."""
+    with locked():
+        asks = read_asks()
+        rec = asks.get(ask_id)
+        if not isinstance(rec, dict) or rec.get("state") != "open":
+            return None
+        rec.update(state=state, closed=dt.datetime.now().isoformat(timespec="seconds"), closed_ts=time.time(),
+                   **fields)
+        write_json(ASKS, asks)
+    return rec
+
+
+def drop_ask_tab(rec: dict) -> None:
+    """Release the ask tab's sidebar claim and close it. Best effort; the tab may be gone."""
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "release-agent", rec["pane"], "--source", ASK_SOURCE, "--agent", ASK_AGENT, check=False)
+        herdr("tab", "close", rec["tab"], check=False)
+
+
+def withdraw_ask(ask_id: str, uuid: str) -> int:
+    rec = read_asks().get(ask_id)
+    if not isinstance(rec, dict):
+        print(f"ask: no ask {ask_id}", file=sys.stderr)
+        return 1
+    if rec.get("uuid") != uuid:
+        print(f"ask: {ask_id} is another session's ask", file=sys.stderr)
+        return 1
+    rec = close_ask(ask_id, "withdrawn")
+    if rec is None:
+        print(f"ask {ask_id} is closed already")
+        return 0
+    drop_ask_tab(rec)
+    event("ask-withdrawn", id=ask_id, uuid=uuid)
+    print(f"ask {ask_id} withdrawn; its tab is closed")
+    return 0
+
+
+def ask_screen(ask_id: str, rec: dict) -> str:
+    lines = [f"{ASK_MARK}{rec.get('asker')} asks ({rec.get('asker_place') or '-'}, ask {ask_id}, "
+             f"{rec.get('created')}):", "", f"  {rec.get('question')}", ""]
+    if rec.get("context"):
+        lines += [rec["context"], ""]
+    for i, o in enumerate(rec.get("options") or [], 1):
+        lines.append(f"  {i}) {o}" + ("   (recommended)" if rec.get("recommend") == i else ""))
+    lines += [f"  {ASK_DISCUSS}) discuss it in the session first (it is told you are coming; this tab closes)", "",
+              "Type a number, d, or your own answer, then Enter. The answer goes to the session as yours.", ""]
+    return "\n".join(lines)
+
+
+def ask_answer(rec: dict, line: str) -> tuple[str, str] | None:
+    """(state, message body) for what the owner typed, or None for nothing usable."""
+    text = line.strip()
+    if not text or CONTROL_CHARS.search(text):
+        return None
+    options = rec.get("options") or []
+    if text.lower() == ASK_DISCUSS:
+        return "discuss", (f"Q: {rec.get('question')}\nA: the owner wants to discuss this with you here before "
+                           "deciding; wait for them in this session.")
+    if text.isdigit() and 1 <= int(text) <= len(options):
+        return "answered", f"Q: {rec.get('question')}\nA: option {text}: {options[int(text) - 1]}"
+    return "answered", f"Q: {rec.get('question')}\nA: {text}"
+
+
+def cmd_ask_pane(args: argparse.Namespace) -> int:
+    """The ask tab's program (internal): show the ask, hold the tab `blocked`, send the answer."""
+    set_state_dir(Path(args.state_dir))
+    ask_id = args.ask_id
+    rec = read_asks().get(ask_id) if ASK_ID_RE.fullmatch(ask_id) else None
+    pane = os.environ.get("HERDR_PANE_ID") or (rec or {}).get("pane")
+    if not isinstance(rec, dict) or rec.get("state") != "open":
+        print(f"ask {ask_id} is no longer open; closing this tab")
+        if isinstance(rec, dict):
+            drop_ask_tab(rec)
+        return 0
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "report-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, "--state", "blocked",
+              "--message", str(rec.get("question"))[:120], "--", *ask_pane_argv(ask_id), check=False)
+    sane_tty()
+    print(ask_screen(ask_id, rec))
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            return 1  # the terminal went away; the record stays open and Herdr's resume command reopens it
+        got = ask_answer(rec, line)
+        if got is None:
+            continue
+        state, body = got
+        if read_asks().get(ask_id, {}).get("state") != "open":
+            print("This ask was withdrawn meanwhile; nothing sent.")
+            drop_ask_tab(rec)
+            return 0
+        try:
+            config, _src = load_config()
+            with mailbox_lock(rec["uuid"]):
+                msg, _status = queue_message(rec["uuid"], f"ask.{ask_id}", body, f"ask-{ask_id}",
+                                             extra={"kind": OWNER_ANSWER, "ask": ask_id})
+                code, text = finish_delivery(rec["uuid"], msg["id"], f"ask.{ask_id}", pane, config)
+        except SleeperError as exc:
+            print(f"Could not send it: {exc}\nPress Enter to try again.")
+            continue
+        close_ask(ask_id, state, answer=body.split("\nA: ", 1)[-1], delivered=code == 0)
+        event("ask-answered", id=ask_id, uuid=rec["uuid"], state=state, delivered=code == 0)
+        print(text)
+        drop_ask_tab(rec)
+        return 0
+
+
 # --------------------------------------------------------------- presence
 
 PLACE_SEP = " › "
@@ -4066,7 +4305,7 @@ def presence_rows() -> list[dict]:
     agents = list_agents()
     places = ui_places(agents)
     for a in agents:
-        if not a.get("agent") or a.get("agent") == CLAIM_AGENT:
+        if not a.get("agent") or a.get("agent") in (CLAIM_AGENT, ASK_AGENT):
             continue
         rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name"), "pane": a["pane_id"],
                      "place": places.get(a["pane_id"]), "kind": a.get("agent"), "cwd": a.get("cwd"),
@@ -6361,6 +6600,19 @@ def main(argv: list[str] | None = None) -> int:
     clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     clp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
     clp.set_defaults(fn=cmd_close)
+    akp = sub.add_parser("ask", help="ask the owner in a tab of its own (shown blocked); context on stdin")
+    akp.add_argument("--question", help="the question, one line")
+    akp.add_argument("--option", action="append", help="an answer the owner can pick (repeat, up to 9)")
+    akp.add_argument("--recommend", type=int, help="the option you recommend, by number (1 = first)")
+    akp.add_argument("--withdraw", metavar="ID", help="close your own open ask")
+    akp.add_argument("--list", action="store_true", help="open asks on this machine")
+    akp.add_argument("--all", action="store_true", help="with --list: answered and withdrawn ones too")
+    akp.add_argument("--json", action="store_true")
+    akp.set_defaults(fn=cmd_ask)
+    app = sub.add_parser("ask-pane", help="an ask tab's program (internal)")
+    app.add_argument("ask_id")
+    app.add_argument("state_dir")
+    app.set_defaults(fn=cmd_ask_pane)
     ip = sub.add_parser("insomnia", help="keep the calling agent's own session awake (claim/release/list)")
     isub = ip.add_subparsers(dest="action", required=True)
     icp = isub.add_parser("claim", help="never sleep the calling agent's session until released")
