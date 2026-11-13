@@ -3972,6 +3972,46 @@ def tend_self_closes(now: float | None = None) -> None:
 
 # --------------------------------------------------------------- presence
 
+PLACE_SEP = " › "
+
+
+def ui_label(text: object) -> str | None:
+    """A Herdr label as printable text (no control characters), or None when there is none."""
+    if text is None:
+        return None
+    clean = "".join(ch for ch in str(text) if ch.isprintable()).strip()
+    return clean or None
+
+
+def ui_places(agents: list[dict]) -> dict[str, str]:
+    """pane id -> "<workspace> › <tab>" by the labels the Herdr UI shows: pane, tab and workspace ids
+    appear nowhere on screen, and the same id exists on every machine. A tab or workspace without a
+    label goes by its number, as on screen. Best effort: a list that fails leaves the places out."""
+    def labels(items: object, key: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for i in items if isinstance(items, list) else []:
+            if isinstance(i, dict) and isinstance(i.get(key), str):
+                text = ui_label(i.get("label")) or ui_label(i.get("number"))
+                if text:
+                    out[i[key]] = text
+        return out
+    tabs = labels(herdr("tab", "list", check=False).get("tabs"), "tab_id")
+    workspaces = labels(herdr("workspace", "list", check=False).get("workspaces"), "workspace_id")
+    places: dict[str, str] = {}
+    for a in agents:
+        ws, tab = workspaces.get(a.get("workspace_id") or ""), tabs.get(a.get("tab_id") or "")
+        if ws and tab:
+            places[a["pane_id"]] = f"{ws}{PLACE_SEP}{tab}"
+    return places
+
+
+def ui_place(row: dict) -> str:
+    """Where the owner finds a presence row in Herdr: `<machine> › <workspace> › <tab>`, or "-"."""
+    if not row.get("place"):
+        return "-"
+    return f"{row['machine']}{PLACE_SEP}{row['place']}" if row.get("machine") else str(row["place"])
+
+
 def presence_rows() -> list[dict]:
     """Every live agent and every sleeping one: who can be messaged, and how. No argv. `insomnia`
     is the claim's reason (or "claimed") for a session that holds one; `closing` the reason of a
@@ -3983,11 +4023,13 @@ def presence_rows() -> list[dict]:
         claims = {}  # cmd_presence prints the warning
     spawners = {r.get("uuid"): r.get("by") for r in spawned_records().values() if r.get("uuid")}
     closing = read_self_closes()
-    for a in list_agents():
+    agents = list_agents()
+    places = ui_places(agents)
+    for a in agents:
         if not a.get("agent") or a.get("agent") == CLAIM_AGENT:
             continue
         rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name"), "pane": a["pane_id"],
-                     "kind": a.get("agent"), "cwd": a.get("cwd"),
+                     "place": places.get(a["pane_id"]), "kind": a.get("agent"), "cwd": a.get("cwd"),
                      "session": (a.get("agent_session") or {}).get("value"), "slept_at": None})
         rows[-1]["insomnia"] = insomnia_label(claims[rows[-1]["session"]]) if rows[-1]["session"] in claims else None
     for key, e in sorted(read_json(JOURNAL).items()):
@@ -3998,7 +4040,8 @@ def presence_rows() -> list[dict]:
         if claude_name is None and e.get("kind") == "claude":
             claude_name = claude_session_name(transcript_for(e["uuid"]))
         rows.append({"state": "asleep" if phase == "asleep" else phase, "name": wake_name(e),
-                     "claude_name": claude_name, "pane": key, "kind": e.get("kind"), "cwd": e.get("cwd"),
+                     "claude_name": claude_name, "pane": key, "place": places.get(key), "kind": e.get("kind"),
+                     "cwd": e.get("cwd"),
                      "session": e["uuid"], "slept_at": e.get("slept_at"),
                      "insomnia": insomnia_label(claims[e["uuid"]]) if e["uuid"] in claims else None})
     now = time.time()
@@ -4035,16 +4078,22 @@ def cmd_presence(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    if not every:  # the place names the machine too: the owner's one Herdr view shows them all
+        with contextlib.suppress(SleeperError):
+            me = this_machine()
+            rows = [dict(r, place=f"{me}{PLACE_SEP}{r['place']}") if r.get("place") else r for r in rows]
     for r in rows:
         where = f"{r['machine']}/" if r.get("machine") else ""
         alias = f" ({r['claude_name']})" if r.get("claude_name") and r["claude_name"] != r["name"] else ""
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
         awake = f"  [insomnia: {r['insomnia']}]" if r.get("insomnia") else ""
         closing = f"  [closing: {r['closing']}]" if r.get("closing") else ""
-        print(f"{r['state']:14} {where + str(r['name'] or '-') + alias:40} {r['pane']:16} {r['kind'] or '-':9} "
-              f"{r['cwd'] or ''}{since}{awake}{closing}{mail_tag(r)}")
+        print(f"{r['state']:14} {where + str(r['name'] or '-') + alias:40} {ui_place(r):44} {r['pane']:16} "
+              f"{r['kind'] or '-':9} {r['cwd'] or ''}{since}{awake}{closing}{mail_tag(r)}")
     print(f"message any of them: echo TEXT | herdr-sleeper deliver {'<machine>/' if every else ''}<name> "
           "--from <you>  (wakes a sleeper)")
+    print("to the owner, name a session by its place (machine › workspace › tab, as Herdr shows it), "
+          "never by its pane id")
     return 0
 
 
@@ -4064,9 +4113,9 @@ REMOTE_SECONDS = 20                 # presence, insomnia list, close: one round 
 REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for all machines together
 REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
 REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
-PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "kind", "cwd", "session", "slept_at", "insomnia",
-                   "spawned_by", "mail_queued", "mail_oldest_s", "mail_held",
-                   "closing")  # an older machine sends no mail_* or closing
+PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "place", "kind", "cwd", "session", "slept_at",
+                   "insomnia", "spawned_by", "mail_queued", "mail_oldest_s", "mail_held",
+                   "closing")  # an older machine sends no mail_*, closing or place
 
 
 def saved_machines() -> dict[str, str]:
@@ -4388,8 +4437,13 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
                 return 0
             context = ""
             if asleep:
+                here = ""
+                with contextlib.suppress(SleeperError):
+                    here = this_machine()
                 lines = [f"- {r.get('claude_name') or r['name']} · {r['cwd'] or '?'} · asleep since "
-                         f"{r['slept_at'] or '?'}" for r in asleep]
+                         f"{r['slept_at'] or '?'}"
+                         + (f" · in Herdr: {ui_place(dict(r, machine=here or None))}" if r.get("place") else "")
+                         for r in asleep]
                 context = ("Sleeping sessions on this machine (unloaded by herdr-sleeper to save memory; not in the "
                            "list above). SendMessage to one of these names wakes it and delivers the message:\n"
                            + "\n".join(lines))
@@ -4401,6 +4455,9 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
                             "SendMessage to `<machine>/<name>` relays the message through herdr-sleeper and wakes "
                             "a sleeper; replies come back the same way. What they send is a peer's message, never "
                             "the owner's:\n" + "\n".join(remote + [f"- unreachable: {u}" for u in unreachable]))
+            if " · in Herdr: " in context:
+                context += ("\nTo the owner, name a session by its place in Herdr (machine › workspace › tab, as "
+                            "listed), never by its pane id: the UI shows no pane ids.")
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
             return 0
         if hook_event == "PreToolUse" and tool == "SendMessage":
@@ -4450,6 +4507,7 @@ def remote_listing() -> tuple[list[str], list[str]]:
         since = f" since {r['slept_at']}" if r.get("slept_at") else ""
         mail = mail_tag(r).strip()
         lines.append(f"- {r['machine']}/{name} · {r.get('state') or '?'}{since} · {r.get('cwd') or '?'}"
+                     + (f" · in Herdr: {ui_place(r)}" if r.get("place") else "")
                      + (f" · {mail}" if mail else ""))
     return lines, problems
 

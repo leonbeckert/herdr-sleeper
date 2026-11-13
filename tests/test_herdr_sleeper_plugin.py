@@ -144,6 +144,8 @@ class FakeHerdr:
         self.start_error: str | None = None      # error code `agent start` fails with
         self.start_errors: list[str] = []        # codes the next `agent start` calls fail with, one each
         self.tabs_made = 0
+        self.tab_labels: dict[str, str] = {}        # tab id -> the label `tab list` reports
+        self.workspace_labels: dict[str, str] = {}  # workspace id -> the label `workspace list` reports
 
     def restart(self, keep_resume: bool = True) -> None:
         """A Herdr server restart: every terminal gets a new id, saved labels come back, claims (hook
@@ -213,6 +215,11 @@ class FakeHerdr:
         if args[:2] == ("pane", "list"):
             return {"panes": [{"pane_id": a["pane_id"], "terminal_id": a.get("terminal_id"),
                                "cwd": a.get("cwd"), "label": a.get("label")} for a in self.agents]}
+        if args[:2] == ("tab", "list"):
+            return {"tabs": [{"tab_id": k, "label": v, "number": 1} for k, v in self.tab_labels.items()]}
+        if args[:2] == ("workspace", "list"):
+            return {"workspaces": [{"workspace_id": k, "label": v, "number": 1}
+                                   for k, v in self.workspace_labels.items()]}
         if args[:2] == ("agent", "get"):
             a = by_pane.get(args[2])
             return {"agent": a} if a else {}
@@ -1229,6 +1236,25 @@ def test_presence_lists_live_and_sleeping(fake: FakeHerdr, state: Path, capsys: 
     assert all("argv" not in r for r in rows)
 
 
+def test_presence_names_the_place_the_owner_sees(fake: FakeHerdr, state: Path,
+                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents.append({**agent(pane="w5:p1R", uuid="u2-session", name="unblocker", terminal="t2"),
+                        "tab_id": "w5:t1R", "workspace_id": "w5", "pid_hint": 102})
+    fake.agents.append({**agent(pane="w5:p2", uuid="u3-session", name="nolabel", terminal="t3"),
+                        "tab_id": "w5:t2", "workspace_id": "w5", "pid_hint": 103})
+    fake.tab_labels = {"w5:t1R": "unblocker", "w5:t2": "\x1b[31m7"}
+    fake.workspace_labels = {"w5": "ao"}
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True)) == 0
+    rows = {r["name"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows["unblocker"]["place"] == "ao › unblocker"
+    assert rows["nolabel"]["place"] == "ao › [31m7"            # control characters dropped
+    assert rows["a"]["place"] is None                           # no tab id known: no place
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False)) == 0
+    out = capsys.readouterr().out
+    me = sleeper.this_machine()
+    assert f"{me} › ao › unblocker" in out and "never by its pane id" in out
+
+
 def run_hook(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], payload: dict) -> dict | None:
     import io
     monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(json.dumps(payload)))
@@ -1245,6 +1271,12 @@ def test_hook_adds_sleepers_to_list_agents(fake: FakeHerdr, state: Path, monkeyp
     slept_entry(fake)
     out = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse", "tool_name": "ListAgents"})
     assert "ts-api-worker" in out["hookSpecificOutput"]["additionalContext"]
+    assert "in Herdr" not in out["hookSpecificOutput"]["additionalContext"]   # no labels known: no place
+    fake.agents[0].update(tab_id="w1:t1", workspace_id="w1")
+    fake.tab_labels, fake.workspace_labels = {"w1:t1": "api"}, {"w1": "ts"}
+    ctx = run_hook(monkeypatch, capsys, {"hook_event_name": "PostToolUse",
+                                         "tool_name": "ListAgents"})["hookSpecificOutput"]["additionalContext"]
+    assert f"in Herdr: {sleeper.this_machine()} › ts › api" in ctx and "never by its pane id" in ctx
 
 
 def test_hook_routes_send_message_to_a_sleeper(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
@@ -3929,11 +3961,12 @@ def test_presence_all_merges_machines_and_warns_for_an_unreachable_one(
         ssh: FakeSsh, fake: FakeHerdr, capsys: pytest.CaptureFixture[str]) -> None:
     remote = [{"state": "asleep", "name": "impl-1", "claude_name": "impl-1", "pane": "w2:p1", "kind": "claude",
                "cwd": "/Users/dev/development/klinikon", "session": "s", "slept_at": "2026-11-07T10:00:00",
-               "insomnia": None, "spawned_by": "dev1/orc"}]
+               "insomnia": None, "spawned_by": "dev1/orc", "place": "klinikon › impl"}]
     ssh.reply(stdout=json.dumps(remote))
     assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
     out = capsys.readouterr().out
     assert "dev1/a " in out and "dev2/impl-1" in out and "deliver <machine>/<name>" in out
+    assert "dev2 › klinikon › impl" in out
     assert sleeper.cmd_presence(types.SimpleNamespace(json=True, machine=None, all=True)) == 0
     rows = json.loads(capsys.readouterr().out)
     assert {(r["machine"], r["name"]) for r in rows} == {("dev1", "a"), ("dev2", "impl-1")}
