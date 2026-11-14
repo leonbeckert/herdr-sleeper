@@ -448,6 +448,19 @@ def test_composer_state_fails_closed() -> None:
     assert cs("❯ \n─── a rule I am drafting\n────────\n  ⏵⏵ bypass\n")[0] == "draft"
 
 
+def test_composer_rule_with_a_colour_code_remnant_is_still_the_rule() -> None:
+    """mini2 mbeg-orch 2026-11-14: a mis-parsed SGR left "2;136;136;136m" in front of the rule
+    under an empty composer, the rule wrapped onto a second line, and mail was held as a draft."""
+    cs = sleeper.composer_state
+    rule = "─" * 40
+    screen = f"⏺ done\n{rule}\n❯ \n;2;136;136;136m{rule}\n{'─' * 15}\n  ⏵⏵ bypass permissions on · ← 1 agent\n"
+    assert cs(screen) == ("empty", "")
+    assert cs(screen.replace("❯ \n", "❯ half-typed\n"))[0] == "draft"
+    assert cs(screen.replace(f";2;136;136;136m{rule}\n", f"  second line\n;2;136;136;136m{rule}\n"))[0] == "draft"
+    assert not sleeper.is_rule("12 minutes ───")       # text before a rule is still text
+    assert not sleeper.is_rule("m───") and sleeper.is_rule("[38;2;1;2;3m───") and sleeper.is_rule(";2;1m───")
+
+
 def test_manual_command_is_shell_safe() -> None:
     cmd = sleeper.manual_command({"cwd": "/tmp/my dir", "argv": ["--model", "it's"], "uuid": "u", "kind": "claude"})
     assert cmd == "cd '/tmp/my dir' && claude --model 'it'\"'\"'s' --resume u"

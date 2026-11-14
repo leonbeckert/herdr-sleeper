@@ -89,6 +89,8 @@ Mail also goes into a Claude pane that Herdr reports as `working` only because b
 shells or workflows still run while its prompt waits (*v0.1.20*): the line over the composer reads
 `✻ Waiting for … to finish` and the composer is empty. A running turn, a draft or an open menu still
 hold it. The background-task panel under the composer (`⏺ main`, one row per task) counts as footer.
+A colour code the terminal mis-parsed can leave its tail (`;2;136;136;136m`) in front of the rule under
+the composer and make that rule wrap onto a second line; both still count as the rule (*v0.1.28*).
 
 A displaced sleep row answers to its session id or journal key only (*v0.1.22*): its pane, and the
 pane's wake name with it, went to another session, so `deliver wake-w3-p3` reaches the newcomer or

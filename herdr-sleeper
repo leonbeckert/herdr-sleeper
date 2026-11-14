@@ -1102,8 +1102,13 @@ def typed_text(line: str) -> str:
                    if not dim and not (reverse and j + 1 < len(chars) and chars[j + 1][1]))
 
 
+# The tail of a colour code the terminal mis-parsed ("2;136;136;136m") can stay on screen in front
+# of a rule (mini2 mbeg-orch, 2026-11-14: mail held 90 min as a "draft"); it is not text.
+SGR_REMNANT = re.compile(r"^\[?;?[0-9][0-9;]*m")
+
+
 def is_rule(line: str) -> bool:
-    text = line.strip()
+    text = SGR_REMNANT.sub("", line.strip(), count=1)
     return len(text) >= 3 and set(text) <= {"─"}
 
 
@@ -1143,7 +1148,11 @@ def composer_state(screen: str | None) -> tuple[str, str]:
             rule = next((j for j, ln in enumerate(rest) if is_rule(ln)), None)
             if rule is None:  # a bare glyph with no box under it is not a composer we can vouch for
                 return "unknown", "no rule below the prompt"
-            if idx + 1 + rule != rules[-1]:  # the footer is skipped only below the composer's own box
+            # a rule that wraps (the remnant above made it wider than the pane) is one rule
+            end = rule
+            while idx + 2 + end < len(lines) and is_rule(lines[idx + 2 + end]):
+                end += 1
+            if idx + 1 + end != rules[-1]:  # the footer is skipped only below the composer's own box
                 return "unknown", "another rule below the prompt's box"
             below = sum(1 for ln in raw[idx + 1:idx + 1 + rule] if typed_text(ln).strip())
             if below:
