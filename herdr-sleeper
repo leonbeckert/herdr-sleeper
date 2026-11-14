@@ -2995,11 +2995,13 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
             size += len(text.encode()) + 2
         if not batch:
             break
+        # an auto-resume note: the slow checks first, then the pane and its composer, then the last look
+        if drop_stale_notes(batch, pane, uuid, name):
+            continue
         refusal = mail_refusal(pane, uuid)
         if refusal:
             return sent, refusal
-        # after mail_refusal's own calls, right before typing: someone may have typed meanwhile
-        if drop_stale_notes(batch, pane, uuid, name):
+        if drop_stale_notes(batch, pane, uuid, name, last_look=True):
             continue
         # a pending `close --self` is cancelled by what is typed in now, and the text says so
         closing = read_self_closes().get(uuid)
@@ -6253,6 +6255,7 @@ GATE_FRESH_SECONDS = 30         # an older probe vouches for nothing
 GATE_GAP_SECONDS = 60           # no probe for longer (a suspended watcher, a closed lid): start over
 GATE_STILL_DOWN_SECONDS = 3600
 GATE = {"up_since": None, "down_since": None, "checked": 0.0, "detail": "", "state": None, "still_down": False}
+GATE_FILE = STATE_DIR / "gate.json"  # {up_since, checked}: the watcher's gate for every typing path (resume_note_problem)
 STALLED: dict[str, dict] = {}       # pane -> {uuid, err, seq, first, backoff, focused, early}: watcher memory
 STALL_CACHE: dict[str, tuple] = {}  # transcript path -> ((size, mtime_ns), parsed tail)
 AUTO_RESUME_EVENTED: dict[str, float] = {}  # event key -> when: one event per error record (watcher memory)
@@ -6263,7 +6266,7 @@ class Stall(NamedTuple):
     at: float                  # the error record's time
     cls: str | None            # network | stream | server | edge; None: never resumed
     what: str                  # the field value that decided it, never message text
-    attempts: int              # notes already typed in for this error chain
+    attempts: int | None       # notes already typed in for this error chain; None: unknown (counts as spent)
     recent: int | None         # notes within AUTO_RESUME_WINDOW_SECONDS; None: unknown (counts as spent)
     recent_edge: int | None    # ... of which answered an edge challenge
     known: bool                # False: a record shape no classifier row covers
@@ -6392,6 +6395,9 @@ def parse_stall(lines: list[bytes], truncated: bool) -> dict | None:
                 closed -= 1
             else:
                 return None
+    else:
+        if truncated:
+            return None  # the turn began before the tail: its queue cannot be balanced
     notes: list[tuple[float | None, str | None]] = []
     waiting: list[int] = []   # indexes into notes whose error (further up) is not found yet
     chain, chain_open = 0, True
@@ -6420,8 +6426,9 @@ def parse_stall(lines: list[bytes], truncated: bool) -> dict | None:
         oldest = _stamp(rec.get("timestamp")) if rec and rec.get("timestamp") else None
         if oldest is not None:
             break
-    return {"error": _json_record(lines[error_at]), "notes": notes, "chain": chain, "truncated": truncated,
-            "oldest": oldest}
+    # a cut tail with no prompt before the notes may hide earlier notes of the chain: unknown (spent)
+    return {"error": _json_record(lines[error_at]), "notes": notes,
+            "chain": None if truncated and chain_open else chain, "truncated": truncated, "oldest": oldest}
 
 
 def stalled_turn(uuid: str, now: float) -> Stall | None:
@@ -6467,6 +6474,8 @@ def resume_cap(stall: Stall) -> int:
 
 def spent(stall: Stall) -> str | None:
     """Why no more notes go in for this stall (the budget), or None."""
+    if stall.attempts is None:
+        return "budget unknown (the transcript tail does not reach the error chain's start)"
     if stall.attempts >= resume_cap(stall):
         return f"{stall.attempts} notes in this error chain"
     if stall.recent is None:
@@ -6630,10 +6639,44 @@ def refresh_gate(now: float) -> None:
         elif not GATE["still_down"] and now - GATE["down_since"] >= GATE_STILL_DOWN_SECONDS:
             GATE["still_down"] = True
             event("auto-resume-gate", state="down", still_down=True, detail=detail, stalled=len(STALLED))
+    publish_gate()
     state = "up" if up else "down"
     if state != GATE["state"]:
         GATE["state"] = state
         event("auto-resume-gate", state=state, detail=detail, stalled=len(STALLED))
+
+
+def publish_gate() -> None:
+    """GATE's up_since and checked into GATE_FILE (atomic, 0600, no fsync: a lost write only holds notes;
+    a failed one removes the file)."""
+    try:
+        ensure_state_dir()
+        fd, tmp = tempfile.mkstemp(prefix=GATE_FILE.name + ".", suffix=".tmp", dir=GATE_FILE.parent)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps({"up_since": GATE["up_since"], "checked": GATE["checked"]}) + "\n")
+        os.replace(tmp, GATE_FILE)
+    except OSError as exc:  # an old record must not keep vouching: no file reads as "unknown"
+        with contextlib.suppress(OSError):
+            GATE_FILE.unlink()
+        say(f"WARN could not record the auto-resume gate: {exc}")
+
+
+def gate_vouches(queued_at: float, now: float) -> str | None:
+    """Why the gate does not vouch for a note queued at queued_at, or None: stable now (GATE_FILE, so a
+    `deliver` in another process sees what the watcher saw) and up without a break since the note was
+    queued. A failed probe after queueing resets up_since, so it invalidates every note queued before."""
+    try:
+        rec = json.loads(GATE_FILE.read_text())
+    except (OSError, ValueError):
+        return "the API gate is unknown"
+    up, checked = (rec.get("up_since"), rec.get("checked")) if isinstance(rec, dict) else (None, None)
+    if not _number(up) or not _number(checked):
+        return "the API gate is down"
+    if up > queued_at:
+        return "the API gate went down after the note was queued"
+    if now - up < GATE_UP_SECONDS or now - checked > GATE_FRESH_SECONDS:
+        return "the API gate is not stable now"
+    return None
 
 
 def gate_stable(now: float) -> bool:
@@ -6775,27 +6818,43 @@ def answer_stall(agent: dict, stall: Stall, config: dict) -> int:
 AUTO_RESUME_NOTE_TTL_SECONDS = 120  # the gate's word is this fresh at most: an older note is dropped (re-queued)
 
 
-def resume_note_problem(msg: dict, path: Path, pane: str, uuid: str) -> str | None:
+def resume_note_problem(msg: dict, path: Path, pane: str, uuid: str, last_look: bool = False) -> str | None:
     """Why a queued auto-resume note is stale and must not be typed in, or None. Every typing path
-    asks (type_mail: the watcher's flush, the 5 s retries, a `deliver` that flushes the box), right
-    before typing, so a note queued before the owner typed, before a watcher crash, before
-    auto_resume was turned off, or for another pane is dropped there. The note is only as good as
-    the gate when it was queued, so it lives AUTO_RESUME_NOTE_TTL_SECONDS; the tender queues a new
-    one while the stall is still due. Every candidate check runs again on fresh state."""
+    asks (type_mail: the watcher's flush, the 5 s retries, a `deliver` that flushes the box), so a
+    note queued before the owner typed, before a watcher crash, before auto_resume was turned off,
+    or for another pane or session is dropped there. The note lives AUTO_RESUME_NOTE_TTL_SECONDS and
+    only while the gate stays up (gate_vouches); the tender queues a new one while the stall is
+    still due. type_mail asks twice: the full check (every candidate check on fresh state) before
+    mail_refusal, and last_look (the gate and the transcript, both cheap) right before typing."""
     now = time.time()
     age = mail_age(path, now)
     if age is None or age > AUTO_RESUME_NOTE_TTL_SECONDS:
         return "queued too long ago (the API gate's word is stale)"
     if msg.get("expect_pane") != pane:
         return "the mail would go into another pane"
+    unvouched = gate_vouches(now - age, now)
+    if unvouched:
+        return unvouched
+    if last_look:
+        try:
+            stall = stalled_turn(uuid, now)
+        except Exception as exc:
+            return f"could not be checked ({type(exc).__name__})"
+        if stall is None:
+            return "the turn is no longer stalled (someone typed, or it went on)"
+        return None if stall.err_id == msg.get("expect_err") else "the error changed"
     agents = list_agents()  # a Herdr failure keeps the note queued, like any mail
     agent = next((a for a in agents if a["pane_id"] == pane), None)
     if agent is None:
         return "no agent in the pane"
+    if (agent.get("agent_session") or {}).get("value") != uuid:
+        return "the pane runs another session"
     try:
         config, _src = load_config()
         if not config["auto_resume"]:
             return "auto_resume is off"
+        if config["dry_run"]:
+            return "dry run"
         stall, why = resume_candidate(agent, agents, read_json(JOURNAL), config, now, resume_floor(now, create=False))
     except Exception as exc:  # a broken config, an unreadable journal or transcript: never type on a guess
         return f"could not be checked ({type(exc).__name__})"
@@ -6808,14 +6867,15 @@ def resume_note_problem(msg: dict, path: Path, pane: str, uuid: str) -> str | No
     return None
 
 
-def drop_stale_notes(batch: list[tuple[Path, dict]], pane: str, uuid: str, name: str) -> bool:
+def drop_stale_notes(batch: list[tuple[Path, dict]], pane: str, uuid: str, name: str,
+                     last_look: bool = False) -> bool:
     """Delete the batch's auto-resume notes that resume_note_problem refuses; True when any went.
     Dropped is not delivered: a later stall may queue the same id again. Caller holds the mailbox lock."""
     dropped = False
     for path, msg in batch:
         if msg.get("kind") != AUTO_RESUME_KIND:
             continue
-        stale = resume_note_problem(msg, path, pane, uuid)
+        stale = resume_note_problem(msg, path, pane, uuid, last_look)
         if stale:
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()

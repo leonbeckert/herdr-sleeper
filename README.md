@@ -711,16 +711,19 @@ done. The watcher continues such turns once the API answers again
   ticks in the same state, 20 s after the gate came up (5 minutes on a
   focused pane); 0, 1, 5, 15 minutes after each new error; at most 4 notes
   per error chain and 6 per session in 6 h (counted in the transcript, so
-  partial output between cuts does not reset it); then `mail_refusal`
+  partial output between cuts does not reset it; a cut tail that hides the
+  chain's start or the turn's prompt counts as spent); then `mail_refusal`
   (draft, menu, status, journal). At most 4 notes per tick, oldest error
   first. With a 60 s poll the wait between ticks ends early once a note is due.
-- Right before typing (after `mail_refusal`), in every path (the watcher's
-  flush, its 5 s retries, a `deliver` that flushes the box), the note is
-  checked again on fresh state: the same pane, every check above with the
-  config as it is now, and the same error still the last record. A note lives
-  2 minutes (the gate's word is no fresher); the tender queues a new one while
-  the stall is still due. Otherwise it is deleted (`auto-resume-dropped`),
-  never typed.
+- In every typing path (the watcher's flush, its 5 s retries, a `deliver`
+  that flushes the box) the note is checked again on fresh state: first every
+  check above, with the config as it is now (`dry_run` too) and the pane still
+  running that session; then `mail_refusal` (status, composer); then, right
+  before typing, the transcript once more. A note lives 2 minutes, and only
+  while the gate stays up without a break since it was queued (the watcher
+  publishes the gate in `gate.json`, so any process can check it). The tender
+  queues a new one while the stall is still due. Otherwise it is deleted
+  (`auto-resume-dropped`), never typed.
 - A pane whose stall will be answered is not slept (`scan` shows
   `auto-resume pending (…, gate unknown)`); a sleeper is never woken for it.
   At the cap: one `auto-resume-gave-up` event, and the pane may sleep.
@@ -845,7 +848,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 528 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 536 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

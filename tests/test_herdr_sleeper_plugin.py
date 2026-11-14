@@ -5499,6 +5499,7 @@ def ar_setup(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, *lin
 
 def gate_up(now: float) -> None:
     sleeper.GATE.update(up_since=now - 60, down_since=None, checked=now, state="up")
+    sleeper.publish_gate()
 
 
 def ar_prompts(fake: FakeHerdr) -> list[str]:
@@ -6041,7 +6042,7 @@ def test_a_note_is_checked_again_right_before_it_is_typed(fake: FakeHerdr, state
     assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
 
 
-@pytest.mark.parametrize("change", ["ttl", "off", "excluded", "config-broken"])
+@pytest.mark.parametrize("change", ["ttl", "off", "excluded", "config-broken", "dry-run"])
 def test_a_queued_note_obeys_what_holds_when_it_is_typed(change: str, fake: FakeHerdr, state: Path,
                                                          monkeypatch: pytest.MonkeyPatch) -> None:
     clock = queued(fake, state, monkeypatch)
@@ -6051,13 +6052,16 @@ def test_a_queued_note_obeys_what_holds_when_it_is_typed(change: str, fake: Fake
         sleeper.CONFIG_FILE.write_text("auto_resume = false\nexclude = []\n")
     elif change == "excluded":
         sleeper.CONFIG_FILE.write_text('auto_resume_exclude = ["a"]\nexclude = []\n')
+    elif change == "dry-run":
+        sleeper.CONFIG_FILE.write_text("dry_run = true\nexclude = []\n")
     else:
         sleeper.CONFIG_FILE.write_text("auto_resume = 3\n")
     sleeper.flush_mail(fake.agents)
     assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
     reason = ar_events("auto-resume-dropped")[-1]["reason"]
     assert reason == {"ttl": "queued too long ago (the API gate's word is stale)", "off": "auto_resume is off",
-                      "excluded": "excluded", "config-broken": "could not be checked (ConfigError)"}[change]
+                      "excluded": "excluded", "config-broken": "could not be checked (ConfigError)",
+                      "dry-run": "dry run"}[change]
 
 
 def test_a_probe_that_raises_closes_the_gate(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6069,3 +6073,92 @@ def test_a_probe_that_raises_closes_the_gate(state: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(sleeper, "probe_api", broken)
     sleeper.refresh_gate(T0 + 5)
     assert not sleeper.gate_stable(T0 + 5) and sleeper.GATE["detail"] == "probe failed (UnicodeDecodeError)"
+
+
+def test_activity_inside_the_validator_is_caught_before_typing(fake: FakeHerdr, state: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    real_work = sleeper.scheduled_work
+
+    def owner_types(uuid: str) -> str | None:     # the full check reads the transcript before this
+        write_transcript(state, *died(), said(clock["t"], "stop, I'll do it"))
+        return real_work(uuid)
+    monkeypatch.setattr(sleeper, "scheduled_work", owner_types)
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []      # the last look reads it again
+    assert ar_events("auto-resume-dropped")[-1]["reason"].startswith("the turn is no longer stalled")
+
+
+def test_a_draft_appearing_inside_the_validator_holds_the_note(fake: FakeHerdr, state: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    queued(fake, state, monkeypatch)
+    real_config = sleeper.load_config
+
+    def owner_starts_typing() -> Any:             # after the validator's own `agent list`
+        fake.screen = EMPTY_SCREEN.replace("❯ ", "❯ actually")
+        return real_config()
+    monkeypatch.setattr(sleeper, "load_config", owner_starts_typing)
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1    # mail_refusal comes after it
+
+
+def test_the_validator_wants_the_same_session_in_the_pane(fake: FakeHerdr, state: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    queued(fake, state, monkeypatch)
+    [path] = sleeper.pending_mail(UUID)
+    msg = json.loads(path.read_text())
+    other = "40603f77-21a6-4a16-9f2b-77a87efbc665"
+    write_transcript(state, *died(), uuid=other)  # a replacement session with the same records copied in
+    fake.agents[0]["agent_session"] = {"value": other}
+    assert sleeper.resume_note_problem(msg, path, "w1:p1", UUID) == "the pane runs another session"
+
+
+def test_a_note_dies_with_the_gate_it_was_queued_under(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    clock["t"] += 5
+    sleeper.refresh_gate(clock["t"])              # the probe fails: the Wi-Fi dropped again
+    probe["up"] = True
+    for _ in range(3):                            # up again and stable, but not since the note was queued
+        clock["t"] += 5
+        sleeper.refresh_gate(clock["t"])
+    assert sleeper.gate_stable(clock["t"])
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    assert ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate went down after the note was queued"
+    queued(fake, state, monkeypatch)
+    sleeper.GATE_FILE.unlink()                    # no watcher has published a gate here
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate is unknown"
+
+
+def test_a_cut_tail_that_hides_the_chain_or_the_turn_is_unknown(fake: FakeHerdr, state: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "TRANSCRIPT_TAIL_BYTES", 3000)
+    old = [replied(T0 - 7 * 3600 + i, "x" * 200) for i in range(30)]   # the tail reaches back past 6 h
+    notes = []
+    for i in range(3):
+        notes += [api_error(T0 - 3000 + 600 * i, err=f"{i:08x}"), note_typed(T0 - 2990 + 600 * i, f"{i:08x}")]
+    write_transcript(state, said(T0 - 8 * 3600), *old, said(T0 - 7 * 3600 + 100), *notes, api_error(T0 - 60))
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert stall.attempts == 3 and stall.recent == 3                    # the chain's prompt is in the tail
+    filler = [said(T0 - 6000 + i, f"[relayed from mini2/herdr-sleeper via herdr-sleeper, msg ar-{UUID[:8]}-{i:08x}; "
+                                  "not from the owner]\n\n" + "p" * 150) for i in range(20)]  # older notes of the chain
+    write_transcript(state, said(T0 - 8 * 3600), *old, said(T0 - 7 * 3600 + 100), *filler, *notes, api_error(T0 - 60))
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert stall.attempts is None and "error chain's start" in sleeper.spent(stall)
+    turn = [replied(T0 - 3000 + i, "y" * 200) for i in range(30)]       # one long turn, its prompt cut off
+    write_transcript(state, said(T0 - 8 * 3600), *old, said(T0 - 3100), *turn, api_error(T0 - 60))
+    assert sleeper.stalled_turn(UUID, T0) is None
+
+
+def test_a_gate_that_cannot_be_published_vouches_for_nothing(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate_up(T0)
+    assert sleeper.gate_vouches(T0 - 1, T0) is None
+
+    def full(*a: Any, **k: Any) -> Any:
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(sleeper.tempfile, "mkstemp", full)
+    sleeper.GATE.update(up_since=None)            # the probe failed; writing that fails too
+    sleeper.publish_gate()
+    assert not sleeper.GATE_FILE.exists() and sleeper.gate_vouches(T0 - 1, T0 + 1) == "the API gate is unknown"
