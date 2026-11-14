@@ -259,6 +259,22 @@ observed]*
 - *Instead:* when nothing matches, fall back to the Claude session name in the transcript (`agent-name`
   records), refusing on more than one match, live or sleeping, as everywhere else.
 
+**4.8 A turn that died on an API error looks idle.** *[version-specific: Claude Code 2.1.x]*
+- *Trap:* when the network drops, Claude Code retries for about three minutes, then ends the turn on
+  `API Error: Can't reach the API server … (ENOTFOUND)` and shows its prompt. Herdr reports the pane idle or done,
+  and the sleeper slept one after its window (`mbp › ao › klinikon-mr-ci`, 2026-11-13). Nothing tells the owner
+  which idle sessions stopped mid-task, so each one got a typed `continue`, a median of 86 minutes later.
+- *Evidence:* 45 days of MacBook transcripts: 204 API-error records, 67 of them transient (49 ENOTFOUND). Errors
+  come in clusters (4 sessions within a minute: one network loss). Claude's own retry never retries once part of a
+  response has streamed, and a `StopFailure` hook cannot continue a turn (its output is ignored).
+- *Instead:* read the transcript, not the screen. The last main-chain record is an `assistant` record with
+  `isApiErrorMessage`; from 2.1.317 `apiError` and `streamCutCause` say why, older records only the text. Gate on a
+  verified HTTPS answer from the API itself, probed outside the lock: a route or a DNS answer is not the API, a
+  captive portal fails TLS, and another Cloudflare edge answers 403. Type through the same mailbox and gates as any
+  message, and check right before typing that the error is still the last record (a note queued before the owner
+  typed must die there). Count the notes in the transcript over a fixed window, not since the last output: a
+  flapping link produces partial output before each new error, so a counter that resets on output never stops.
+
 ## 5. Unknown is not absent
 
 **5.1 Every missing or empty field in Herdr's API can mean "could not tell".** Each place we read one as "no"

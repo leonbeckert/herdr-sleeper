@@ -220,7 +220,8 @@ loops. An npm/bun install shows only its runtime to `lsof`, so it is never
 restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
-`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
+`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"),
+`auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one, but report it when it is
@@ -665,6 +666,70 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
   window. Events: `dialog-answered`, `limit-wait`, `limit-continue`,
   `limit-all-used-up`, `unknown-dialog`.
 
+### Auto-resume after a network or API error (*v0.1.27*)
+
+When the network drops, every running Claude turn ends within about three
+minutes (Claude's own retries are spent by then) on `API Error: Can't reach
+the API server … (ENOTFOUND)`, and the session sits at its prompt, idle or
+done. The watcher continues such turns once the API answers again
+(`auto_resume`, default on; plan: ansible-orchestration
+`docs/macos/plan.herdr-sleeper-auto-resume.md`, B-437):
+
+- Detection reads the transcript, never the screen: the last main-chain
+  record that counts must be an `assistant` record with
+  `isApiErrorMessage: true`. A prompt, an interrupt, a slash command, a
+  relayed message, a real reply, or a prompt still waiting in Claude's own
+  queue (after it, or queued during the turn and never taken) means someone
+  went on. Subagent, meta and bookkeeping records are skipped; a half-written
+  or damaged record there means no stall.
+- Resumed: network errors (`apiError` `connection_failed`, `no_response`,
+  `stream_idle_timeout`, `computer_slept`), cut streams (`streamCutCause`),
+  server errors (status 500–599, 529 included; the first try after 60 s), and
+  another Cloudflare edge's 403 challenge (after 120 s, at most 2 in 6 h).
+  Records before Claude Code 2.1.317 carry only the text; the known texts
+  count. Never: usage limits (the limit menu and Claude's own quota resume
+  handle those), logins, TLS, billing, invalid requests, an aborted stream,
+  and anything unknown (one `auto-resume-unclassified` event, field values
+  only).
+- The gate: `GET https://api.anthropic.com/api/hello` through
+  `/usr/bin/curl` (TLS verified, no curlrc) must answer 200 with `hello` for
+  10 s straight. It is probed only while stalls wait: every 5 s between ticks
+  (every 30 s after 10 minutes down), never under the lock.
+- The note goes through the mailbox like any message, as
+  `msg ar-<session8>-<error8>` from `herdr-sleeper`: `Auto-resume: your last
+  turn ended on an API error (connection_failed, attempt 1/4); the API
+  answers again. Continue the task you were on. Before repeating a step with
+  side effects (deploy, push, mail), check whether it already happened. No
+  reply needed.` One note per error record, across watcher restarts too.
+- Before it is queued: an idle or done claude pane, its session open in this
+  pane only, no journal row, no pending `close --self`, no scheduled wakeup or
+  cron, not in `auto_resume_exclude`, the error younger than
+  `auto_resume_max_age` (24 h) and than the first start of a v0.1.27 watcher
+  (`auto-resume.json`: the first deploy resumes nothing older); seen on two
+  ticks in the same state, 20 s after the gate came up (5 minutes on a
+  focused pane); 0, 1, 5, 15 minutes after each new error; at most 4 notes
+  per error chain and 6 per session in 6 h (counted in the transcript, so
+  partial output between cuts does not reset it); then `mail_refusal`
+  (draft, menu, status, journal). At most 4 notes per tick, oldest error
+  first. With a 60 s poll the wait between ticks ends early once a note is due.
+- Right before typing (after `mail_refusal`), in every path (the watcher's
+  flush, its 5 s retries, a `deliver` that flushes the box), the note is
+  checked again on fresh state: the same pane, every check above with the
+  config as it is now, and the same error still the last record. A note lives
+  2 minutes (the gate's word is no fresher); the tender queues a new one while
+  the stall is still due. Otherwise it is deleted (`auto-resume-dropped`),
+  never typed.
+- A pane whose stall will be answered is not slept (`scan` shows
+  `auto-resume pending (…, gate unknown)`); a sleeper is never woken for it.
+  At the cap: one `auto-resume-gave-up` event, and the pane may sleep.
+- Config: `auto_resume = false` (this machine), `auto_resume_max_age = "24h"`,
+  `auto_resume_exclude = ["name"]` (pane id, Herdr name, title or Claude
+  name; the sleep `exclude` does not count: orchestrators should continue).
+  Events: `auto-resume`, `auto-resume-gave-up`, `auto-resume-dropped`,
+  `auto-resume-unclassified`, `auto-resume-error`, `auto-resume-gate`. No
+  Pushover. Codex panes are not covered (Codex waits for its connection
+  itself).
+
 ## Safety rules (all fail closed)
 
 Inherited verbatim from the standalone script; the deltas the plugin
@@ -762,6 +827,14 @@ introduces are marked.
    not the tick. *v0.1.2:* no Herdr server is retried at the poll interval,
    not backed off; a missing external watcher is reported (see *Restarts and
    reboots*).
+8. *v0.1.27:* auto-resume types only into an idle claude pane whose
+   transcript's last main-chain record is a transient API error that no
+   prompt followed, only through the mailbox and `mail_refusal`, only after a
+   verified HTTPS answer from the API (probed outside the lock), within a
+   budget counted in the transcript, and only after the note is checked
+   again right before typing. An unknown error shape, an unreadable time or
+   transcript, a cut tail that does not reach back 6 h, or any failure means
+   no note.
 
 Known limits: SIGTERM leaves a small window between the final recheck and
 the process handling it (only a native Herdr operation could close it);
@@ -770,13 +843,15 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 437 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 528 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close (and `close --self`), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
+and close (and `close --self`), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), auto-resume (its
+classifier rows on 2.1.231–2.1.322 record shapes, the gate on a fake clock with a 60 s poll; an autouse fixture keeps
+every test off the network), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's
 `/usr/bin/python3`) and 3.12. The `state` fixture redirects every module-level
 path in the state dir, so a new state file cannot reach the live one. The fake does not prove what a real Herdr

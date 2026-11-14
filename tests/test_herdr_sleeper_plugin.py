@@ -88,7 +88,8 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
-    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS", "DIALOG_SEEN"):   # per-process watcher memory
+    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS", "DIALOG_SEEN",   # per-process watcher memory
+                 "STALLED", "STALL_CACHE", "AUTO_RESUME_EVENTED"):
         monkeypatch.setattr(sleeper, name, {})
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
         monkeypatch.delenv(var, raising=False)
@@ -476,7 +477,8 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
-                      "answer_dialogs": True, "limit_monitor": ""}
+                      "answer_dialogs": True, "limit_monitor": "", "auto_resume": True,
+                      "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": []}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -5395,3 +5397,662 @@ def test_previews_skip_the_macbook_relays_pair_note() -> None:
     assert sleeper.first_line(body) == "may mbeg-f5 push the corpus?"
     assert sleeper.message_text(body) == ["may mbeg-f5 push the corpus?", "more"]
     assert sleeper.first_line("[note] only\n\nbody") == "[note] only"     # other brackets stay
+
+
+# ------------------------------------------- v0.1.27: auto-resume after a network or API error
+
+T0 = 1_800_000_000.0          # the fake clock's start
+ERR = "1c9e33ab"              # first 8 hex of the error record's uuid
+CANT_REACH = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+PRISTINE_GATE = dict(sleeper.GATE)
+
+
+@pytest.fixture(autouse=True)
+def probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """No test reaches the network: the auto-resume gate's probe answers what `up` says, counts its
+    calls, and fails the test when it runs under the global lock."""
+    seen: dict[str, Any] = {"up": False, "calls": 0}
+
+    def fake_probe() -> tuple[bool, str]:
+        import fcntl
+        seen["calls"] += 1
+        if tmp_path in sleeper.LOCK.parents and sleeper.LOCK.exists():
+            with sleeper.LOCK.open("a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    pytest.fail("the API probe ran under the global lock")
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        return (True, "http 200") if seen["up"] else (False, "curl exit 6")
+    monkeypatch.setattr(sleeper, "probe_api", fake_probe)
+    monkeypatch.setattr(sleeper, "GATE", dict(PRISTINE_GATE))
+    monkeypatch.setattr(sleeper, "LAST_SKIP", {})
+    return seen
+
+
+def _at(t: float) -> str:
+    return sleeper.dt.datetime.fromtimestamp(t, sleeper.dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def api_error(t: float, err: str = ERR, version: str = "2.1.322", text: str = CANT_REACH, **fields: Any) -> str:
+    """An `isApiErrorMessage` record; with no fields, the 2.1.322 shape of ENOTFOUND."""
+    fields = fields or {"error": "server_error", "apiError": "connection_failed"}
+    return _line(type="assistant", isApiErrorMessage=True, timestamp=_at(t), version=version,
+                 uuid=f"{err}-0000-4000-8000-000000000000",
+                 message={"role": "assistant", "content": [{"type": "text", "text": text}]}, **fields)
+
+
+def said(t: float, text: str = "go on", **extra: Any) -> str:
+    return _line(type="user", timestamp=_at(t), message={"role": "user", "content": text}, **extra)
+
+
+def replied(t: float, text: str = "on it", **extra: Any) -> str:
+    return _line(type="assistant", timestamp=_at(t), message={"role": "assistant",
+                                                              "content": [{"type": "text", "text": text}]}, **extra)
+
+
+def note_typed(t: float, err: str = ERR) -> str:
+    """What Claude writes once an auto-resume note was typed in."""
+    return said(t, f"[relayed from mini2/herdr-sleeper via herdr-sleeper, msg ar-{UUID[:8]}-{err}; not from the "
+                   "owner]\n\nAuto-resume: your last turn ended on an API error")
+
+
+def write_transcript(state: Path, *lines: str, uuid: str = UUID) -> Path:
+    path = state / "projects" / "proj" / f"{uuid}.jsonl"
+    path.write_text("".join(lines))
+    return path
+
+
+def died(now: float = T0) -> list[str]:
+    """A turn that died on ENOTFOUND about three minutes ago."""
+    return [said(now - 400, "deploy it"), replied(now - 390), api_error(now - 185)]
+
+
+def ar_setup(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, *lines: str) -> dict[str, float]:
+    """A fake clock (time.sleep advances it), the floor a day back, and a transcript (default: died())."""
+    clock = {"t": T0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(sleeper.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    ticks = {"n": 0}
+
+    def time_ns() -> int:  # mailbox file names: the clock's, and never twice the same
+        ticks["n"] += 1
+        return int(clock["t"] * 1e9) + ticks["n"]
+    monkeypatch.setattr(sleeper.time, "time_ns", time_ns)
+    sleeper.write_json(sleeper.AUTO_RESUME, {"since": T0 - 86400})
+    write_transcript(state, *(lines or died()))
+    return clock
+
+
+def gate_up(now: float) -> None:
+    sleeper.GATE.update(up_since=now - 60, down_since=None, checked=now, state="up")
+
+
+def ar_prompts(fake: FakeHerdr) -> list[str]:
+    return [c[3] for c in prompts(fake) if "msg ar-" in c[3]]
+
+
+def ar_events(name: str) -> list[dict[str, Any]]:
+    p = sleeper.EVENTS
+    return [r for r in (json.loads(l) for l in p.read_text().splitlines()) if r["event"] == name] if p.exists() else []
+
+
+@pytest.mark.parametrize("version, fields, text, want", [
+    ("2.1.322", {"error": "server_error", "apiError": "connection_failed"}, CANT_REACH, ("network", "connection_failed")),
+    ("2.1.322", {"error": "server_error", "apiError": "no_response"}, "API Error: x", ("network", "no_response")),
+    ("2.1.322", {"error": "server_error", "apiError": "stream_idle_timeout"}, "x", ("network", "stream_idle_timeout")),
+    ("2.1.322", {"error": "server_error", "apiError": "computer_slept"}, "x", ("network", "computer_slept")),
+    *[("2.1.322", {"error": "server_error", "streamCutCause": c}, "x", ("stream", c)) for c in sorted(sleeper.STREAM_CUTS)],
+    ("2.1.312", {"error": "server_error", "streamCutCause": "stream_suspended"},
+     "API Error: Your computer went to sleep mid-response.", ("stream", "stream_suspended")),
+    ("2.1.231", {"error": "server_error", "apiErrorStatus": 529}, "API Error: 529 Overloaded.", ("server", "server_error 529")),
+    ("2.1.322", {"error": "overloaded", "apiErrorStatus": 529}, "x", ("server", "overloaded 529")),
+    ("2.1.231", {"error": "server_error", "apiErrorStatus": 500}, "API Error: 500 Internal", ("server", "server_error 500")),
+    ("2.1.306", {"error": "authentication_failed", "apiErrorStatus": 403},
+     "Please run /login · API Error: 403 Attention Required! | Cloudflare", ("edge", "cloudflare_challenge")),
+    # 2.1.312 and older carry the text only
+    ("2.1.312", {"error": "server_error"}, CANT_REACH, ("network", "connection_failed")),
+    ("2.1.300", {"error": "server_error"}, "API Error: The response stopped arriving. The re", ("stream", "stream_stopped")),
+    ("2.1.306", {"error": "server_error"}, "API Error: Connection lost mid-response.", ("stream", "connection_lost")),
+    ("2.1.301", {"error": "server_error"}, "API Error: Your computer went to sleep mid-response.", ("stream", "computer_slept")),
+    ("2.1.295", {"error": "server_error"}, "API Error: Server error mid-response.", ("stream", "server_error_mid_response")),
+    # never: an aborted stream (neither field on >= 2.1.317, whatever the text), limits, logins, the rest
+    ("2.1.322", {"error": "server_error"}, CANT_REACH, (None, "server_error")),
+    ("2.1.306", {"error": "rate_limit", "apiError": "usage_limit_reached", "apiErrorStatus": 429}, "You've hit", (None, "rate_limit")),
+    ("2.1.285", {"error": "rate_limit", "apiErrorStatus": 429}, "You've hit your session limit", (None, "rate_limit")),
+    ("2.1.306", {"error": "authentication_failed"}, "Not logged in · Please run /login", (None, "authentication_failed")),
+    ("2.1.322", {"error": "server_error", "apiError": "tls_untrusted_ca"}, "x", (None, "tls_untrusted_ca")),
+    ("2.1.322", {"error": "authentication_failed", "apiError": "network_edge_blocked", "apiErrorStatus": 403},
+     "Attention Required! | Cloudflare", (None, "authentication_failed")),
+    ("2.1.231", {"error": "invalid_request"}, "API Error: the safeguards flagged this message", (None, "invalid_request")),
+])
+def test_classify_api_error_rows(version: str, fields: dict, text: str, want: tuple) -> None:
+    cls, what, known = sleeper.classify_api_error(json.loads(api_error(T0, version=version, text=text, **fields)))
+    assert (cls, what) == want and known
+
+
+def test_classify_api_error_flags_shapes_it_does_not_know() -> None:
+    vetoed = json.loads(api_error(T0, error="rate_limit", apiError="connection_failed"))
+    assert sleeper.classify_api_error(vetoed) == (None, "rate_limit", True)   # a veto wins over the field next to it
+    vetoed = json.loads(api_error(T0, version="2.1.312", error="rate_limit"))
+    assert sleeper.classify_api_error(vetoed)[0] is None                       # ... and over the legacy text
+    for fields in ({"error": "server_error", "apiError": "brand_new"},
+                   {"error": "server_error", "streamCutCause": "user_abort"}):
+        cls, what, known = sleeper.classify_api_error(json.loads(api_error(T0, **fields)))
+        assert cls is None and not known and what in ("brand_new", "user_abort")
+    cls, _what, known = sleeper.classify_api_error(json.loads(api_error(T0, version="2.1.306", text="Weird", error="x")))
+    assert cls is None and not known
+
+
+def test_stalled_turn_reads_the_last_main_chain_record(fake: FakeHerdr, state: Path) -> None:
+    noise = [replied(T0 - 150, "subagent", isSidechain=True), api_error(T0 - 140, err="aaaaaaaa", isSidechain=True,
+                                                                      error="server_error", apiError="no_response"),
+             said(T0 - 130, "<session-start-hook>", isMeta=True), _line(type="system", subtype="turn_duration"),
+             _line(type="system", subtype="informational"), _line(type="summary", summary="x"),
+             _line(type="agent-name", agentName="a"), _line(type="custom-title", customTitle="t"),
+             _line(type="file-history-snapshot"), _line(type="attachment", attachment={"type": "hook_success"}),
+             _line(type="queue-operation", operation="enqueue"), _line(type="queue-operation", operation="dequeue")]
+    write_transcript(state, *died(), *noise)
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert stall == sleeper.Stall(ERR, sleeper._stamp(_at(T0 - 185)), "network", "connection_failed", 0, 0, 0, True)
+    owner = [said(T0 - 50, "hm?"), said(T0 - 50, "[Request interrupted by user]"),
+             _line(type="system", subtype="local_command", content="/login"),
+             _line(type="queue-operation", operation="enqueue"), replied(T0 - 50, "back")]
+    for line in owner:                                   # someone or something went on: nothing to resume
+        write_transcript(state, *died(), line)
+        assert sleeper.stalled_turn(UUID, T0) is None, line
+    write_transcript(state, said(T0 - 400), replied(T0 - 300), api_error(T0 - 185, isSidechain=True))
+    assert sleeper.stalled_turn(UUID, T0) is None        # a subagent's error is not the session's
+    write_transcript(state, said(T0 - 400), api_error(T0 - 185).replace(_at(T0 - 185), "yesterday"))
+    assert sleeper.stalled_turn(UUID, T0) is None        # an unparseable time is not "fresh"
+    write_transcript(state, *died(), '{"type":"user","message":{"role":"user","content":"wai')
+    assert sleeper.stalled_turn(UUID, T0) is None        # a half-written last record may be the owner's prompt
+    queued_in_turn = [said(T0 - 400, "deploy it"), _line(type="queue-operation", operation="enqueue"),
+                      replied(T0 - 300), api_error(T0 - 185)]
+    write_transcript(state, *queued_in_turn)
+    assert sleeper.stalled_turn(UUID, T0) is None        # a prompt the owner queued during the turn still waits
+    write_transcript(state, *queued_in_turn, _line(type="queue-operation", operation="dequeue"))
+    assert sleeper.stalled_turn(UUID, T0) is not None    # ... unless Claude took it
+
+
+def test_the_budget_holds_through_a_stream_cut_loop(fake: FakeHerdr, state: Path) -> None:
+    cut = {"error": "server_error", "streamCutCause": "stream_truncated"}
+    lines, t = [said(T0 - 5 * 3600, "build it")], T0 - 4 * 3600
+    for i in range(4):   # each note gets some real output before the link drops again
+        lines += [api_error(t, err=f"{i:08x}", **cut), note_typed(t + 30, f"{i:08x}"), replied(t + 60, "partial")]
+        t += 600
+    write_transcript(state, *lines, api_error(t, err="0000000f", **cut))
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert (stall.attempts, stall.recent) == (4, 4) and sleeper.spent(stall) == "4 notes in this error chain"
+    # a prompt between them ends the chain, not the 6 h budget; notes older than 6 h do not count
+    lines, t = [], T0 - 7 * 3600
+    for i in range(8):
+        lines += [said(t, "again"), api_error(t + 10, err=f"{i:08x}"), note_typed(t + 40, f"{i:08x}")]
+        t += 1800
+    write_transcript(state, *lines, api_error(T0 - 60, err="0000000f"))
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert (stall.attempts, stall.recent) == (1, 6) and sleeper.spent(stall) == "6 notes in 6 h"
+    edge = {"error": "authentication_failed", "apiErrorStatus": 403}
+    cf = "API Error: 403 Attention Required! | Cloudflare"
+    write_transcript(state, said(T0 - 7200), api_error(T0 - 3600, err="0000000a", text=cf, **edge),
+                     note_typed(T0 - 3400, "0000000a"), said(T0 - 3000), api_error(T0 - 2000, err="0000000b", text=cf, **edge),
+                     note_typed(T0 - 1800, "0000000b"), said(T0 - 1000), api_error(T0 - 300, err="0000000c", text=cf, **edge))
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert stall.cls == "edge" and stall.recent_edge == 2 and sleeper.spent(stall) == "2 edge-challenge notes in 6 h"
+
+
+def test_a_cut_tail_needs_six_hours_of_history_a_whole_one_does_not(fake: FakeHerdr, state: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    write_transcript(state, *died())
+    assert sleeper.spent(sleeper.stalled_turn(UUID, T0)) is None          # a young session, read from byte 0
+    monkeypatch.setattr(sleeper, "TRANSCRIPT_TAIL_BYTES", 2000)
+    padding = [replied(T0 - 3000 + i, "x" * 200) for i in range(30)]
+    write_transcript(state, said(T0 - 3600), *padding, *died())
+    assert sleeper.stalled_turn(UUID, T0).recent is None                  # cut, and nothing in it is 6 h old
+    assert "budget unknown" in sleeper.spent(sleeper.stalled_turn(UUID, T0))
+    old = [replied(T0 - 7 * 3600 + i, "x" * 200) for i in range(30)]
+    write_transcript(state, said(T0 - 8 * 3600), *old, *died())
+    stall = sleeper.stalled_turn(UUID, T0)
+    assert stall.recent == 0 and sleeper.spent(stall) is None              # the cut tail reaches back past 6 h
+
+
+def candidate(floor: float = T0 - 86400, **cfg: Any) -> tuple[Any, str]:
+    a = agent()
+    return sleeper.resume_candidate(a, [a], {}, {**sleeper.DEFAULTS, **cfg}, T0, floor)
+
+
+def test_candidate_floor_age_and_the_floor_file(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch)
+    stall, why = candidate()
+    assert stall.err_id == ERR and why == ""
+    write_transcript(state, said(T0 - 30 * 3600), api_error(T0 - 25 * 3600))
+    assert candidate()[1] == "the error is too old"
+    assert candidate(floor=T0 - 3 * 86400, auto_resume_max_age_hours=48.0)[1] == ""
+    write_transcript(state, *died())
+    a = agent()
+    assert sleeper.resume_candidate(a, [a], {}, sleeper.DEFAULTS, T0, T0 - 60)[1] == \
+        "the error is from before auto-resume was on"
+    sleeper.AUTO_RESUME.unlink()
+    assert sleeper.resume_floor(T0, create=False) == T0 and not sleeper.AUTO_RESUME.exists()   # scan only reads
+    assert sleeper.resume_floor(T0) == T0 and sleeper.read_json(sleeper.AUTO_RESUME) == {"since": T0}
+    assert sleeper.resume_floor(T0 + 999) == T0                            # a restart keeps the first start
+    sleeper.AUTO_RESUME.write_text("[1]")
+    assert sleeper.resume_floor(T0 + 5) == T0 + 5 and list(state.glob("state/auto-resume.json.damaged-*"))
+
+
+def test_gate_up_down_stale_and_sleep_gap(state: Path, probe: dict[str, Any]) -> None:
+    sleeper.refresh_gate(T0)
+    assert sleeper.GATE["state"] == "down" and not sleeper.gate_stable(T0)
+    probe["up"] = True
+    for t in (5, 10):
+        sleeper.refresh_gate(T0 + t)
+    assert sleeper.GATE["up_since"] == T0 + 5 and not sleeper.gate_stable(T0 + 10)
+    sleeper.refresh_gate(T0 + 15)
+    assert sleeper.gate_stable(T0 + 15) and sleeper.gate_label(T0 + 15) == "up"
+    calls = probe["calls"]
+    sleeper.refresh_gate(T0 + 17)
+    assert probe["calls"] == calls                                         # not due yet
+    assert not sleeper.gate_stable(T0 + 15 + 31)                           # a stale probe vouches for nothing
+    sleeper.refresh_gate(T0 + 15 + 61)                                     # the watcher was suspended: start over
+    assert sleeper.GATE["up_since"] == T0 + 76 and not sleeper.gate_stable(T0 + 76)
+    probe["up"] = False
+    sleeper.refresh_gate(T0 + 81)
+    assert sleeper.GATE["up_since"] is None and sleeper.GATE["down_since"] == T0 + 81  # any failure resets it
+    states = [e["state"] for e in ar_events("auto-resume-gate")]
+    assert states == ["down", "up", "down"]                                # changes only
+    t, calls = T0 + 81, probe["calls"]
+    while t < T0 + 81 + 600:
+        t += 5
+        sleeper.refresh_gate(t)
+    assert probe["calls"] - calls == 119                                   # every 5 s for 10 min
+    calls = probe["calls"]
+    for step in range(1, 7):                                               # down 10 min: every 30 s
+        sleeper.refresh_gate(t + 5 * step)
+    assert probe["calls"] - calls == 1
+    while t < T0 + 81 + 3700:
+        t += 30
+        sleeper.refresh_gate(t)
+    still = [e for e in ar_events("auto-resume-gate") if e.get("still_down")]
+    assert len(still) == 1 and still[0]["detail"] == "curl exit 6"
+
+
+def test_probe_api_wants_a_verified_200_with_hello(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The autouse fixture replaced sleeper.probe_api; a fresh copy of the module runs the real one
+    against a fake curl."""
+    mod = types.ModuleType("herdr_sleeper_probe")
+    mod.__file__ = str(SCRIPT)
+    exec(compile(SCRIPT.read_text(), str(SCRIPT), "exec"), mod.__dict__)
+    answers: dict[str, Any] = {}
+
+    def run(argv: list[str], **kw: Any) -> Any:
+        assert argv[:2] == ["/usr/bin/curl", "-q"] and argv[-1] == mod.GATE_URL and "-k" not in argv
+        if answers.get("raise"):
+            raise answers["raise"]
+        return types.SimpleNamespace(returncode=answers.get("rc", 0), stdout=answers.get("out", ""), stderr="")
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    answers.update(out='{"message": "hello"}\n200')
+    assert mod.probe_api() == (True, "http 200")
+    answers.update(out="<html>Attention Required! | Cloudflare</html>\n403")
+    assert mod.probe_api() == (False, "http 403")
+    answers.update(out="captive portal\n200")
+    assert mod.probe_api() == (False, "http 200 without hello")
+    answers.update(rc=60, out="")
+    assert mod.probe_api() == (False, "curl exit 60")                      # a portal fails TLS
+    answers.update(**{"raise": sleeper.subprocess.TimeoutExpired("curl", 8)})
+    assert mod.probe_api()[0] is False
+
+
+def test_auto_resume_end_to_end_with_a_60_s_poll(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = ar_setup(fake, state, monkeypatch)
+    cfg = {**sleeper.DEFAULTS, "poll_seconds": 60}
+    sleeper.watch_tick({}, cfg)                       # the first sighting; the Wi-Fi is still off
+    assert list(sleeper.STALLED) == ["w1:p1"] and probe["calls"] == 0 and prompts(fake) == []
+    sleeper.pause_watching_mail(60)                   # the gate is probed every 5 s between ticks
+    assert clock["t"] == T0 + 60 and probe["calls"] == 11
+    sleeper.watch_tick({}, cfg)
+    assert prompts(fake) == [] and sleeper.GATE["state"] == "down"
+    probe["up"] = True                                # the Wi-Fi is back
+    start = clock["t"]
+    sleeper.pause_watching_mail(60)                   # up at +5, stable at +15, due 20 s after it came up
+    assert clock["t"] == start + 25
+    sleeper.watch_tick({}, cfg)                       # this tick queues the note, its flush types it in
+    typed = ar_prompts(fake)
+    assert len(typed) == 1 and f"msg ar-{UUID[:8]}-{ERR}; not from the owner]" in typed[0]
+    assert "(connection_failed, attempt 1/4)" in typed[0] and "No reply needed." in typed[0]
+    rec = ar_events("auto-resume")[-1]
+    assert rec["err"] == ERR and rec["attempt"] == 1 and rec["pane"] == "w1:p1" and "body" not in rec
+    assert sleeper.pending_mail(UUID) == [] and f"ar-{UUID[:8]}-{ERR}" in sleeper.recently_delivered()
+    assert "auto-resumed w1:p1 (a) after connection_failed, attempt 1/4" in sleeper.LOGFILE.read_text()
+    sleeper.watch_tick({}, cfg)                       # before Claude writes it down: never a second note
+    assert len(ar_prompts(fake)) == 1
+    write_transcript(state, *died(), note_typed(clock["t"] + 1), replied(clock["t"] + 30, "deployed"))
+    sleeper.watch_tick({}, cfg)
+    assert sleeper.STALLED == {}
+    calls = probe["calls"]
+    sleeper.pause_watching_mail(60)
+    assert probe["calls"] == calls                    # no stall, no probe
+
+
+def test_auto_resume_waits_longer_on_a_focused_pane_and_needs_two_sightings(
+        fake: FakeHerdr, state: Path, probe: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = ar_setup(fake, state, monkeypatch)
+    fake.agents[0]["focused"] = True
+    probe["up"] = True
+    cfg = {**sleeper.DEFAULTS, "poll_seconds": 60}
+    typed_at = None
+    for _ in range(8):
+        sleeper.watch_tick({}, cfg)
+        if ar_prompts(fake):
+            typed_at = clock["t"]
+            break
+        sleeper.pause_watching_mail(60)
+    assert typed_at is not None and T0 + 5 + 300 <= typed_at <= T0 + 5 + 300 + 5   # the owner may be about to type
+    fake.calls.clear()
+    clock2 = ar_setup(fake, state, monkeypatch, *died(), api_error(T0 - 100, err="2c9e33ab"))
+    fake.agents[0]["focused"] = False
+    sleeper.STALLED.clear()
+    for _ in range(5):                                # the state moves every tick: never seen twice
+        fake.agents[0]["state_change_seq"] += 1
+        sleeper.watch_tick({}, cfg)
+        sleeper.pause_watching_mail(60)
+    assert ar_prompts(fake) == [] and clock2["t"] > T0
+
+
+def test_backoff_follows_the_class_and_the_attempt(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch, said(T0 - 900), api_error(T0 - 300, err="0000000a"),
+             note_typed(T0 - 290, "0000000a"), api_error(T0 - 10))
+    cfg = dict(sleeper.DEFAULTS)
+    for t in (0, 25):                                 # attempt 2: due 60 s after the error
+        gate_up(T0 + t)
+        sleeper.tend_api_errors(fake.agents, cfg, T0 + t)
+    assert sleeper.pending_mail(UUID) == []
+    gate_up(T0 + 55)
+    sleeper.tend_api_errors(fake.agents, cfg, T0 + 55)
+    body = json.loads(sleeper.pending_mail(UUID)[0].read_text())["body"]
+    assert "attempt 2/4" in body
+    sleeper.pending_mail(UUID)[0].unlink()
+    sleeper.STALLED.clear()
+    write_transcript(state, said(T0 - 900), api_error(T0 - 10, error="server_error", apiErrorStatus=529))
+    for t in (0, 25, 49):                             # a 529: the first try waits 60 s
+        gate_up(T0 + t)
+        sleeper.tend_api_errors(fake.agents, cfg, T0 + t)
+    assert sleeper.pending_mail(UUID) == []
+    gate_up(T0 + 51)
+    sleeper.tend_api_errors(fake.agents, cfg, T0 + 51)
+    assert "(server_error 529, attempt 1/4)" in json.loads(sleeper.pending_mail(UUID)[0].read_text())["body"]
+
+
+def test_at_most_four_notes_a_tick_oldest_error_first(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = ar_setup(fake, state, monkeypatch)
+    uuids = [f"{i}0603f77-21a6-4a16-9f2b-77a87efbc665" for i in range(1, 6)]
+    fake.agents = [agent(pane=f"w1:p{i + 2}", uuid=u, terminal=f"term-{i + 2}", name=f"s{i}") for i, u in enumerate(uuids)]
+    for i, u in enumerate(uuids):
+        write_transcript(state, said(T0 - 900), api_error(T0 - 100 - 10 * i, err=f"{i:08x}"), uuid=u)
+    cfg = dict(sleeper.DEFAULTS)
+    gate_up(T0)
+    sleeper.watch_tick({}, cfg)
+    clock["t"] += 30
+    gate_up(clock["t"])
+    sleeper.watch_tick({}, cfg)
+    typed = ar_prompts(fake)
+    assert len(typed) == 4 and not any(f"msg ar-{uuids[0][:8]}-" in t for t in typed)   # the newest waits
+    clock["t"] += 60
+    gate_up(clock["t"])
+    sleeper.watch_tick({}, cfg)
+    assert any(f"msg ar-{uuids[0][:8]}-" in t for t in ar_prompts(fake))
+
+
+@pytest.mark.parametrize("case", ["draft", "menu", "journal", "self-close", "scheduled", "exclude", "two-panes",
+                                  "working", "off", "dry-run"])
+def test_auto_resume_refusals(case: str, fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                              monkeypatch: pytest.MonkeyPatch) -> None:
+    lines = died()
+    if case == "scheduled":   # a pending wakeup resumes the session itself
+        lines = [said(T0 - 400), _tool("ScheduleWakeup", _at(T0 - 300), delaySeconds=1200), api_error(T0 - 185)]
+    ar_setup(fake, state, monkeypatch, *lines)
+    cfg = {**sleeper.DEFAULTS, "poll_seconds": 60, "exclude": ["a"]}  # the sleep keep-list never stops auto-resume
+    if case == "draft":
+        fake.screen = EMPTY_SCREEN.replace("❯ ", "❯ half a thought")
+    elif case == "menu":
+        fake.screen = PERMISSION
+    elif case == "journal":
+        sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {
+            "pane_id": "w1:p1", "uuid": "b28ffddd-0000-4000-8000-000000000000", "kind": "claude", "phase": "displaced",
+            "argv": [], "cwd": "/tmp/proj", "terminal_id": "term-1", "slept_at": "2026-11-09T10:00:00",
+            "wake_got": UUID}})
+    elif case == "self-close":
+        sleeper.write_json(sleeper.SELF_CLOSE, {UUID: {"at": T0 - 5, "name": "a", "pane": "w1:p1"}})
+        monkeypatch.setattr(sleeper, "tend_self_closes", lambda now=None: None)
+    elif case == "exclude":
+        cfg["auto_resume_exclude"] = ["a"]
+    elif case == "two-panes":
+        fake.agents.append(agent(pane="w1:p2", terminal="term-2", name="b"))
+    elif case == "working":
+        fake.agents[0]["agent_status"] = "working"
+    elif case == "off":
+        cfg["auto_resume"] = False
+    elif case == "dry-run":
+        cfg["dry_run"] = True
+    probe["up"] = True
+    for _ in range(4):
+        sleeper.watch_tick({}, cfg)
+        sleeper.pause_watching_mail(60)
+    assert ar_prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    if case in ("draft", "menu"):
+        assert sleeper.LAST_SKIP["w1:p1"].startswith("auto-resume waits: composer draft")
+    if case == "dry-run":
+        assert [e.get("dry_run") for e in ar_events("auto-resume")] == [True]
+        assert sleeper.LAST_SKIP["w1:p1"] == "would auto-resume (connection_failed, attempt 1/4) (dry run)"
+    if case in ("off", "working", "journal", "two-panes"):
+        assert probe["calls"] == 0                    # nothing stalled: the API is never probed
+
+
+def queued(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """A note the tender queued and no flush has typed in yet."""
+    clock = ar_setup(fake, state, monkeypatch)
+    cfg = dict(sleeper.DEFAULTS)
+    gate_up(T0)
+    sleeper.tend_api_errors(fake.agents, cfg, T0)
+    clock["t"] = T0 + 25
+    gate_up(clock["t"])
+    sleeper.tend_api_errors(fake.agents, cfg, clock["t"])
+    [path] = sleeper.pending_mail(UUID)
+    msg = json.loads(path.read_text())
+    assert msg["kind"] == "auto-resume" and msg["expect_pane"] == "w1:p1" and msg["expect_err"] == ERR
+    return clock
+
+
+def test_a_queued_note_is_dropped_once_the_owner_typed(fake: FakeHerdr, state: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    write_transcript(state, *died(), said(clock["t"], "never mind, I did it"))
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    assert f"ar-{UUID[:8]}-{ERR}" not in sleeper.recently_delivered()       # dropped, not delivered
+    assert ar_events("auto-resume-dropped")[-1]["reason"].startswith("the turn is no longer stalled")
+
+
+def test_a_concurrent_deliver_drops_the_stale_note_and_types_its_own(fake: FakeHerdr, state: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    write_transcript(state, *died(), said(clock["t"], "[Request interrupted by user]"))
+    assert deliver(monkeypatch, "a", body="please rebase") == 0
+    [typed] = prompts(fake)
+    assert "please rebase" in typed[3] and "msg ar-" not in typed[3]
+
+
+def test_a_note_left_by_a_restarted_watcher_is_checked_again(fake: FakeHerdr, state: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    queued(fake, state, monkeypatch)
+    for memory in (sleeper.STALLED, sleeper.STALL_CACHE, sleeper.AUTO_RESUME_EVENTED):
+        memory.clear()                                # a new watcher process
+    sleeper.GATE.update(PRISTINE_GATE)
+    sleeper.flush_mail(fake.agents)                   # still the same dead turn: it goes in
+    assert len(ar_prompts(fake)) == 1
+    fake.calls.clear()
+    write_transcript(state, *died(), api_error(T0 - 20, err="3c9e33ab"))
+    sleeper.STALLED.clear()
+    gate_up(T0)
+    sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, T0)
+    gate_up(T0 + 25)
+    sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, T0 + 25)
+    assert len(sleeper.pending_mail(UUID)) == 1
+    write_transcript(state, *died(), api_error(T0 - 20, err="3c9e33ab"), said(T0 + 26),
+                     api_error(T0 + 30, err="4c9e33ab"))  # the watcher died; the owner typed; a new error
+    sleeper.flush_mail(fake.agents)
+    assert ar_prompts(fake) == [] and ar_events("auto-resume-dropped")[-1]["reason"] == "the error changed"
+
+
+def test_a_second_pane_opening_the_session_drops_the_note(fake: FakeHerdr, state: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    queued(fake, state, monkeypatch)
+    fake.agents.append(agent(pane="w1:p2", terminal="term-2", name="b"))
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    assert ar_events("auto-resume-dropped")[-1]["reason"] == "session also open in another pane"
+
+
+def test_the_tender_never_waits_for_a_mailbox_lock(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch)
+    held = hold_flock(sleeper.MAILBOX / UUID / ".lock")   # a `deliver` holds it (and may want the global lock)
+    try:
+        gate_up(T0)
+        sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, T0)
+        gate_up(T0 + 25)
+        sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, T0 + 25)
+    finally:
+        held.close()
+    assert sleeper.pending_mail(UUID) == [] and sleeper.LAST_SKIP["w1:p1"] == f"auto-resume waits: {sleeper.MAIL_BUSY}"
+
+
+def test_a_stalled_pane_stays_awake_until_auto_resume_gives_up(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch)
+    cfg = {**sleeper.DEFAULTS, "idle_hours": 0.0}
+    sleeper.watch_tick({}, cfg)
+    assert journal() == {} and fake.signals == []
+    assert sleeper.LAST_SKIP["w1:p1"] == "auto-resume pending (connection_failed, attempt 1/4, gate unknown)"
+    lines = [said(T0 - 4000)]
+    for i in range(4):
+        lines += [api_error(T0 - 3000 + 600 * i, err=f"{i:08x}"), note_typed(T0 - 2990 + 600 * i, f"{i:08x}")]
+    write_transcript(state, *lines, api_error(T0 - 60))
+    sleeper.watch_tick({}, cfg)                       # the chain is spent: it sleeps like any idle pane
+    assert journal()["w1:p1"]["uuid"] == UUID
+    [gave] = ar_events("auto-resume-gave-up")
+    assert gave["err"] == ERR and gave["why"] == "4 notes in this error chain"
+
+
+def test_asleep_sessions_are_never_woken_for_it(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch)
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {**slept_entry(fake), "pane_id": "w1:p1"}})
+    fake.agents[0].update(agent=sleeper.CLAIM_AGENT)
+    fake.agents[0].pop("agent_session", None)
+    probe["up"] = True
+    for _ in range(3):
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+        sleeper.pause_watching_mail(60)
+    assert not [c for c in fake.calls if c[:2] == ("agent", "start")] and sleeper.pending_mail(UUID) == []
+
+
+def test_scan_shows_the_pending_auto_resume_and_never_probes(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                             monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    ar_setup(fake, state, monkeypatch)
+    sleeper.CONFIG_FILE.write_text('idle = "0h"\nexclude = []\n')
+    assert sleeper.main(["scan", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "keep  w1:p1" in out and "auto-resume pending (connection_failed, attempt 1/4, gate unknown)" in out
+    assert probe["calls"] == 0 and journal() == {}
+
+
+@pytest.mark.parametrize("text", ['auto_resume = "yes"\n', 'auto_resume_max_age = "0h"\n',
+                                  'auto_resume_max_age = "soon"\n', "auto_resume_max_age_hours = true\n",
+                                  "auto_resume_max_age_hours = inf\n", "auto_resume_exclude = [1]\n"])
+def test_auto_resume_config_is_checked(state: Path, text: str) -> None:
+    sleeper.CONFIG_FILE.write_text(text + "exclude = []\n")
+    with pytest.raises(sleeper.ConfigError):
+        sleeper.load_config()
+
+
+def test_auto_resume_config_values(state: Path) -> None:
+    sleeper.CONFIG_FILE.write_text('auto_resume = false\nauto_resume_max_age = "90m"\nauto_resume_exclude = "orc"\n'
+                                   "exclude = []\n")
+    values, source = sleeper.load_config()
+    assert values["auto_resume"] is False and values["auto_resume_max_age_hours"] == 1.5
+    assert values["auto_resume_exclude"] == ["orc"] and source["auto_resume_max_age_hours"] == str(sleeper.CONFIG_FILE)
+
+
+def test_a_malformed_record_costs_one_event_and_nothing_else(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = ar_setup(fake, state, monkeypatch, said(T0 - 400),
+                     api_error(T0 - 185, error="server_error", apiError=["connection_failed"]))
+    other = "30603f77-21a6-4a16-9f2b-77a87efbc665"
+    fake.agents.append(agent(pane="w1:p2", uuid=other, terminal="term-2", name="b"))
+    write_transcript(state, *died(), uuid=other)
+    probe["up"] = True
+    for _ in range(3):
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+        sleeper.pause_watching_mail(60)
+    [err] = ar_events("auto-resume-error")
+    assert err["pane"] == "w1:p1" and err["error"] == "TypeError" and clock["t"] > T0
+    typed = ar_prompts(fake)
+    assert len(typed) == 1 and f"msg ar-{other[:8]}-" in typed[0]      # the other pane is served as usual
+
+
+def test_an_unknown_record_shape_is_logged_once_by_its_fields(fake: FakeHerdr, state: Path, probe: dict[str, Any],
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    ar_setup(fake, state, monkeypatch, said(T0 - 400),
+             api_error(T0 - 185, text="secret words", error="server_error", apiError="brand_new"))
+    for _ in range(2):
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+    [rec] = ar_events("auto-resume-unclassified")
+    assert rec["apiError"] == "brand_new" and rec["version"] == "2.1.322" and rec["err"] == ERR
+    assert "secret words" not in sleeper.EVENTS.read_text() and sleeper.STALLED == {}
+
+
+def test_a_note_is_checked_again_right_before_it_is_typed(fake: FakeHerdr, state: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    real = sleeper.mail_refusal
+
+    def owner_types_meanwhile(pane: str, uuid: str) -> str | None:   # mail_refusal's calls take a while
+        write_transcript(state, *died(), said(clock["t"], "wait, not that"))
+        return real(pane, uuid)
+    monkeypatch.setattr(sleeper, "mail_refusal", owner_types_meanwhile)
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+
+
+@pytest.mark.parametrize("change", ["ttl", "off", "excluded", "config-broken"])
+def test_a_queued_note_obeys_what_holds_when_it_is_typed(change: str, fake: FakeHerdr, state: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = queued(fake, state, monkeypatch)
+    if change == "ttl":            # the watcher died after queueing; the gate's word is old by now
+        clock["t"] += sleeper.AUTO_RESUME_NOTE_TTL_SECONDS + 1
+    elif change == "off":
+        sleeper.CONFIG_FILE.write_text("auto_resume = false\nexclude = []\n")
+    elif change == "excluded":
+        sleeper.CONFIG_FILE.write_text('auto_resume_exclude = ["a"]\nexclude = []\n')
+    else:
+        sleeper.CONFIG_FILE.write_text("auto_resume = 3\n")
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    reason = ar_events("auto-resume-dropped")[-1]["reason"]
+    assert reason == {"ttl": "queued too long ago (the API gate's word is stale)", "off": "auto_resume is off",
+                      "excluded": "excluded", "config-broken": "could not be checked (ConfigError)"}[change]
+
+
+def test_a_probe_that_raises_closes_the_gate(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate_up(T0)
+    assert sleeper.gate_stable(T0)
+
+    def broken() -> tuple[bool, str]:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+    monkeypatch.setattr(sleeper, "probe_api", broken)
+    sleeper.refresh_gate(T0 + 5)
+    assert not sleeper.gate_stable(T0 + 5) and sleeper.GATE["detail"] == "probe failed (UnicodeDecodeError)"

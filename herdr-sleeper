@@ -109,6 +109,11 @@ rounds, the live-deployment iteration, and the v0.1.1 review (Fable, Grok):
    and a `watcher-missing` event at startup and (hourly at most) from any
    plugin activity, a header in `list`/`presence`, a note in the ListAgents
    hook. State files are synced (file, then directory; F_FULLFSYNC on macOS) before they count.
+8. Auto-resume (v0.1.27) types only into an idle claude pane whose last main-chain transcript
+   record is a transient API error no prompt followed, only through the mailbox and mail_refusal,
+   only after a verified HTTPS answer from the API (probed outside the lock), within a budget
+   counted in the transcript, and only after the note is checked again right before typing.
+   An unknown error shape, an unreadable time or transcript, or any failure means no note.
 
 Ideas adopted from the two community plugins studied before writing this
 (dalogax/herdr-agent-hibernate, prabhatgmp/herdr-park): the SIGTERM exit
@@ -249,6 +254,9 @@ DEFAULTS = {
     "machine_aliases": [],       # former labels still accepted: "old=new" (this machine's or a saved one's)
     "answer_dialogs": True,      # answer Claude's limit menu (option 1) and known one-time dialogs
     "limit_monitor": "",         # session told when every account slot is at its limit (mbp/dev-mini-setup)
+    "auto_resume": True,         # continue claude turns that died on a network or API error, once the API answers
+    "auto_resume_max_age_hours": 24.0,  # older errors are left alone (TOML: auto_resume_max_age = "24h")
+    "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
 }
 
 
@@ -690,6 +698,9 @@ def load_config() -> tuple[dict, dict[str, str]]:
                 values["idle_hours"], source["idle_hours"] = parse_duration(v), str(CONFIG_FILE)
             elif k == "pressure_idle":
                 values["pressure_idle_hours"], source["pressure_idle_hours"] = parse_duration(v), str(CONFIG_FILE)
+            elif k == "auto_resume_max_age":
+                values["auto_resume_max_age_hours"] = parse_duration(v)
+                source["auto_resume_max_age_hours"] = str(CONFIG_FILE)
             elif k in DEFAULTS:
                 values[k], source[k] = v, str(CONFIG_FILE)
             else:
@@ -725,25 +736,28 @@ def load_config() -> tuple[dict, dict[str, str]]:
                                   f"{legacy['exclude']!r}; merge it into {CONFIG_FILE} (or set `exclude = []`) "
                                   "and delete the old file")
     # validation: a bad config must never mean "no excludes" or "sleep everything"
-    for key in ("idle_hours", "poll_seconds", "max_live", "pressure_idle_hours"):
+    for key in ("idle_hours", "poll_seconds", "max_live", "pressure_idle_hours", "auto_resume_max_age_hours"):
         if isinstance(values[key], bool):  # TOML `false` would otherwise become 0.0 = sleep everything
             raise ConfigError(f"{key} must be a number, not a boolean")
     try:
         values["idle_hours"] = float(values["idle_hours"])
         values["poll_seconds"] = float(values["poll_seconds"])
         values["pressure_idle_hours"] = float(values["pressure_idle_hours"])
+        values["auto_resume_max_age_hours"] = float(values["auto_resume_max_age_hours"])
     except (TypeError, ValueError) as exc:
-        raise ConfigError(f"idle_hours/poll_seconds/pressure_idle_hours must be numbers: {exc}")
+        raise ConfigError(f"idle_hours/poll_seconds/pressure_idle_hours/auto_resume_max_age must be numbers: {exc}")
     if not math.isfinite(values["idle_hours"]) or values["idle_hours"] < 0:
         raise ConfigError(f"idle_hours must be a finite number >= 0, got {values['idle_hours']!r}")
     if not math.isfinite(values["pressure_idle_hours"]) or values["pressure_idle_hours"] <= 0:
         raise ConfigError("pressure_idle must be a finite duration > 0")
     values["pressure_idle_hours"] = min(values["pressure_idle_hours"], values["idle_hours"])  # never later than idle
+    if not math.isfinite(values["auto_resume_max_age_hours"]) or values["auto_resume_max_age_hours"] <= 0:
+        raise ConfigError("auto_resume_max_age must be a finite duration > 0")
     if not isinstance(values["max_live"], int) or values["max_live"] < 0:
         raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
-    for key in ("exclude", "agents", "wake_refuse_from"):
+    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude"):
         v = values[key]
         if isinstance(v, str):
             v = [v]
@@ -753,7 +767,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     unknown = [a for a in values["agents"] if a not in PROFILES]
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
-    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs"):
+    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -2946,7 +2960,8 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
     check passes. Everything queued goes in as ONE prompt (envelopes one after another, up to
     MAIL_BATCH_MAX_BYTES): the agent turns `working` as soon as the first message lands, so one
     prompt per message would let only one through per tick. A file is removed only after `agent
-    prompt` succeeded (at least once). Returns (ids typed in, why it stopped early or None).
+    prompt` succeeded (at least once). An auto-resume note gone stale is deleted instead
+    (resume_note_problem). Returns (ids typed in, why it stopped early or None).
     Caller holds the mailbox lock."""
     sent: list[str] = []
     while True:
@@ -2974,6 +2989,9 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
         refusal = mail_refusal(pane, uuid)
         if refusal:
             return sent, refusal
+        # after mail_refusal's own calls, right before typing: someone may have typed meanwhile
+        if drop_stale_notes(batch, pane, uuid, name):
+            continue
         # a pending `close --self` is cancelled by what is typed in now, and the text says so
         closing = read_self_closes().get(uuid)
         text = "\n\n".join(envelope(m) for _p, m in batch) + (f"\n\n{SELF_CLOSE_CANCELLED}" if closing else "")
@@ -2991,6 +3009,10 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
             mark_delivered(msg["id"])
             event("delivered", id=msg["id"], sender=msg.get("from"), to=name, pane=pane, uuid=uuid,
                   bytes=len(str(msg.get("body", "")).encode()), **({"batch": len(batch)} if len(batch) > 1 else {}))
+            if msg.get("kind") == AUTO_RESUME_KIND:
+                event("auto-resume", id=msg["id"], pane=pane, name=name, uuid=uuid, err=msg.get("expect_err"),
+                      cause=msg.get("what"), attempt=msg.get("attempt"))
+                say(f"auto-resumed {pane} ({name}) after {msg.get('what')}, attempt {msg.get('attempt')}/{msg.get('cap')}")
             sent.append(msg["id"])
     if not pending_mail(uuid):
         clear_mail_hold(uuid)  # nothing waits any more
@@ -5902,13 +5924,18 @@ def send_note(target: str, body: str) -> None:
         say(f"WARN note to {target} not sent: {exc}")
 
 
-def queue_note(uuid: str, body: str, msg_id: str) -> None:
-    """Queue a note into a local session's mailbox; the watcher's mail flush types it in."""
-    with mailbox_lock(uuid):
-        _msg, status = queue_message(uuid, "herdr-sleeper", body, msg_id)
+def queue_note(uuid: str, body: str, msg_id: str, wait: bool = True, extra: dict | None = None) -> str | None:
+    """Queue a note into a local session's mailbox; the watcher's mail flush types it in. Returns
+    queue_message's status, or None when wait=False and a delivery holds the mailbox (under the
+    global lock the watcher must not wait for it: `deliver` takes the mailbox lock first, LESSONS 8.6)."""
+    with mailbox_lock(uuid, wait=wait) as got:
+        if not got:
+            return None
+        _msg, status = queue_message(uuid, "herdr-sleeper", body, msg_id, extra=extra)
     if status == "new":
         event("deliver-queued", id=msg_id, sender="herdr-sleeper", to=uuid, uuid=uuid, target_state="live",
               bytes=len(body.encode()))
+    return status
 
 
 def continue_after_account_restart(uuid: str, new: str) -> None:
@@ -6167,6 +6194,628 @@ def restart_in_place(agent: dict, since: float | None, window: float, old: str, 
     return "restarted"
 
 
+# ------------------------------------------------------------ auto-resume (v0.1.27)
+# When the network or the API goes away, every running Claude turn ends on "API Error: Can't reach
+# the API server …" once Claude's own retries are spent, and the session sits at its prompt looking
+# idle (B-437, ansible-orchestration docs/macos/plan.herdr-sleeper-auto-resume.md). The watcher reads
+# such a turn from the transcript's structured fields (never the screen), waits until a verified
+# HTTPS probe says the API answers again, and queues a short note through the mailbox, which types
+# it in with every gate a delivery has. The note is checked again right before it is typed in.
+
+AUTO_RESUME = STATE_DIR / "auto-resume.json"  # {"since": epoch}: errors from before auto-resume was on stay alone
+AUTO_RESUME_KIND = "auto-resume"     # mailbox `kind` of a note (deliver cannot set it); checked at typing time
+AUTO_RESUME_MARK = "msg ar-"         # in a user record: an auto-resume note went in (the budget counts them)
+AUTO_RESUME_WINDOW_SECONDS = 6 * 3600
+AUTO_RESUME_CHAIN_MAX = 4            # notes per error chain (since the last prompt that was not a note)
+AUTO_RESUME_WINDOW_MAX = 6           # notes per session per window
+AUTO_RESUME_EDGE_MAX = 2             # ... answering a Cloudflare edge challenge
+AUTO_RESUME_PER_TICK = 4
+AUTO_RESUME_ACT_SECONDS = 20         # after max(first sighting, gate up), like DIALOG_ACT_SECONDS
+AUTO_RESUME_ACT_FOCUSED_SECONDS = 300
+AUTO_RESUME_BACKOFF = (0, 60, 300, 900)  # after the error, by notes already typed in for its chain
+AUTO_RESUME_FIRST_DELAY = {"network": 0, "stream": 0, "server": 60, "edge": 120}
+STRUCTURED_ERRORS_VERSION = (2, 1, 317)  # Claude Code writes apiError/streamCutCause from here on
+NETWORK_API_ERRORS = {"connection_failed", "no_response", "stream_idle_timeout", "computer_slept"}
+STREAM_CUTS = {"watchdog", "timed_out", "server_error", "stream_suspended", "stream_truncated", "network_down",
+               "stale_connection"}
+EDGE_TEXT = "Attention Required! | Cloudflare"  # another Cloudflare edge's challenge page, not a login problem
+LEGACY_ERROR_TEXTS = (  # records before STRUCTURED_ERRORS_VERSION carry only the text
+    ("API Error: Can't reach the API server", "network", "connection_failed"),
+    ("API Error: No internet route", "network", "connection_failed"),
+    ("API Error: The response stopped arriving", "stream", "stream_stopped"),
+    ("API Error: Connection lost mid-response", "stream", "connection_lost"),
+    ("API Error: Server error mid-response", "stream", "server_error_mid_response"),
+    ("API Error: Your computer went to sleep mid-response", "stream", "computer_slept"),
+)
+# usage limits belong to tend_dialogs and Claude's own quota auto-resume; the rest needs a human
+NEVER_RESUMED = {"rate_limit", "authentication_failed", "tls_untrusted_ca", "network_edge_blocked", "billing_error",
+                 "invalid_request", "model_not_found", "max_output_tokens", "oauth_org_not_allowed",
+                 "account_on_hold", "cloud_credential_error", "unknown"}
+AUTO_RESUME_NOTE = ("Auto-resume: your last turn ended on an API error ({what}, attempt {n}/{cap}); the API answers "
+                    "again. Continue the task you were on. Before repeating a step with side effects (deploy, push, "
+                    "mail), check whether it already happened. No reply needed.")
+GATE_URL = "https://api.anthropic.com/api/hello"
+CURL = "/usr/bin/curl"
+GATE_EVERY_SECONDS = 5
+GATE_SLOW_EVERY_SECONDS = 30    # ... once the API has been down GATE_SLOW_AFTER_SECONDS
+GATE_SLOW_AFTER_SECONDS = 600
+GATE_UP_SECONDS = 10            # the probe passes this long straight before a note goes in
+GATE_FRESH_SECONDS = 30         # an older probe vouches for nothing
+GATE_GAP_SECONDS = 60           # no probe for longer (a suspended watcher, a closed lid): start over
+GATE_STILL_DOWN_SECONDS = 3600
+GATE = {"up_since": None, "down_since": None, "checked": 0.0, "detail": "", "state": None, "still_down": False}
+STALLED: dict[str, dict] = {}       # pane -> {uuid, err, seq, first, backoff, focused, early}: watcher memory
+STALL_CACHE: dict[str, tuple] = {}  # transcript path -> ((size, mtime_ns), parsed tail)
+AUTO_RESUME_EVENTED: dict[str, float] = {}  # event key -> when: one event per error record (watcher memory)
+
+
+class Stall(NamedTuple):
+    err_id: str                # first 8 hex of the error record's uuid
+    at: float                  # the error record's time
+    cls: str | None            # network | stream | server | edge; None: never resumed
+    what: str                  # the field value that decided it, never message text
+    attempts: int              # notes already typed in for this error chain
+    recent: int | None         # notes within AUTO_RESUME_WINDOW_SECONDS; None: unknown (counts as spent)
+    recent_edge: int | None    # ... of which answered an edge challenge
+    known: bool                # False: a record shape no classifier row covers
+
+
+def _stamp(value: object) -> float | None:
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _content(rec: dict) -> object:
+    msg = rec.get("message")
+    return msg.get("content") if isinstance(msg, dict) else None
+
+
+def record_text(rec: dict) -> str:
+    content = _content(rec)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
+def _version(value: object) -> tuple[int, ...] | None:
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(value or ""))
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def classify_api_error(rec: dict) -> tuple[str | None, str, bool]:
+    """(class, what, known) of an `isApiErrorMessage` record, failing closed: class None is never
+    resumed, and known False is a shape no row covers (logged once, by field values only)."""
+    error, api, cut = rec.get("error"), rec.get("apiError"), rec.get("streamCutCause")
+    status = rec.get("apiErrorStatus") if _number(rec.get("apiErrorStatus")) else None
+    if api is None and error == "authentication_failed" and status == 403 and EDGE_TEXT in record_text(rec):
+        return "edge", "cloudflare_challenge", True  # the one authentication_failed that is not about the login
+    for value in (error, api):  # a veto wins over every resumable field next to it (rate_limit + connection_failed)
+        if isinstance(value, str) and value in NEVER_RESUMED:
+            return None, value, True
+    if api in NETWORK_API_ERRORS:
+        return "network", str(api), True
+    if api is None:
+        if error == "server_error" and cut in STREAM_CUTS:
+            return "stream", str(cut), True
+        if error in ("server_error", "overloaded") and status is not None and 500 <= status <= 599:
+            return "server", f"{error} {int(status)}", True
+    version = _version(rec.get("version"))
+    old = version is not None and version < STRUCTURED_ERRORS_VERSION
+    if api is None and old:
+        text = record_text(rec).lstrip()
+        for prefix, cls, what in LEGACY_ERROR_TEXTS:
+            if text.startswith(prefix):
+                return cls, what, True
+    if api is None and cut is None and not old:
+        return None, str(error or "aborted")[:64], True  # an aborted stream sets neither
+    return None, str(api or cut or error or "unknown")[:64], False
+
+
+def _json_record(line: bytes) -> dict | None:
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None  # the first line of the tail is usually cut, the last may be half written
+    return rec if isinstance(rec, dict) else None
+
+
+def _tool_result(rec: dict) -> bool:
+    content = _content(rec)
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
+def parse_stall(lines: list[bytes], truncated: bool) -> dict | None:
+    """What a transcript tail says about its last turn, independent of the clock: None unless the
+    last main-chain record that counts is an API error; else that record, the auto-resume notes
+    typed in before it ([(time, class of the error each answered)]), how many of them belong to its
+    chain, whether the tail was cut, and the oldest time in it."""
+    error_at: int | None = None
+    closed = 0  # dequeue/remove records seen below: each closes one enqueue above it
+    for idx in range(len(lines) - 1, -1, -1):
+        rec = _json_record(lines[idx])
+        if rec is None and lines[idx].strip() and not (idx == 0 and truncated):
+            return None  # a half-written or damaged record may be the prompt that followed: unknown
+        if rec is None or rec.get("isSidechain"):
+            continue
+        kind = rec.get("type")
+        if kind == "user":
+            if rec.get("isMeta"):
+                continue
+            return None  # a prompt, an interrupt, a slash command, a notification, a relayed message
+        if kind == "system":
+            if rec.get("subtype") == "local_command":
+                return None  # /login, /restart …
+            continue
+        if kind == "queue-operation":
+            op = rec.get("operation")
+            if op in ("dequeue", "remove"):
+                closed += 1
+                continue
+            if op == "enqueue" and closed:
+                closed -= 1
+                continue
+            return None  # a prompt waits in Claude's own queue (or an operation we do not know)
+        if kind == "assistant":
+            if not rec.get("isApiErrorMessage"):
+                return None  # a real reply
+            error_at = idx
+            break
+        # summary, agent-name, custom-title, attachment, api-request …: no turn of their own
+    if error_at is None:
+        return None
+    for idx in range(error_at - 1, -1, -1):  # back to the turn's prompt: a prompt queued in it, never taken
+        rec = _json_record(lines[idx])
+        if rec is None and lines[idx].strip() and not (idx == 0 and truncated):
+            return None
+        if rec is None or rec.get("isSidechain"):
+            continue
+        if rec.get("type") == "user" and not rec.get("isMeta") and not _tool_result(rec):
+            break
+        if rec.get("type") == "queue-operation":
+            op = rec.get("operation")
+            if op in ("dequeue", "remove"):
+                closed += 1
+            elif op == "enqueue" and closed:
+                closed -= 1
+            else:
+                return None
+    notes: list[tuple[float | None, str | None]] = []
+    waiting: list[int] = []   # indexes into notes whose error (further up) is not found yet
+    chain, chain_open = 0, True
+    for idx in range(error_at - 1, -1, -1):
+        line = lines[idx]
+        if b'"user"' not in line and b"isApiErrorMessage" not in line:
+            continue
+        rec = _json_record(line)
+        if rec is None or rec.get("isSidechain"):
+            continue
+        if rec.get("type") == "assistant" and rec.get("isApiErrorMessage"):
+            cls = classify_api_error(rec)[0]
+            for i in waiting:
+                notes[i] = (notes[i][0], cls)
+            waiting = []
+        elif rec.get("type") == "user" and not rec.get("isMeta") and not _tool_result(rec):
+            if AUTO_RESUME_MARK in record_text(rec):
+                waiting.append(len(notes))
+                notes.append((_stamp(rec.get("timestamp")), None))
+                chain += chain_open
+            else:
+                chain_open = False  # a prompt that was not a note ends the chain (not the 6 h budget)
+    oldest = None
+    for line in lines:
+        rec = _json_record(line)
+        oldest = _stamp(rec.get("timestamp")) if rec and rec.get("timestamp") else None
+        if oldest is not None:
+            break
+    return {"error": _json_record(lines[error_at]), "notes": notes, "chain": chain, "truncated": truncated,
+            "oldest": oldest}
+
+
+def stalled_turn(uuid: str, now: float) -> Stall | None:
+    """The API error this session's last turn died on, or None (no transcript, a turn that ended
+    otherwise, or anyone typed since). The parse is cached by (path, size, mtime_ns)."""
+    path = transcript_for(uuid)
+    if path is None:
+        return None
+    st = path.stat()
+    key = (st.st_size, st.st_mtime_ns)
+    hit = STALL_CACHE.get(str(path))
+    if hit and hit[0] == key:
+        parsed = hit[1]
+    else:
+        with path.open("rb") as fh:
+            start = max(0, st.st_size - TRANSCRIPT_TAIL_BYTES)
+            fh.seek(start)
+            tail = fh.read()
+        parsed = parse_stall(tail.splitlines(), start > 0)
+        if len(STALL_CACHE) > 512:
+            STALL_CACHE.clear()
+        STALL_CACHE[str(path)] = (key, parsed)
+    if parsed is None:
+        return None
+    rec = parsed["error"]
+    at = _stamp(rec.get("timestamp"))
+    if at is None:
+        return None  # an unparseable time is not "fresh"
+    cls, what, known = classify_api_error(rec)
+    rid = str(rec.get("uuid") or "")
+    err = rid[:8] if re.fullmatch(r"[0-9a-f]{8}", rid[:8]) else hashlib.sha1(str(rec.get("timestamp")).encode()).hexdigest()[:8]
+    # a note with no readable time counts as recent; a cut tail that does not reach back past the
+    # window may hide notes, so its budget is unknown (spent). A tail read from byte 0 is the whole story.
+    window = [c for t, c in parsed["notes"] if t is None or now - t < AUTO_RESUME_WINDOW_SECONDS]
+    unknown = parsed["truncated"] and (parsed["oldest"] is None or now - parsed["oldest"] < AUTO_RESUME_WINDOW_SECONDS)
+    return Stall(err, at, cls, what, parsed["chain"], None if unknown else len(window),
+                 None if unknown else sum(c == "edge" for c in window), known)
+
+
+def resume_cap(stall: Stall) -> int:
+    return AUTO_RESUME_EDGE_MAX if stall.cls == "edge" else AUTO_RESUME_CHAIN_MAX
+
+
+def spent(stall: Stall) -> str | None:
+    """Why no more notes go in for this stall (the budget), or None."""
+    if stall.attempts >= resume_cap(stall):
+        return f"{stall.attempts} notes in this error chain"
+    if stall.recent is None:
+        return "budget unknown (the transcript tail does not reach back 6 h)"
+    if stall.recent >= AUTO_RESUME_WINDOW_MAX:
+        return f"{stall.recent} notes in 6 h"
+    if stall.cls == "edge" and (stall.recent_edge or 0) >= AUTO_RESUME_EDGE_MAX:
+        return f"{stall.recent_edge} edge-challenge notes in 6 h"
+    return None
+
+
+def resume_label(stall: Stall) -> str:
+    return f"{stall.what}, attempt {stall.attempts + 1}/{resume_cap(stall)}"
+
+
+def resume_floor(now: float, create: bool = True) -> float:
+    """When auto-resume first ran here: older errors are never answered, so the first deploy does
+    not resume every error of the last day, ones the owner left on purpose included. Missing or
+    damaged: now (written when create; `scan` only reads)."""
+    try:
+        since = read_json(AUTO_RESUME).get("since")
+    except DamagedState as exc:
+        since = None
+        if create:
+            say(f"WARN {exc}; moved to {quarantine(AUTO_RESUME)}; auto-resume starts over from now")
+    except SleeperError:
+        return now
+    if _number(since):
+        return float(since)
+    if create:
+        try:
+            write_json(AUTO_RESUME, {"since": now})
+        except OSError as exc:
+            say(f"WARN could not record when auto-resume started: {exc}")
+    return now
+
+
+def once(key: str, name: str, /, **fields: object) -> None:
+    """One event per key (an error record, a pane's failure) for the watcher's lifetime."""
+    if key in AUTO_RESUME_EVENTED:
+        return
+    if len(AUTO_RESUME_EVENTED) > 4096:
+        AUTO_RESUME_EVENTED.clear()
+    AUTO_RESUME_EVENTED[key] = time.time()
+    event(name, **fields)
+
+
+def resume_excluded(agent: dict, uuid: str, exclude: list[str]) -> bool:
+    """auto_resume_exclude, matched like the keep-list in assess: pane id, Herdr name, terminal
+    title, Claude session name."""
+    if not exclude:
+        return False
+    if any(v in exclude for v in (agent["pane_id"], agent.get("name"), agent.get("terminal_title_stripped")) if v):
+        return True
+    return claude_session_name(transcript_for(uuid)) in exclude
+
+
+def resume_candidate(agent: dict, agents: list[dict], journal: dict, config: dict, now: float,
+                     floor: float) -> tuple[Stall | None, str]:
+    """(stall, "") when auto-resume would answer this pane's dead turn, else (stall or None, why
+    not). Cheap checks first: most panes end on a real reply and cost one cached parse."""
+    pane = agent["pane_id"]
+    uuid = (agent.get("agent_session") or {}).get("value")
+    if agent.get("agent") != "claude" or agent.get("agent_status") not in SLEEPABLE_STATUSES:
+        return None, "not an idle claude pane"
+    if not valid_session_id(uuid):
+        return None, "no usable session id"
+    if pane in journal:
+        return None, "the pane is in the sleep journal"
+    if any(a["pane_id"] != pane and (a.get("agent_session") or {}).get("value") == uuid for a in agents):
+        return None, "session also open in another pane"  # its mail could go into the other one
+    stall = stalled_turn(uuid, now)
+    if stall is None:
+        return None, "no stalled turn"
+    if stall.cls is None:
+        return stall, f"not resumable ({stall.what})"
+    if now - stall.at > config["auto_resume_max_age_hours"] * 3600:
+        return stall, "the error is too old"
+    if stall.at < floor:
+        return stall, "the error is from before auto-resume was on"
+    if resume_excluded(agent, uuid, config["auto_resume_exclude"]):
+        return stall, "excluded"
+    if uuid in read_self_closes():
+        return stall, "a close --self is pending"
+    busy = scheduled_work(uuid)  # a pending wakeup or cron resumes the session itself
+    if busy:
+        return stall, busy
+    out = spent(stall)
+    if out:
+        return stall, f"gave up: {out}"
+    return stall, ""
+
+
+def resume_blocks_sleep(agent: dict, agents: list[dict], journal: dict, config: dict, now: float,
+                        floor: float) -> str | None:
+    """Why a pane whose dead turn auto-resume will answer stays awake, or None. Sessions already
+    asleep are never woken for it; a failure here keeps the old behaviour (it may sleep)."""
+    if not config["auto_resume"]:
+        return None
+    try:
+        stall, why = resume_candidate(agent, agents, journal, config, now, floor)
+    except Exception as exc:
+        once(f"error:{agent['pane_id']}:{type(exc).__name__}", "auto-resume-error", pane=agent["pane_id"],
+             uuid=(agent.get("agent_session") or {}).get("value"), error=type(exc).__name__, where="sleep guard")
+        return None
+    if stall is not None and why.startswith("gave up"):  # it may sleep now, before tend_api_errors sees it
+        gave_up(agent, stall, why)
+    if stall is None or why:
+        return None
+    return f"auto-resume pending ({resume_label(stall)}, gate {gate_label(now)})"
+
+
+def gave_up(agent: dict, stall: Stall, why: str) -> None:
+    uuid = agent["agent_session"]["value"]
+    once(f"gave-up:{uuid}:{stall.err_id}", "auto-resume-gave-up", pane=agent["pane_id"], uuid=uuid,
+         name=agent.get("name"), err=stall.err_id, cause=stall.what, why=why.removeprefix("gave up: "))
+
+
+def probe_api() -> tuple[bool, str]:
+    """One GET of GATE_URL through curl with TLS verification (a captive portal fails it) and no
+    curlrc (-q): up only on 200 with "hello" in the body (another Cloudflare edge's 403 is not up).
+    Python's own DNS lookup has no timeout; curl's does."""
+    try:
+        proc = subprocess.run([CURL, "-q", "-sS", "-m", "4", "--connect-timeout", "3", "-o", "-", "-w",
+                               "\n%{http_code}", GATE_URL], capture_output=True, text=True, errors="replace",
+                              timeout=8)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"curl failed ({type(exc).__name__})"
+    if proc.returncode != 0:
+        return False, f"curl exit {proc.returncode}"
+    body, _sep, code = proc.stdout.rpartition("\n")
+    if code.strip() != "200":
+        return False, f"http {code.strip()[:8] or '?'}"
+    if '"hello"' not in body:
+        return False, "http 200 without hello"
+    return True, "http 200"
+
+
+def refresh_gate(now: float) -> None:
+    """Probe the API when due (every 5 s, every 30 s once it is down 10 min). Never under locked():
+    a probe can take seconds. The state changes are events; so is one hour down while stalls wait."""
+    if now - GATE["checked"] > GATE_GAP_SECONDS:
+        GATE.update(up_since=None, down_since=None, still_down=False)  # the watcher was suspended or idle
+    down = GATE["down_since"]
+    every = GATE_SLOW_EVERY_SECONDS if down is not None and now - down >= GATE_SLOW_AFTER_SECONDS else GATE_EVERY_SECONDS
+    if now - GATE["checked"] < every - 1:
+        return
+    try:
+        up, detail = probe_api()
+    except Exception as exc:  # whatever went wrong, it is no word that the API answers
+        up, detail = False, f"probe failed ({type(exc).__name__})"
+    GATE.update(checked=now, detail=detail)
+    if up:
+        if GATE["up_since"] is None:
+            GATE["up_since"] = now
+        GATE.update(down_since=None, still_down=False)
+    else:
+        GATE["up_since"] = None
+        if GATE["down_since"] is None:
+            GATE["down_since"] = now
+        elif not GATE["still_down"] and now - GATE["down_since"] >= GATE_STILL_DOWN_SECONDS:
+            GATE["still_down"] = True
+            event("auto-resume-gate", state="down", still_down=True, detail=detail, stalled=len(STALLED))
+    state = "up" if up else "down"
+    if state != GATE["state"]:
+        GATE["state"] = state
+        event("auto-resume-gate", state=state, detail=detail, stalled=len(STALLED))
+
+
+def gate_stable(now: float) -> bool:
+    return (GATE["up_since"] is not None and now - GATE["up_since"] >= GATE_UP_SECONDS
+            and now - GATE["checked"] <= GATE_FRESH_SECONDS)
+
+
+def gate_label(now: float) -> str:
+    """up / down / unknown, as the sleep guard and `scan` show it (`scan` never probes)."""
+    if gate_stable(now):
+        return "up"
+    return "down" if GATE["down_since"] is not None and now - GATE["checked"] <= GATE_FRESH_SECONDS else "unknown"
+
+
+def resume_due(rec: dict) -> float | None:
+    """When a stall's note may go in: a wait after max(first sighting, gate up) — longer for a
+    focused pane, the owner may be about to type — and its backoff. None while the gate is not up."""
+    if GATE["up_since"] is None:
+        return None
+    wait = AUTO_RESUME_ACT_FOCUSED_SECONDS if rec["focused"] else AUTO_RESUME_ACT_SECONDS
+    return max(max(rec["first"], GATE["up_since"]) + wait, rec["backoff"])
+
+
+def resume_ready(now: float) -> bool:
+    """Between ticks (pause_watching_mail): refresh the gate; True once a stall's note is due and the
+    gate is stable, so the next tick queues it now instead of a poll later. Once per stall."""
+    try:
+        refresh_gate(now)
+    except Exception as exc:  # the gate must never cost the watcher
+        say(f"auto-resume gate: {type(exc).__name__}: {exc}")
+        return False
+    if not gate_stable(now):
+        return False
+    for rec in STALLED.values():
+        due = resume_due(rec)
+        if not rec["early"] and due is not None and due <= now:
+            rec["early"] = True
+            return True
+    return False
+
+
+def tend_api_errors(agents: list[dict], config: dict, now: float) -> None:
+    """Queue an auto-resume note for each idle claude pane whose last turn died on a transient API
+    error (stalled_turn), once seen twice, its backoff passed and the gate stable; at most
+    AUTO_RESUME_PER_TICK, oldest error first. Caller holds the lock: this queues only (a non-blocking
+    mailbox lock) and never types; the mail flush does, after resume_note_problem."""
+    if not config["auto_resume"]:
+        STALLED.clear()
+        return
+    journal = read_json(JOURNAL)  # fresh: this tick may have slept a pane
+    floor = resume_floor(now)
+    live = {a["pane_id"] for a in agents}
+    for pane in [p for p in STALLED if p not in live]:
+        STALLED.pop(pane, None)
+    ready: list[tuple[Stall, dict, dict]] = []
+    for agent in agents:
+        pane = agent["pane_id"]
+        uuid = (agent.get("agent_session") or {}).get("value")
+        try:
+            stall, why = resume_candidate(agent, agents, journal, config, now, floor)
+        except Exception as exc:  # a record of an unexpected shape must not stall the watcher
+            STALLED.pop(pane, None)
+            once(f"error:{pane}:{type(exc).__name__}", "auto-resume-error", pane=pane, uuid=uuid,
+                 error=type(exc).__name__)
+            continue
+        if why:
+            STALLED.pop(pane, None)
+            if stall is not None and stall.cls is None and not stall.known:
+                once(f"unclassified:{uuid}:{stall.err_id}", "auto-resume-unclassified", pane=pane, uuid=uuid,
+                     err=stall.err_id, **error_fields(parsed_error(uuid)))
+            elif stall is not None and why.startswith("gave up"):
+                gave_up(agent, stall, why)
+            continue
+        assert stall is not None
+        seq = agent.get("state_change_seq")
+        rec = STALLED.get(pane)
+        if rec is None or (rec["uuid"], rec["err"], rec["seq"]) != (uuid, stall.err_id, seq):
+            STALLED[pane] = {"uuid": uuid, "err": stall.err_id, "seq": seq, "first": now, "early": False,
+                             "focused": agent.get("focused") is not False,
+                             "backoff": stall.at + AUTO_RESUME_FIRST_DELAY[stall.cls]
+                             + AUTO_RESUME_BACKOFF[min(stall.attempts, len(AUTO_RESUME_BACKOFF) - 1)]}
+            continue  # the first sighting: never act on it
+        rec["focused"] = agent.get("focused") is not False
+        ready.append((stall, agent, rec))
+    acted = 0
+    for stall, agent, rec in sorted(ready, key=lambda r: r[0].at):
+        if acted >= AUTO_RESUME_PER_TICK or STOP["requested"]:
+            break
+        due = resume_due(rec)
+        if due is None or now < due or not gate_stable(now):
+            continue
+        try:
+            acted += answer_stall(agent, stall, config)
+        except Exception as exc:
+            once(f"error:{agent['pane_id']}:{type(exc).__name__}", "auto-resume-error", pane=agent["pane_id"],
+                 uuid=rec["uuid"], error=type(exc).__name__, where="queue")
+
+
+def parsed_error(uuid: str) -> dict | None:
+    """The error record stalled_turn last parsed for this session (its cached tail)."""
+    path = transcript_for(uuid)
+    hit = STALL_CACHE.get(str(path)) if path else None
+    return hit[1]["error"] if hit and hit[1] else None
+
+
+def error_fields(rec: dict | None) -> dict:
+    """An error record's classifying fields for an event: names and short values, never its text."""
+    rec = rec or {}
+    return {k: rec[k] for k in ("error", "apiError", "apiErrorStatus", "streamCutCause", "version")
+            if isinstance(rec.get(k), (str, int)) and len(str(rec[k])) <= 64}
+
+
+def answer_stall(agent: dict, stall: Stall, config: dict) -> int:
+    """Queue the note for one due stall after a fresh mail_refusal (a draft, a menu, another session
+    in the pane, a journal row …: nothing is queued). Returns 1 when a note was queued (or would be)."""
+    pane = agent["pane_id"]
+    uuid = agent["agent_session"]["value"]
+    refusal = mail_refusal(pane, uuid)
+    if refusal:
+        note_skip(pane, f"auto-resume waits: {refusal}")
+        return 0
+    label = resume_label(stall)
+    msg_id = f"ar-{uuid[:8]}-{stall.err_id}"
+    if config["dry_run"]:
+        note_skip(pane, f"would auto-resume ({label}) (dry run)")
+        once(f"dry:{uuid}:{stall.err_id}", "auto-resume", pane=pane, name=agent.get("name"), uuid=uuid, id=msg_id,
+             err=stall.err_id, cause=stall.what, attempt=stall.attempts + 1, dry_run=True)
+        return 1
+    body = AUTO_RESUME_NOTE.format(what=stall.what, n=stall.attempts + 1, cap=resume_cap(stall))
+    status = queue_note(uuid, body, msg_id, wait=False,
+                        extra={"kind": AUTO_RESUME_KIND, "expect_pane": pane, "expect_err": stall.err_id,
+                               "what": stall.what, "attempt": stall.attempts + 1, "cap": resume_cap(stall)})
+    if status is None:
+        note_skip(pane, f"auto-resume waits: {MAIL_BUSY}")
+        return 0
+    return 1 if status == "new" else 0
+
+
+AUTO_RESUME_NOTE_TTL_SECONDS = 120  # the gate's word is this fresh at most: an older note is dropped (re-queued)
+
+
+def resume_note_problem(msg: dict, path: Path, pane: str, uuid: str) -> str | None:
+    """Why a queued auto-resume note is stale and must not be typed in, or None. Every typing path
+    asks (type_mail: the watcher's flush, the 5 s retries, a `deliver` that flushes the box), right
+    before typing, so a note queued before the owner typed, before a watcher crash, before
+    auto_resume was turned off, or for another pane is dropped there. The note is only as good as
+    the gate when it was queued, so it lives AUTO_RESUME_NOTE_TTL_SECONDS; the tender queues a new
+    one while the stall is still due. Every candidate check runs again on fresh state."""
+    now = time.time()
+    age = mail_age(path, now)
+    if age is None or age > AUTO_RESUME_NOTE_TTL_SECONDS:
+        return "queued too long ago (the API gate's word is stale)"
+    if msg.get("expect_pane") != pane:
+        return "the mail would go into another pane"
+    agents = list_agents()  # a Herdr failure keeps the note queued, like any mail
+    agent = next((a for a in agents if a["pane_id"] == pane), None)
+    if agent is None:
+        return "no agent in the pane"
+    try:
+        config, _src = load_config()
+        if not config["auto_resume"]:
+            return "auto_resume is off"
+        stall, why = resume_candidate(agent, agents, read_json(JOURNAL), config, now, resume_floor(now, create=False))
+    except Exception as exc:  # a broken config, an unreadable journal or transcript: never type on a guess
+        return f"could not be checked ({type(exc).__name__})"
+    if stall is None and why == "no stalled turn":
+        return "the turn is no longer stalled (someone typed, or it went on)"
+    if why:
+        return why
+    if stall is None or stall.err_id != msg.get("expect_err"):
+        return "the error changed"
+    return None
+
+
+def drop_stale_notes(batch: list[tuple[Path, dict]], pane: str, uuid: str, name: str) -> bool:
+    """Delete the batch's auto-resume notes that resume_note_problem refuses; True when any went.
+    Dropped is not delivered: a later stall may queue the same id again. Caller holds the mailbox lock."""
+    dropped = False
+    for path, msg in batch:
+        if msg.get("kind") != AUTO_RESUME_KIND:
+            continue
+        stale = resume_note_problem(msg, path, pane, uuid)
+        if stale:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            event("auto-resume-dropped", id=msg["id"], pane=pane, uuid=uuid, reason=stale)
+            say(f"auto-resume note {msg['id']} for {name} dropped: {stale}")
+            dropped = True
+    return dropped
+
+
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
 
 
@@ -6208,10 +6857,16 @@ def early_sleepers(agents: list[dict], clocks: dict[str, dict], due: list[dict],
 
 
 def watch_tick(clocks: dict[str, dict], config: dict) -> None:
-    """One watcher tick: sleep_tick, then the mail flush, which runs even when sleep_tick failed
-    (a broken sleep or reconcile must not hold mail back; mail_refusal re-reads fresh state), then
+    """One watcher tick: the auto-resume gate while stalls wait, sleep_tick, then the mail flush,
+    which runs even when sleep_tick failed (a broken sleep or reconcile must not hold mail back;
+    mail_refusal re-reads fresh state; an auto-resume note queued in sleep_tick goes in here), then
     pending `close --self` wishes (after the flush: mail typed in cancels them)."""
     agents = list_agents()
+    if STALLED and config["auto_resume"]:
+        try:  # outside the lock: a probe can take seconds
+            refresh_gate(time.time())
+        except Exception as exc:
+            say(f"auto-resume gate: {type(exc).__name__}: {exc}")
     try:
         sleep_tick(clocks, config, agents)
     except Exception as exc:
@@ -6293,6 +6948,7 @@ def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> Non
         except (SleeperError, OSError) as exc:
             say(f"WARN insomnia/spawn upkeep: {exc}")
         early, want_early, why_early = early_sleepers(agents, clocks, due, config, now, held)
+        floor = resume_floor(now) if config["auto_resume"] else now
         if early and why_early != LAST_SKIP.get("<early>"):
             LAST_SKIP["<early>"] = why_early
             say(f"early sleep ({why_early}): {want_early} of {', '.join(a['pane_id'] for a in early)}")
@@ -6312,6 +6968,10 @@ def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> Non
                 if not ok:
                     if not reason.startswith(QUIET_OUTCOMES):
                         note_skip(pane, reason)
+                    continue
+                stalled = resume_blocks_sleep(agent, agents, journal, config, now, floor)
+                if stalled:  # its dead turn is answered once the API is back; a sleeper is never woken for it
+                    note_skip(pane, stalled)
                     continue
                 uuid = (agent.get("agent_session") or {}).get("value")  # capture before sleep mutates the pane
                 did, outcome = sleep_agent(agent, window, exclude, dry_run=config["dry_run"],
@@ -6333,6 +6993,11 @@ def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> Non
                 restarting = tend_dialogs(agents, config, now)
             except SleeperError as exc:
                 say(f"dialogs: {exc}")
+        if not STOP["requested"]:
+            try:  # queues only; the mail flush after this tick types the notes in
+                tend_api_errors(agents, config, now)
+            except Exception as exc:
+                say(f"auto-resume: {type(exc).__name__}: {exc}")
         if config["restart_outdated"] and not STOP["requested"] and restarting is None:
             try:
                 restarting = restart_onto_new_build(agents, clocks, {a["pane_id"] for a in due + early},
@@ -6369,12 +7034,16 @@ def mail_waiting() -> bool:
 def pause_watching_mail(seconds: float) -> None:
     """Wait for the next tick. While mail waits, retry it every MAIL_POLL_SECONDS: a cleared draft
     or an agent going idle releases it within seconds, not a whole poll, and the hold reason that
-    `presence` shows is at most that old. Only mail is retried; sleeping waits for the full tick."""
+    `presence` shows is at most that old. Only mail is retried; sleeping waits for the full tick.
+    While auto-resume stalls wait, the API gate is probed here too, and the wait ends early once a
+    stall's note is due and the gate is stable: the next tick queues it (resume_ready)."""
     left = float(seconds)  # counted in slept steps (a retry's own time is not subtracted)
     while left > 0 and not STOP["requested"]:
         step = min(left, MAIL_POLL_SECONDS)
         pause(step)
         left -= step
+        if left > 0 and not STOP["requested"] and STALLED and resume_ready(time.time()):
+            return
         if left > 0 and not STOP["requested"] and mail_waiting():
             try:
                 flush_mail_safely(list_agents())
@@ -6399,6 +7068,7 @@ def watch_loop() -> None:
         signal.signal(signal.SIGTERM, on_term)
         write_json(WATCHER_PID, {"pid": os.getpid(), "stamp": code_stamp(), "lock": True})
         say(f"watcher start session={SESSION}")
+        resume_floor(time.time())  # the first v0.1.27 start: no error from before it is ever resumed
         clocks = load_clocks()
         failures = 0
         down = 0  # consecutive ticks that found no Herdr server (after a reboot the watcher may be first)
@@ -6678,11 +7348,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
         reconcile(agents)
         journal = read_json(JOURNAL)
         clocks, now = load_clocks(), time.time()
+        floor = resume_floor(now, create=False)  # the watcher's: scan never writes it, nor probes the API
         for agent in agents:
             since = clock_since(clocks, agent, now)
             since = now if since is None else since
             ok, reason, _idle = assess(agent, agents, config["idle_hours"], journal, exclude, idle_since=since)
             outcome = reason
+            stalled = resume_blocks_sleep(agent, agents, journal, config, now, floor) if ok else None
+            if stalled:
+                ok, outcome = False, stalled
             if ok:
                 try:
                     did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=dry_run,
