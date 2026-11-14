@@ -157,6 +157,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
+PLUGIN_VERSION = "0.1.32"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -509,7 +510,7 @@ class locked:
 # Commands the CLI answers with nothing on success: exit 0 and empty stdout, or the error JSON on
 # stderr and exit 1 (Herdr v0.9.5 src/cli.rs send_ok_request). No envelope is not a failure for these.
 OK_ONLY_COMMANDS = {("pane", "report-agent"), ("pane", "report-agent-session"), ("pane", "release-agent"),
-                    ("pane", "report-metadata"), ("pane", "send-keys"), ("pane", "send-text"),
+                    ("pane", "report-metadata"), ("pane", "send-keys"), ("pane", "send-text"), ("pane", "run"),
                     ("server", "stop"), ("workspace", "report-metadata")}
 
 
@@ -2775,7 +2776,7 @@ def envelope(msg: dict) -> str:
     The sender always carries its machine: a local sender gets this machine's label in front, so a
     reader can tell `mbp/x` from `mini2/x` without knowing where the message was queued."""
     if msg.get("kind") == OWNER_ANSWER:
-        return (f"{OWNER_ANSWER_HEADER} {msg.get('ask', '?')}, typed in its ask tab "
+        return (f"{OWNER_ANSWER_HEADER} {msg.get('ask', '?')}, typed in its ask panel "
                 f"(herdr-sleeper, msg {msg['id']})]\n\n{msg['body']}")
     sender = msg["from"]
     if "/" not in sender:
@@ -3872,6 +3873,9 @@ def close_refusals(state: str, hit: dict, uuid: str) -> list[str]:
         why.append(f"holds {held}")
     if pending_mail(uuid):
         why.append("has undelivered mail")
+    asks = ask_close_refusal(uuid, hit.get("name"), hit.get("pane_id"), hit.get("terminal_id"))
+    if asks:
+        why.append(asks)
     if state == "live":
         status = hit.get("agent_status")
         if status not in SLEEPABLE_STATUSES:
@@ -4015,6 +4019,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
         tab = hit.get("tab_id") if state == "live" else (herdr("pane", "get", pane, check=False).get("pane") or {}).get("tab_id")
         cwd, kind = hit.get("cwd"), hit.get("agent") if state == "live" else hit.get("kind")
         exited, helpers = None, {}
+        # forced past its open asks: its panel goes first, so the tab can close whole
+        retired = retire_session_asks(uuid, hit.get("name"), by, hit.get("pane_id"), hit.get("terminal_id"))
         if state == "live" and kind in PROFILES and PROFILES[kind]["exit"] == "signal":
             present, _argv, pid = agent_process(pane, str(kind))
             table = process_table()
@@ -4053,7 +4059,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
     if refusals:
         say(f"close {name}: forced by {by} past: {'; '.join(refusals)}")
     resume = manual_command({"cwd": cwd, "argv": hit.get("argv") or [], "uuid": uuid, "kind": kind or "claude"})
-    return True, f"closed {name} ({closed}); its transcript stays: {resume}", []
+    gone = f"; withdrew its open ask(s) {', '.join(retired)}" if retired else ""
+    return True, f"closed {name} ({closed}){gone}; its transcript stays: {resume}", []
 
 
 # ------------------------------------------------------------ close --self
@@ -4192,23 +4199,66 @@ def tend_self_closes(now: float | None = None) -> None:
 
 
 # -------------------------------------------------------------------- ask
-# An agent that needs the owner's decision must not wait in a menu: a Claude menu turns its pane
-# `blocked` and no mail can be typed into it. `ask` opens a tab next to the asker instead. The tab
-# runs `ask-pane` (no LLM): it shows the question, reports itself to Herdr as agent "ask" in state
-# `blocked` (the owner's "needs me" in the sidebar), takes the owner's pick or text and queues it
-# for the asker like any mail (waking it), then closes. The asker keeps working meanwhile.
+# An agent that needs the owner must not wait in a menu: a Claude menu turns its pane `blocked` and
+# no mail can be typed into it. `ask` (a decision) and `ask --todo` (something only the owner can
+# do) add an item to the session's ask panel instead: ONE pane split to the right of the asker's
+# pane, in the asker's own tab, so the owner sees the session on the left and what it waits for on
+# the right. The panel runs `ask-panel` (no LLM). It lists every open item of that session as
+# numbered cards, reports itself to Herdr as agent "ask" in state `blocked` (shown "needs you"),
+# takes the owner's answers one by one (each confirmed with y), queues each for the asker like any
+# mail (a sleeping asker is woken by a detached deliver-pending, never by the panel) and closes
+# its own pane, never the tab, when nothing is open any more. Up to ASK_OPEN_MAX items per
+# session; a new one joins the panel, it never replaces one. The asker keeps working meanwhile.
+#
+# Trust: an answer reaches the asker under OWNER_ANSWER_HEADER, which only envelope() writes for a
+# mail of kind owner-answer that the panel queued; `deliver`, the ask's own text and its options
+# refuse the header. What this does NOT prove: that the keys came from the owner's keyboard. Herdr
+# 0.9.5 writes `pane send-text` into a pane's tty like typed keys, and the state dir is the same
+# user's, so a same-user agent that sets out to forge an answer can. The y-confirmation guards
+# against stray keys (a "1" meant for a Claude menu next door), not against such an agent.
+#
+# Records from the tab design (one ask per tab, no `panel`) still load: their tab's `ask-pane`
+# program shows them alone, and the session's next ask adopts them into its panel.
+#
+# Priority: the design relies on the client's ui.agent_panel_sort = "priority" (blocked rows on
+# top). Herdr sorts the rows of a machine whose connection is not Online below every live row,
+# idle ones too, so a "needs you" row from a stale mini endpoint can sink: the panel therefore
+# toasts new items (bundled) and reminds of items open longer than ASK_RENOTIFY_SECONDS.
+# Ownership: only is_ask_pane's exact argv proves a pane is a panel; nothing else closes or joins one.
 
 ASK_AGENT = "ask"
 ASK_SOURCE = "herdr-sleeper-ask"
+ASK_META_SOURCE = "herdr-sleeper-ask-meta"
+ASK_TOKEN = "ask"                  # pane token for a sidebar row `$ask` (first open item, 80 chars)
 ASK_MARK = "❓ "
 ASK_ID_RE = re.compile(r"[0-9a-f]{8}")
 ASK_QUESTION_MAX = 300
 ASK_OPTION_MAX = 200
 ASK_OPTIONS_MAX = 9
+ASK_OPEN_MAX = 9                   # open items per session, all in its one panel
 ASK_KEEP_SECONDS = 7 * 86400       # answered or withdrawn records stay a week (for an inbox), then go
-OWNER_ANSWER = "owner-answer"      # mailbox `kind` of an answer typed in an ask tab
+ASK_STALE_SECONDS = 3 * 86400      # an item open this long is marked stale in the panel and --list
+ASK_SPLIT_RATIO = 0.6              # the asker keeps this share of its tab; the panel gets the right part
+ASK_SHELL_WAIT_SECONDS = 5         # `ask` waits this long at most for the new pane's shell, then types anyway
+ASK_OPENING_SECONDS = 20           # a panel being opened this recently is joined, not opened twice
+ASK_POLL_SECONDS = 1.0             # the panel re-reads the items this often (new, withdrawn, answered)
+ASK_RECHECK_SECONDS = 30           # ... and verifies its sidebar row is still blocked this often
+ASK_PLACE_SECONDS = 10             # ... and re-resolves where the asker is now this often
+ASK_VERIFY_SECONDS = 3.0           # `ask` proves the new pane runs the panel within this long, else closes it
+ASK_ORPHAN_GRACE_SECONDS = 45      # a panel seen gone twice this far apart is reopened (or its items lost)
+ASK_REOPEN_BACKOFF_SECONDS = 120   # a failed reopen is retried after this long ...
+ASK_REOPEN_TRIES = 3               # ... this often, then its items are marked lost
+ASK_RETRY_SECONDS = 0.5           # a busy mailbox: the panel tries the answer again this soon
+ASK_REAP_SECONDS = 30              # the watcher looks for items without a panel this often
+ASK_NOTIFY_BUNDLE_SECONDS = 4      # new items within this long give one toast and one sound
+ASK_RENOTIFY_SECONDS = 30 * 60     # an item open this long is notified again (a flaky machine's row may sort low)
+TODO_MARK = "❗ "                   # a to-do's mark in the sidebar row, the toast and its card
+OWNER_ANSWER = "owner-answer"      # mailbox `kind` of an answer typed in an ask panel
 OWNER_ANSWER_HEADER = "[the owner's answer to your ask"  # only envelope() writes it; deliver refuses it in a body
-ASK_DISCUSS = "d"
+QUESTION, TODO = "question", "todo"
+ASK_TALK = "?"                     # question: talk it over in the session first (the item stays open)
+TODO_DONE, TODO_CANT = "d", "x"    # to-do: done / can't or won't (x REASON)
+ASK_STATE_LABEL = "needs you"      # the sidebar's state text for a panel (a Claude menu still says blocked)
 
 
 def text_problem(text: str | None, what: str, limit: int) -> str | None:
@@ -4218,6 +4268,8 @@ def text_problem(text: str | None, what: str, limit: int) -> str | None:
         return f"{what} is over {limit} characters"
     if CONTROL_CHARS.search(text) or "\n" in text:
         return f"{what} must be one line without control characters"
+    if OWNER_ANSWER_HEADER in text:
+        return f"{what} imitates an owner's answer"
     return None
 
 
@@ -4233,41 +4285,185 @@ def read_asks() -> dict:
             and (v.get("state") == "open" or now - float(v.get("closed_ts") or now) < ASK_KEEP_SECONDS)}
 
 
-def ask_pane_argv(ask_id: str) -> list[str]:
-    """The ask tab's program as an argv (typed into the tab, and Herdr's resume command after a restart)."""
+def ask_kind(rec: dict) -> str:
+    return TODO if rec.get("type") == TODO else QUESTION
+
+
+def ask_is_mine(rec: dict, uuid: str | None, agent_name: str | None, pane: str | None = None,
+                terminal: str | None = None) -> bool:
+    """The record belongs to this session: the same session id, or (after /clear gave the pane a new
+    session id) the same Herdr agent name in the same pane on the same terminal. A name, or a name
+    and a pane id, is not continuity: a later session may carry both after a restart; a /clear keeps
+    the terminal, a restart does not (and a restarted session resumes its own session id)."""
+    if uuid and rec.get("uuid") == uuid:
+        return True
+    return bool(agent_name and pane and terminal and rec.get("asker_agent") == agent_name
+                and rec.get("asker_pane") == pane and rec.get("asker_terminal") == terminal)
+
+
+def _ask_env_args() -> list[str]:
     env_args = [f"{var}={os.environ[var]}" for var in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH") if os.environ.get(var)]
-    env_args.append(f"HERDR_SESSION={SESSION}")
-    return ["env", *env_args, str(SELF), "ask-pane", ask_id, str(STATE_DIR)]
+    # the panel's children (deliver-pending) must find this state dir, not the default one
+    env_args += [f"HERDR_PLUGIN_STATE_DIR={STATE_ROOT}", f"HERDR_SESSION={SESSION}"]
+    return env_args
+
+
+def ask_panel_argv(panel_id: str) -> list[str]:
+    """The panel's program as an argv (typed into its pane, and Herdr's resume command after a restart)."""
+    return ["env", *_ask_env_args(), str(SELF), "ask-panel", panel_id, str(STATE_DIR)]
+
+
+def ask_pane_argv(ask_id: str) -> list[str]:
+    """The tab design's program (one ask per tab): kept so such a tab still resumes after a restart."""
+    return ["env", *_ask_env_args(), str(SELF), "ask-pane", ask_id, str(STATE_DIR)]
+
+
+def ask_pane_info(pane: str | None) -> dict:
+    if not pane:
+        return {}
+    with contextlib.suppress(SleeperError):
+        info = herdr("pane", "get", pane, check=False).get("pane")
+        return info if isinstance(info, dict) else {}
+    return {}
+
+
+PYTHON_NAME_RE = re.compile(r"[Pp]ython(?:\d+(?:\.\d+)*)?")
+
+
+def is_ask_pane(pane: str | None, prog_id: str | None, legacy: bool = False) -> bool | None:
+    """Does the pane's foreground run exactly this panel's program (`<script> ask-panel <panel id>
+    <state dir>`, or a tab-design ask's `<script> ask-pane <ask id> <state dir>`)? The only proof
+    that lets a pane be closed or joined: a pane id comes back after a restart, and a reported
+    agent `ask` or the word "ask-panel" in some argv may be another session's panel or anything
+    else. None: process-info could not tell."""
+    if not pane or not prog_id:
+        return False
+    with contextlib.suppress(SleeperError):
+        info = herdr("pane", "process-info", "--pane", str(pane), check=False).get("process_info")
+        if not isinstance(info, dict) or not isinstance(info.get("foreground_processes"), list):
+            # Herdr answers a closed pane with an error: gone is "not ours", unreadable is "cannot tell"
+            return False if pane_exists(str(pane)) is False else None
+        procs = info["foreground_processes"]
+        if not procs:
+            return None  # [] is "could not see the job"
+        want = ["ask-pane" if legacy else "ask-panel", prog_id, str(STATE_DIR)]
+        unreadable = False
+        for proc in procs:
+            argv = [str(a) for a in (proc.get("argv") or [])] if isinstance(proc, dict) else []
+            unreadable = unreadable or not argv
+            # the whole invocation: the script itself, or a Python interpreter running it; nothing
+            # else in front (`bash -c '…' <script> ask-panel …` is not the panel)
+            if len(argv) == 4 and os.path.basename(argv[0]) == SELF.name and argv[1:] == want:
+                return True
+            if (len(argv) == 5 and PYTHON_NAME_RE.fullmatch(os.path.basename(argv[0]))
+                    and os.path.basename(argv[1]) == SELF.name and argv[2:] == want):
+                return True
+        return None if unreadable else False  # a process without a readable argv proves nothing either way
+    return None
+
+
+def close_ask_pane(pane: str | None, prog_id: str | None, legacy: bool = False) -> bool:
+    """Release and close a panel's (or a tab-design ask's) pane, only when it provably runs that
+    program. True: closed."""
+    if not pane or is_ask_pane(pane, prog_id, legacy) is not True:
+        return False
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "release-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, check=False)
+        herdr("pane", "report-metadata", pane, "--source", ASK_META_SOURCE, "--clear-display-agent",
+              "--clear-state-labels", "--clear-token", ASK_TOKEN, check=False)
+        herdr("pane", "close", pane, check=False)  # the pane, never a saved tab id (it may hold others now)
+        return True
+    return False
+
+
+def open_asks(uuid: str | None, agent_name: str | None, asks: dict | None = None,
+              pane: str | None = None, terminal: str | None = None) -> list[tuple[str, dict]]:
+    asks = read_asks() if asks is None else asks
+    return [(k, v) for k, v in asks.items()
+            if v.get("state") == "open" and ask_is_mine(v, uuid, agent_name, pane, terminal)]
+
+
+def ask_title(rec: dict, width: int = 80) -> str:
+    """`decide: …` or `to-do: …` with its mark, cut to width: the sidebar's and a toast's words."""
+    mark = TODO_MARK if ask_kind(rec) == TODO else ASK_MARK
+    text = f"{mark}{'to-do' if ask_kind(rec) == TODO else 'decide'}: {clean_text(rec.get('question'))}"
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def find_panel_pane(panel_id: str, agents: list[dict], tab: str | None, skip: str | None = None) -> str | None:
+    """The pane in the asker's tab that runs this panel now (Herdr may have given it a new id in a
+    restart before the panel's own fix-up ran), proved by its argv. None: not found."""
+    for a in agents:
+        if tab and a.get("tab_id") == tab and a["pane_id"] != skip and is_ask_pane(a["pane_id"], panel_id) is True:
+            return str(a["pane_id"])
+    return None
+
+
+def set_panel_pane(panel_id: str, pane: str | None, started: bool = False) -> None:
+    """Record the pane of every open item of a panel (and, from the panel itself, its start)."""
+    with locked():
+        asks = read_asks()
+        stamp = time.time_ns()
+        for v in asks.values():
+            if v.get("panel") == panel_id and v.get("state") == "open":
+                v["pane"] = pane
+                v.pop("orphan_ts", None)
+                if started:
+                    v["panel_started"] = stamp
+        write_json(ASKS, asks)
+
+
+def lost_notice(uuid: str, agent_name: str | None, pane: str | None, terminal: str | None) -> list[str]:
+    """The session's items that lost their panel and were never answered, once each: told in the
+    output of its next ask (it may ask again)."""
+    lines: list[str] = []
+    with locked():
+        asks = read_asks()
+        for k, v in asks.items():
+            if v.get("state") == "lost" and not v.get("lost_told") and ask_is_mine(v, uuid, agent_name, pane, terminal):
+                v["lost_told"] = True
+                lines.append(f"LOST: {'to-do' if ask_kind(v) == TODO else 'ask'} {k} «{clean_text(v.get('question'))}» "
+                             "lost its panel (closed, or your pane went away while you were gone) and was never "
+                             "answered; ask again if it still matters.")
+        if lines:
+            write_json(ASKS, asks)
+    return lines
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """`ask --question Q [--option O ...] [--recommend N]`, context on stdin: open an ask tab for
-    the calling agent's session. `ask --list [--json]`; `ask --withdraw ID` (the asker only)."""
-    if args.list:
-        asks = read_asks()
-        rows = [dict(v, id=k) for k, v in sorted(asks.items(), key=lambda kv: kv[1].get("created", ""))
-                if args.all or v.get("state") == "open"]
-        if args.json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        for r in rows:
-            print(f"{r['id']}  {r.get('state', '?'):9} {r.get('asker', '?'):28} {r.get('tab_place') or '-':40} "
-                  f"{r.get('question', '')}")
-        if not rows:
-            print("no open asks")
-        return 0
+    """`ask --question Q [--option O ...] [--recommend N]` or `ask --todo T`, context on stdin: add an
+    item to the calling session's ask panel (split right of its pane, opened on the first item).
+    `ask --list [--all] [--everywhere] [--json]`, `ask --inbox`; `ask --withdraw ID`, `ask --done ID`
+    (a to-do the session checked is done; the asker only)."""
+    if args.list or getattr(args, "inbox", False):
+        return list_asks(args)
     agents = list_agents()
     hit, why = calling_agent(agents)
     if hit is None:
         print(f"ask: {why}; run it from your own agent's shell tool", file=sys.stderr)
         return 1
     uuid = hit["agent_session"]["value"]
-    if args.withdraw:
-        return withdraw_ask(args.withdraw, uuid)
-    problem = (text_problem(args.question, "--question", ASK_QUESTION_MAX)
-               or next((text_problem(o, "--option", ASK_OPTION_MAX) for o in args.option or []
-                        if text_problem(o, "--option", ASK_OPTION_MAX)), None))
+    agent_name = hit.get("name")
+    me_pane, me_term = hit["pane_id"], hit.get("terminal_id")
+    with contextlib.suppress(SleeperError):
+        reap_lost_asks(agents)
+    lost = lost_notice(uuid, agent_name, me_pane, me_term)
+    if args.withdraw or getattr(args, "done", None):
+        code = withdraw_ask(args.withdraw or args.done, uuid, agent_name, me_pane, me_term,
+                            "withdrawn" if args.withdraw else "done-by-session")
+        for line in lost:
+            print(line)
+        return code
+    todo = getattr(args, "todo", None)
+    kind = TODO if todo is not None else QUESTION
+    title = todo if kind == TODO else args.question
     options = list(args.option or [])
+    problem = None
+    if kind == TODO and (args.question or options or args.recommend is not None):
+        problem = "--todo takes no --question, --option or --recommend (the owner answers done, can't, or a note)"
+    problem = problem or (text_problem(title, "--todo" if kind == TODO else "--question", ASK_QUESTION_MAX)
+                          or next((p for p in (text_problem(o, "--option", ASK_OPTION_MAX) for o in options) if p),
+                                  None))
     if not problem and len(options) > ASK_OPTIONS_MAX:
         problem = f"at most {ASK_OPTIONS_MAX} options"
     if not problem and args.recommend is not None and not 1 <= args.recommend <= len(options):
@@ -4281,56 +4477,338 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if problem:
         print(f"ask: {problem}", file=sys.stderr)
         return 2
-    name = hit.get("name") or claude_session_name(transcript_for(uuid)) or hit["pane_id"]
+    name = agent_name or claude_session_name(transcript_for(uuid)) or me_pane
     places = ui_places(agents)
     me = None
     with contextlib.suppress(SleeperError):
         me = this_machine()
-    asker_place = ui_place({"place": places.get(hit["pane_id"]), "machine": me})
-    ask_id = hashlib.sha256(f"{uuid}\0{time.time_ns()}\0{args.question}".encode()).hexdigest()[:8]
-    label = (ASK_MARK + name)[:40]
-    try:
-        made = herdr("tab", "create", "--cwd", str(hit.get("cwd") or Path.home()), "--label", label, "--no-focus",
-                     *(["--workspace", hit["workspace_id"]] if hit.get("workspace_id") else []))
-        pane, tab = made["root_pane"]["pane_id"], made["tab"]["tab_id"]
-    except (SleeperError, KeyError, TypeError) as exc:
-        print(f"ask: could not create a tab: {exc}", file=sys.stderr)
-        return 1
-    ws_label = (places.get(hit["pane_id"]) or "").split(PLACE_SEP)[0]
-    tab_place = ui_place({"place": f"{ws_label}{PLACE_SEP}{label}" if ws_label else None, "machine": me})
-    rec = {"state": "open", "uuid": uuid, "asker": name, "asker_pane": hit["pane_id"], "asker_place": asker_place,
-           "question": args.question, "options": options, "recommend": args.recommend, "context": context.strip(),
-           "pane": pane, "tab": tab, "tab_place": tab_place,
-           "created": dt.datetime.now().isoformat(timespec="seconds")}
-    if ask_re:  # the relayed message this ask is about: the ask tab shows it, `thread` links them
+    asker_place = ui_place({"place": places.get(me_pane), "machine": me})
+    ask_id = hashlib.sha256(f"{uuid}\0{time.time_ns()}\0{title}".encode()).hexdigest()[:8]
+    rec = {"state": "open", "type": kind, "uuid": uuid, "asker": name, "asker_agent": agent_name,
+           "asker_pane": me_pane, "asker_tab": hit.get("tab_id"), "asker_terminal": me_term,
+           "asker_place": asker_place,
+           "machine": me, "question": title, "options": options, "recommend": args.recommend,
+           "context": context.strip(), "created": dt.datetime.now().isoformat(timespec="seconds"),
+           "created_ts": time.time()}
+    if ask_re:  # the relayed message this ask is about: the panel shows it, `thread` links them
         rec.update(re=ask_re, thread=thread_of(ask_re))
     with locked():
         asks = read_asks()
-        superseded = [(k, v) for k, v in asks.items() if v.get("uuid") == uuid and v.get("state") == "open"]
-        for k, v in superseded:  # one ask tab per session: a new ask replaces the open one
-            v.update(state="superseded", superseded_by=ask_id, closed=rec["created"], closed_ts=time.time())
+        mine = open_asks(uuid, agent_name, asks, me_pane, me_term)
+        if len(mine) >= ASK_OPEN_MAX:
+            print(f"ask: you have {len(mine)} open items for the owner already (at most {ASK_OPEN_MAX}); "
+                  "withdraw one that no longer matters (`herdr-sleeper ask --list`)", file=sys.stderr)
+            return 1
+        for _k, v in mine:  # the same session, maybe under a new session id after /clear: follow it
+            v.update(uuid=uuid, asker=name, asker_pane=me_pane, asker_tab=hit.get("tab_id"), asker_terminal=me_term)
+        panel = next((v for _k, v in mine if v.get("panel")), None)
+        used = {v.get("slot") for _k, v in mine}
+        rec["slot"] = next(n for n in range(1, ASK_OPEN_MAX + 1) if n not in used)
+        rec["panel"] = panel["panel"] if panel else hashlib.sha256(f"panel\0{ask_id}".encode()).hexdigest()[:8]
+        rec["pane"], rec["tab"] = (panel.get("pane"), panel.get("tab")) if panel else (None, None)
+        # A panel being opened moments ago (a parallel tool call, or its program has not started
+        # yet) is joined, not opened twice. Whoever finds no such reservation takes it (also to
+        # reopen a panel whose pane died), so only one caller ever opens; the others join.
+        recent = any(v.get("panel") == rec["panel"] and time.time() - float(v.get("opening_ts") or 0)
+                     < ASK_OPENING_SECONDS for _k, v in mine)
+        if not recent:
+            rec["opening_ts"] = time.time()
         asks[ask_id] = rec
         write_json(ASKS, asks)
-    for k, v in superseded:
-        drop_ask_tab(v)
-        event("ask-superseded", id=k, by=ask_id, uuid=uuid)
-    for _ in range(SPAWN_SHELL_SECONDS * 2):
-        if pane_at_shell(pane) is True:
-            break
-        time.sleep(0.5)
-    herdr("pane", "run", pane, shlex.join(ask_pane_argv(ask_id)), check=False)
-    event("ask-opened", id=ask_id, asker=name, uuid=uuid, pane=pane, tab=tab)
-    print(f"ask {ask_id} is open in {tab_place} (shown as blocked: the owner's to-do). Keep working: the owner's "
-          "answer arrives as a message, marked as the owner's answer to this ask. Withdraw it with "
-          f"`herdr-sleeper ask --withdraw {ask_id}` once it no longer matters."
-          + (f" It replaces your open ask {', '.join(k for k, _v in superseded)} (one ask tab per session: "
-             "put every open question into one ask)." if superseded else ""))
+    joined = recent
+    if not joined and rec["pane"]:
+        # only the panel's own program proves the pane is it; can't tell (None) is not opened twice
+        # either: the watcher's reaper settles it
+        joined = is_ask_pane(rec["pane"], rec["panel"]) is not False
+    if not joined:
+        moved = find_panel_pane(rec["panel"], agents, hit.get("tab_id"), skip=me_pane)
+        if moved:  # restarted under a new id and its fix-up has not run yet: record it, join it
+            set_panel_pane(rec["panel"], moved)
+            joined = True
+    if not joined:
+        problem, others = open_ask_panel(rec["panel"], hit, drop=ask_id)
+        if problem:
+            if others:  # parallel joiners' items: open their panel at once, still under the reservation
+                again, _left = open_ask_panel(rec["panel"], hit)
+                if again:
+                    say(f"ask panel {rec['panel']}: reopening for the joined items failed too: {again}")
+            print(f"ask: could not open the ask panel: {problem}", file=sys.stderr)
+            return 1
+    panel_rec = read_asks().get(ask_id) or rec
+    event("ask-opened", id=ask_id, kind=kind, asker=name, uuid=uuid, panel=rec["panel"], pane=panel_rec.get("pane"),
+          joined=joined)
+    what = "to-do" if kind == TODO else "ask"
+    where = "joins your open ask panel" if joined else "is open in a new ask panel"
+    print(f"{what} {ask_id} (item {rec['slot']}) {where}, right of your pane in {asker_place} (shown as "
+          "\"needs you\": waiting on the owner). Keep working: the owner's answer arrives as a message, marked as "
+          f"the owner's answer to this ask. Other open questions go in asks of their own (up to {ASK_OPEN_MAX}). "
+          f"Withdraw it with `herdr-sleeper ask --withdraw {ask_id}` once it no longer matters"
+          + (f", or close it with `herdr-sleeper ask --done {ask_id}` once you have checked it is done yourself."
+             if kind == TODO else "."))
+    for line in lost:
+        print(line)
     return 0
 
 
+def start_panel(panel_id: str, hit: dict) -> tuple[str | None, str | None, str | None]:
+    """Split the asker's pane and start the panel program in the new right part, then prove it runs
+    there (argv, within ASK_VERIFY_SECONDS). (pane, tab, None), or (None, None, what failed) with
+    the split closed again: a bare shell must never stay next to the session (every later ask
+    would split once more)."""
+    try:
+        made = herdr("pane", "split", hit["pane_id"], "--direction", "right", "--ratio", str(ASK_SPLIT_RATIO),
+                     "--no-focus", "--cwd", str(hit.get("cwd") or Path.home()))
+        info = made["pane"]
+        pane, tab = str(info["pane_id"]), info.get("tab_id") or hit.get("tab_id")
+    except (SleeperError, KeyError, TypeError) as exc:
+        return None, None, f"split failed: {exc}"
+    for _ in range(int(ASK_SHELL_WAIT_SECONDS * 4)):  # bounded: the asker's tool call must stay short
+        if pane_at_shell(pane) is True:
+            break
+        time.sleep(0.25)
+    problem = None
+    try:
+        # exec: the panel replaces the shell, so the pane never falls back to a prompt (Herdr would
+        # drop the blocked row a second later) and closes when the panel ends
+        herdr("pane", "run", pane, "exec " + shlex.join(ask_panel_argv(panel_id)))
+    except SleeperError as exc:
+        problem = f"starting the panel failed: {exc}"
+    if problem is None:
+        for _ in range(int(ASK_VERIFY_SECONDS * 4)):
+            if is_ask_pane(pane, panel_id) is True:
+                return pane, tab, None
+            time.sleep(0.25)
+        problem = f"the new pane did not run the ask panel within {ASK_VERIFY_SECONDS:g} s"
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "close", pane, check=False)  # made by this call a moment ago: ours to close
+    event("ask-panel-start-failed", panel=panel_id, pane=pane, why=problem)
+    return None, None, problem
+
+
+def open_ask_panel(panel_id: str, hit: dict, drop: str | None = None) -> tuple[str | None, bool]:
+    """Open the panel (start_panel), record its pane on every open item of that panel and adopt the
+    session's tab-design items. (None, _) on success. On failure (what failed, any items left): the
+    records lose pane and reservation, except that with `drop` (the caller's own item, removed
+    here) items that parallel joiners added keep a fresh reservation for the caller's one retry."""
+    pane, tab, problem = start_panel(panel_id, hit)
+    if problem:
+        with locked():
+            asks = read_asks()
+            if drop:
+                asks.pop(drop, None)
+            left = [v for v in asks.values() if v.get("panel") == panel_id and v.get("state") == "open"]
+            for v in left:
+                v.update(pane=None, tab=None)
+                if drop:
+                    v["opening_ts"] = time.time()
+                else:
+                    v.pop("opening_ts", None)
+            write_json(ASKS, asks)
+        return problem, bool(left)
+    legacy: list[dict] = []
+    session = (hit.get("agent_session") or {}).get("value")
+    with locked():
+        asks = read_asks()
+        for k, v in asks.items():
+            if v.get("state") != "open":
+                continue
+            if v.get("panel") == panel_id:  # opened and proved: later asks check the pane, not the reservation
+                v.update(pane=pane, tab=tab)
+                for done in ("orphan_ts", "opening_ts", "reopen_failed_ts", "reopen_failures"):
+                    v.pop(done, None)
+            elif not v.get("panel") and ask_is_mine(v, session, hit.get("name"), hit.get("pane_id"),
+                                                    hit.get("terminal_id")):
+                legacy.append(dict(v, id=k))  # the tab design's item: its tab closes, the panel shows it
+                used = {x.get("slot") for x in asks.values() if x.get("panel") == panel_id and x.get("state") == "open"}
+                v.update(panel=panel_id, pane=pane, tab=tab,
+                         slot=next((n for n in range(1, ASK_OPEN_MAX + 1) if n not in used), ASK_OPEN_MAX))
+        write_json(ASKS, asks)
+    for old in legacy:
+        drop_legacy_tab(old, old["id"])
+        event("ask-adopted", id=old["id"], panel=panel_id)
+    return None, False
+
+
+def asker_now(rec: dict, agents: list[dict] | None = None) -> tuple[str | None, dict | None]:
+    """Where the asker is now, proved: ("live", its agent row) when a live agent in some pane is that
+    session (ask_is_mine: its session id, or after /clear the same name, pane and terminal);
+    ("asleep", a row like an agent's) when the sleeper holds it and its own wake stub runs in its
+    pane; (None, None) otherwise."""
+    if agents is None:
+        try:
+            agents = list_agents()
+        except SleeperError:
+            return None, None
+    for a in agents:
+        if a.get("agent") in (None, CLAIM_AGENT, ASK_AGENT):
+            continue
+        if ask_is_mine(rec, (a.get("agent_session") or {}).get("value"), a.get("name"), a["pane_id"],
+                       a.get("terminal_id")):
+            return "live", a
+    with contextlib.suppress(SleeperError, DamagedState):
+        for e in read_json(JOURNAL).values():
+            if valid_entry(e) and e.get("uuid") == rec.get("uuid") and stub_running(e["pane_id"], e["uuid"]) is True:
+                row = next((a for a in agents if a["pane_id"] == e["pane_id"]), {})
+                return "asleep", {"pane_id": e["pane_id"], "tab_id": row.get("tab_id"), "cwd": e.get("cwd"),
+                                  "terminal_id": row.get("terminal_id"), "name": e.get("name"),
+                                  "agent_session": {"value": e["uuid"]}}
+    return None, None
+
+
+def reap_lost_asks(agents: list[dict] | None = None) -> list[str]:
+    """Open items whose panel is gone (the panel ended, or the owner closed its pane by hand) must
+    not stay open with nothing on screen. Seen gone twice ASK_ORPHAN_GRACE_SECONDS apart (a
+    restarted panel fixes its own pane id first): reopen the panel when the asker is live or
+    provably asleep in its pane, else mark the items `lost` (the asker is told at its next ask).
+    A pane that cannot be told (None) is left alone. Returns the ids marked lost."""
+    asks = read_asks()
+    groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    for k, v in asks.items():
+        if v.get("state") == "open":
+            key = ("panel", str(v["panel"])) if v.get("panel") else ("legacy", k)
+            groups.setdefault(key, []).append((k, v))
+    if not groups:
+        return []
+    now = time.time()
+    lost: list[str] = []
+    for (how, prog), items in groups.items():
+        if any(now - float(v.get("opening_ts") or 0) < ASK_OPENING_SECONDS for _k, v in items):
+            continue
+        if any(now - float(v.get("reopen_failed_ts") or 0) < ASK_REOPEN_BACKOFF_SECONDS for _k, v in items):
+            continue
+        pane = next((v.get("pane") for _k, v in items if v.get("pane")), None)
+        ok = is_ask_pane(pane, prog, legacy=how == "legacy") if pane else False
+        if ok is not False:
+            if any(v.get("orphan_ts") for _k, v in items):
+                with locked():
+                    fresh = read_asks()
+                    for k, _v in items:
+                        if isinstance(fresh.get(k), dict):
+                            fresh[k].pop("orphan_ts", None)
+                    write_json(ASKS, fresh)
+            continue
+        seen = min((float(v["orphan_ts"]) for _k, v in items if v.get("orphan_ts")), default=None)
+        if ASK_ORPHAN_GRACE_SECONDS > 0 and (seen is None or now - seen < ASK_ORPHAN_GRACE_SECONDS):
+            if seen is None:
+                with locked():
+                    fresh = read_asks()
+                    for k, _v in items:
+                        if isinstance(fresh.get(k), dict) and fresh[k].get("state") == "open":
+                            fresh[k]["orphan_ts"] = now
+                    write_json(ASKS, fresh)
+            continue
+        seen_started = max((int(v.get("panel_started") or 0) for _k, v in items), default=0)
+
+        def unchanged(cur: list[tuple[str, dict]], seen_pane: object = pane, seen_started: int = seen_started,
+                      prog: str = prog, how: str = how) -> bool:
+            """Still as observed, checked under the lock right before acting: no reservation taken
+            since, no other pane recorded, no panel (re)started, and the pane still not ours."""
+            if not all(now - float(v.get("opening_ts") or 0) >= ASK_OPENING_SECONDS
+                       and v.get("pane") in (seen_pane, None)
+                       and int(v.get("panel_started") or 0) <= seen_started for _k, v in cur):
+                return False
+            return not seen_pane or is_ask_pane(str(seen_pane), prog, legacy=how == "legacy") is False
+
+        state, row = asker_now(items[0][1], agents)
+        if row is not None:
+            panel_id = prog if how == "panel" else hashlib.sha256(f"panel\0{prog}".encode()).hexdigest()[:8]
+            with locked():  # take the reservation, unless what was seen changed meanwhile
+                fresh = read_asks()
+                cur = [(k, fresh[k]) for k, _v in items if isinstance(fresh.get(k), dict)
+                       and fresh[k].get("state") == "open"]
+                if not cur or not unchanged(cur):
+                    continue
+                for _k, v in cur:
+                    v["opening_ts"] = time.time()
+                write_json(ASKS, fresh)
+            problem, _left = open_ask_panel(panel_id, row)  # a tab-design item is adopted into it
+            if problem:
+                with locked():
+                    fresh = read_asks()
+                    for k, _v in items:
+                        if isinstance(fresh.get(k), dict):
+                            fresh[k]["reopen_failed_ts"] = time.time()
+                            fresh[k]["reopen_failures"] = int(fresh[k].get("reopen_failures") or 0) + 1
+                    write_json(ASKS, fresh)
+                say(f"ask panel {panel_id}: reopening for {items[0][1].get('asker')} failed: {problem}")
+                if int(items[0][1].get("reopen_failures") or 0) + 1 < ASK_REOPEN_TRIES:
+                    continue
+            else:
+                event("ask-panel-reopened", panel=panel_id, asker=items[0][1].get("asker"), asker_state=state,
+                      items=[k for k, _v in items])
+                continue
+        with locked():
+            fresh = read_asks()
+            if not unchanged([(k, fresh[k]) for k, _v in items if isinstance(fresh.get(k), dict)
+                              and fresh[k].get("state") == "open"]):
+                continue  # an opener registered a pane or a reservation meanwhile: not lost
+            for k, _v in items:
+                v = fresh.get(k)
+                if isinstance(v, dict) and v.get("state") == "open":
+                    v.update(state="lost", closed=dt.datetime.now().isoformat(timespec="seconds"),
+                             closed_ts=time.time(), closed_by="no panel and no asker")
+                    lost.append(k)
+            write_json(ASKS, fresh)
+        for k, v in items:
+            event("ask-lost", id=k, uuid=v.get("uuid"), pane=v.get("pane"))
+    return lost
+
+
+def list_asks(args: argparse.Namespace) -> int:
+    """`ask --list [--all] [--json]`: this machine's open (and lost) items; `--everywhere` or
+    `ask --inbox`: every saved machine's too. A machine that does not answer is named (exit 3)."""
+    with contextlib.suppress(SleeperError):
+        reap_lost_asks()
+    asks = read_asks()
+    rows = [dict(v, id=k, type=ask_kind(v)) for k, v in sorted(asks.items(), key=lambda kv: kv[1].get("created", ""))
+            if args.all or v.get("state") == "open" or (v.get("state") == "lost" and not v.get("lost_told"))]
+    problems: list[str] = []
+    everywhere = getattr(args, "everywhere", False) or getattr(args, "inbox", False)
+    if everywhere:
+        rows, problems = rows_everywhere(rows, args.all)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        for p in problems:
+            print(f"ask --list: {p}", file=sys.stderr)
+        return 3 if problems else 0
+    now = time.time()
+    for r in rows:
+        old = now - float(r.get("created_ts") or now) > ASK_STALE_SECONDS
+        flag = " STALE" if r.get("state") == "open" and old else (" LOST" if r.get("state") == "lost" else "")
+        who = f"{r.get('machine') or '?'}/{r.get('asker', '?')}" if everywhere else r.get("asker", "?")
+        print(f"{r['id']}  {r.get('state', '?'):9} {ask_kind(r):8} {clean_text(who):28} "
+              f"{clean_text(r.get('asker_place') or '-'):40} {clean_text(r.get('question', ''))}{flag}")
+    if not rows:
+        print("no open asks")
+    for p in problems:
+        print(f"UNREACHABLE {p}")
+    return 3 if problems else 0
+
+
+def rows_everywhere(rows: list[dict], everything: bool) -> tuple[list[dict], list[str]]:
+    """This machine's rows plus every saved machine's (`ask --list --json` there); the machines
+    that did not answer, named."""
+    me = None
+    with contextlib.suppress(SleeperError, ConfigError):
+        me = this_machine()
+    rows = [dict(r, machine=r.get("machine") or me) for r in rows]
+    problems: list[str] = []
+    for label in other_machines():
+        try:
+            done = remote_sleeper(label, ["ask", "--list", "--json", *(["--all"] if everything else [])])
+            got = json.loads(done.stdout) if done.returncode in (0, 3) and done.stdout.strip() else None
+            if not isinstance(got, list):
+                raise SleeperError(clean_text(done.stderr.strip()[:200]) or f"exit {done.returncode}")
+            rows += [dict(r, machine=r.get("machine") or label) for r in got
+                     if isinstance(r, dict) and ASK_ID_RE.fullmatch(str(r.get("id")))]
+        except (SleeperError, json.JSONDecodeError) as exc:
+            problems.append(f"{label}: could not list its asks ({exc}); its items are NOT listed")
+    return rows, problems
+
+
 def close_ask(ask_id: str, state: str, **fields: object) -> dict | None:
-    """Mark an open ask closed (answered, discuss, withdrawn) and return its record, or None if it
-    was not open. Takes the global lock."""
+    """Mark an open ask closed (answered, done, declined, noted, withdrawn, done-by-session) and
+    return its record, or None if it was not open. Takes the global lock."""
     with locked():
         asks = read_asks()
         rec = asks.get(ask_id)
@@ -4342,114 +4820,939 @@ def close_ask(ask_id: str, state: str, **fields: object) -> dict | None:
     return rec
 
 
-def drop_ask_tab(rec: dict) -> None:
-    """Release the ask tab's sidebar claim and close it. Best effort; the tab may be gone."""
-    with contextlib.suppress(SleeperError):
-        herdr("pane", "release-agent", rec["pane"], "--source", ASK_SOURCE, "--agent", ASK_AGENT, check=False)
-        herdr("tab", "close", rec["tab"], check=False)
+def drop_legacy_tab(rec: dict, ask_id: str) -> None:
+    """A tab-design ask's own tab: release its sidebar claim and close its pane, only when that
+    pane provably runs this ask's `ask-pane` program. Never used for a panel (in the asker's tab)."""
+    if rec.get("panel") or not rec.get("pane"):
+        return
+    close_ask_pane(rec["pane"], ask_id, legacy=True)
 
 
-def withdraw_ask(ask_id: str, uuid: str) -> int:
+def withdraw_ask(ask_id: str, uuid: str, agent_name: str | None, pane: str | None = None,
+                 terminal: str | None = None, state: str = "withdrawn") -> int:
     rec = read_asks().get(ask_id)
     if not isinstance(rec, dict):
         print(f"ask: no ask {ask_id}", file=sys.stderr)
         return 1
-    if rec.get("uuid") != uuid:
+    if not ask_is_mine(rec, uuid, agent_name, pane, terminal):
         print(f"ask: {ask_id} is another session's ask", file=sys.stderr)
         return 1
-    rec = close_ask(ask_id, "withdrawn")
+    if state == "done-by-session" and ask_kind(rec) != TODO:
+        print(f"ask: {ask_id} is a question; --done closes a to-do you checked is done (withdraw a question)",
+              file=sys.stderr)
+        return 2
+    rec = close_ask(ask_id, state, closed_by="asker")
     if rec is None:
         print(f"ask {ask_id} is closed already")
         return 0
-    drop_ask_tab(rec)
-    event("ask-withdrawn", id=ask_id, uuid=uuid)
-    print(f"ask {ask_id} withdrawn; its tab is closed")
+    if not rec.get("panel"):
+        drop_legacy_tab(rec, ask_id)
+    event("ask-withdrawn", id=ask_id, uuid=uuid, state=state)
+    print(f"ask {ask_id} {'closed as done' if state == 'done-by-session' else 'withdrawn'}; the ask panel drops it "
+          "within a second (and closes once nothing else is open)")
     return 0
 
 
-ASK_ABOUT_LINES = 8
-
-
-def ask_screen(ask_id: str, rec: dict) -> str:
-    lines = [f"{ASK_MARK}{rec.get('asker')} asks ({rec.get('asker_place') or '-'}, ask {ask_id}, "
-             f"{rec.get('created')}):", "", f"  {rec.get('question')}", ""]
-    if rec.get("context"):
-        lines += [rec["context"], ""]
-    about = archived(str(rec["re"])) if rec.get("re") else None
-    if about:
-        body = message_text(about.get("body"))
-        lines += [f"It is about msg {about['id']} from {about.get('from')} ({about.get('at')}):"]
-        lines += [f"  | {ln[:160]}" for ln in body[:ASK_ABOUT_LINES]]
-        if len(body) > ASK_ABOUT_LINES:
-            lines.append(f"  | … `herdr-sleeper show {about['id']}` prints all of it")
-        lines.append("")
-    for i, o in enumerate(rec.get("options") or [], 1):
-        lines.append(f"  {i}) {o}" + ("   (recommended)" if rec.get("recommend") == i else ""))
-    lines += [f"  {ASK_DISCUSS}) discuss it in the session first (it is told you are coming; this tab closes)", "",
-              "Type a number, d, or your own answer, then Enter. The answer goes to the session as yours.", ""]
-    return "\n".join(lines)
-
-
-def ask_answer(rec: dict, line: str) -> tuple[str, str] | None:
-    """(state, message body) for what the owner typed, or None for nothing usable."""
-    text = line.strip()
-    if not text or CONTROL_CHARS.search(text):
+def ask_close_refusal(uuid: str, agent_name: str | None, pane: str | None = None,
+                      terminal: str | None = None) -> str | None:
+    """close_refusals' line for a session that still waits on the owner."""
+    mine = open_asks(uuid, agent_name, pane=pane, terminal=terminal)
+    if not mine:
         return None
+    return (f"has {len(mine)} open ask(s) for the owner ({', '.join(k for k, _v in mine)}; "
+            "`herdr-sleeper ask --withdraw ID` once they no longer matter)")
+
+
+def retire_session_asks(uuid: str, agent_name: str | None, by: str, pane: str | None = None,
+                        terminal: str | None = None) -> list[str]:
+    """A session is being closed (forced past its open asks): withdraw them and close its panel's
+    pane (only a pane that provably runs that panel), so the session's tab can close whole and no
+    panel is left behind in it. Names what it withdrew. Caller (close_session) holds the global lock."""
+    gone: list[str] = []
+    titles: list[str] = []
+    panels: dict[str, str] = {}
+    legacy: list[tuple[str, dict]] = []
+    asks = read_asks()
+    for k, v in open_asks(uuid, agent_name, asks, pane, terminal):
+        v.update(state="withdrawn", closed_by=f"close by {by}", closed_ts=time.time(),
+                 closed=dt.datetime.now().isoformat(timespec="seconds"))
+        gone.append(k)
+        titles.append(f"{k} «{clean_text(v.get('question'))[:60]}»")
+        if v.get("panel") and v.get("pane"):
+            panels[str(v["panel"])] = str(v["pane"])
+        elif v.get("pane"):
+            legacy.append((k, v))
+    if gone:
+        write_json(ASKS, asks)
+    for k, v in legacy:
+        drop_legacy_tab(v, k)
+    for panel_id, panel_pane in panels.items():
+        close_ask_pane(panel_pane, panel_id)  # never a pane that took the id since
+    for k in gone:
+        event("ask-withdrawn", id=k, uuid=uuid, by=by, via="close")
+    if gone:
+        say(f"close by {by}: withdrew {len(gone)} open ask(s) of {agent_name or uuid}: {'; '.join(titles)}")
+    return gone
+
+
+# ---------------------------------------------------------------- the panel's screen
+
+ANSI_SEQ = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
+BIDI_CHARS = re.compile("[‎‏‪-‮⁦-⁩]")
+SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def clean_text(text: object) -> str:
+    """Session-supplied text as plain printable text: no escape sequences (a session must not paint
+    or move the owner's terminal), no control or bidi characters; tabs become spaces."""
+    s = ANSI_SEQ.sub("", str(text or "")).replace("\t", "    ")
+    s = CONTROL_CHARS.sub("", s.replace("\r\n", "\n").replace("\r", "\n"))
+    return BIDI_CHARS.sub("", s)
+
+
+def visible_len(line: str) -> int:
+    return len(SGR_RE.sub("", line))
+
+
+def wrap_text(text: str, width: int, indent: str = "", first: str | None = None) -> list[str]:
+    """Wrap each line of text to width (blank lines kept), with indent on every line, or first on the first."""
+    import textwrap
+    out: list[str] = []
+    lead = indent if first is None else first
+    for para in clean_text(text).split("\n"):
+        if not para.strip():
+            out.append("")
+            continue
+        got = textwrap.wrap(para, width=max(8, width), initial_indent=lead, subsequent_indent=indent,
+                            break_long_words=True, break_on_hyphens=False, drop_whitespace=True) or [lead]
+        out += got
+        lead = indent
+    return out
+
+
+def ago(rec: dict, now: float | None = None) -> str:
+    stamp = rec.get("created_ts")
+    if not isinstance(stamp, (int, float)):
+        with contextlib.suppress(ValueError, TypeError):
+            stamp = dt.datetime.fromisoformat(str(rec.get("created"))).timestamp()
+    if not isinstance(stamp, (int, float)):
+        return "?"
+    secs = max(0, int((now or time.time()) - stamp))
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return f"{secs // 60} min ago"
+    if secs < 2 * 86400:
+        return f"{secs // 3600} h ago"
+    return f"{secs // 86400} days ago"
+
+
+class PanelView(NamedTuple):
+    items: list            # [(ask id, record)], by slot
+    cur: str | None        # the selected item's id
+    page: int              # the selected item's context page
+    width: int
+    height: int
+    who: dict              # {name, machine, place, status, report}
+    note: str              # one status line (what just happened)
+    pending: dict | None   # an answer waiting for y: {id, slot, state, body, shown}
+    buf: str               # what is typed so far
+
+
+def disp_len(text: str) -> int:
+    """Terminal columns of plain text: wide characters (❓ ❗, CJK) take two."""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def fit_to(text: str, width: int) -> str:
+    """Cut plain text to width terminal columns, with … when cut."""
+    if disp_len(text) <= width:
+        return text
+    out, used = "", 0
+    for ch in text:
+        w = disp_len(ch)
+        if used + w > width - 1:
+            break
+        out, used = out + ch, used + w
+    return out + "…"
+
+
+def item_card(ask_id: str | None, rec: dict, W: int, st: Callable[[str, str], str],
+              selected: bool = True) -> tuple[str, list[str], list[list[str]]]:
+    """One item as a card: its title line, its question lines, and its answers three ways (wrapped,
+    one line each, packed), so a short pane keeps every answer on screen. Shared by the panel and
+    the inbox."""
+    todo = ask_kind(rec) == TODO
+    tags = [f"{TODO_MARK}TO-DO" if todo else "QUESTION", ago(rec), f"ask {ask_id}"]
+    if rec.get("talk"):
+        tags.append("talking it over")
+    if rec.get("state") == "open" and time.time() - float(rec.get("created_ts") or time.time()) > ASK_STALE_SECONDS:
+        tags.append("STALE")
+    if rec.get("state") == "lost":
+        tags.append("LOST (no panel)")
+    title = st(fit_to(f"{'▶' if selected else ' '} {rec.get('slot', '?')}  " + " · ".join(tags), W), "1;33")
+    q = [st(ln, "1") for ln in wrap_text(str(rec.get("question") or ""), W, "   ")] or ["   ?"]
+    wrapped: list[str] = []
+    compact: list[str] = []
+    if not todo:
+        for i, o in enumerate(rec.get("options") or [], 1):
+            star = rec.get("recommend") == i
+            lines = wrap_text(str(o) + ("   ★ recommended" if star else ""), W, "       ", f"   {i})  ")
+            wrapped += [st(ln, "1;32") if star else ln for ln in lines]
+            one = fit_to(f" {i}) {'★ ' if star else ''}{clean_text(o)}", W)
+            compact.append(st(one, "1;32") if star else one)
+        wrapped.append(fit_to(f"   {ASK_TALK})  talk it over in the session first (this stays open)", W))
+        compact.append(fit_to(f" {ASK_TALK}) talk it over first", W))
+    else:
+        wrapped += [fit_to(f"   {TODO_DONE})  done", W), fit_to(f"   {TODO_CANT})  can't or won't do it (x REASON)", W),
+                    fit_to("   or type a note for the session", W)]
+        compact += [fit_to(f" {TODO_DONE}) done · {TODO_CANT}) can't (x REASON)", W), fit_to(" or type a note", W)]
+    packed: list[str] = []
+    for part in (SGR_RE.sub("", c).strip() for c in compact):
+        if packed and disp_len(packed[-1] + "  " + part) <= W:
+            packed[-1] += "  " + part
+        else:
+            packed.append(fit_to(part, W))
+    return title, q, [wrapped, compact, packed]
+
+
+def panel_lines(v: PanelView, color: bool = True) -> list[str]:
+    """The panel's screen: at most v.height lines of at most v.width columns. Never dropped: who
+    asks (the identity line), the selected item's question (its first line), every answer (the
+    options with the recommended one marked ★, `?`, or done/x for a to-do: wrapped, else one line
+    each, else packed) and the input line. The rest goes by priority when space is short (the other
+    items first, the context last of all but pages with `m`)."""
+    W, H = max(20, v.width), max(8, v.height)
+
+    def st(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if color and text else text
+
+    def fit(text: str) -> str:
+        return fit_to(text, W)
+
+    items = v.items
+    rec = next((r for k, r in items if k == v.cur), items[0][1] if items else {})
+    cur = v.cur if any(k == v.cur for k, _r in items) else (items[0][0] if items else None)
+    name = clean_text(v.who.get("name") or rec.get("asker") or "?")
+    machine = clean_text(v.who.get("machine") or rec.get("machine") or "")
+    who_s = f"{machine + '/' if machine else ''}{name}"
+    ident = f"{ASK_MARK}{who_s} waits on you · {len(items)} open"
+    if disp_len(ident) > W:
+        ident = f"{ASK_MARK}{who_s} ({len(items)})"
+    segs: list[tuple[object, list[str]]] = [(0, [st(fit(ident), "1;7")])]
+    segs.append((3, [st(fit(f"   {clean_text(v.who.get('place') or rec.get('asker_place') or '-')}"
+                            f"{' · ' + clean_text(v.who['status']) if v.who.get('status') else ''}"), "36")]))
+    if v.who.get("report"):
+        segs.append((4, [st(fit(f"   ⚠ sidebar: {clean_text(v.who['report'])}"), "33")]))
+    segs.append((6, ["─" * W]))
+    answers: list[list[str]] = [[]]
+    ctx: list[str] = []
+    if rec:
+        title, q, answers = item_card(cur, rec, W, st)
+        segs.append((2, [title]))
+        segs.append((0, q[:1]))
+        if len(q) > 1:
+            segs.append((5, q[1:5] + (["   …"] if len(q) > 5 else [])))
+        segs.append(("answers", []))
+        body = clean_text(rec.get("context") or "")
+        about = archived(str(rec["re"])) if rec.get("re") else None
+        if about:
+            body += (("\n\n" if body else "")
+                     + f"About msg {about['id']} from {about.get('from')} ({about.get('at')}):\n"
+                     + "\n".join(f"| {ln}" for ln in message_text(about.get("body"))))
+        if body.strip():
+            ctx = [st("Context", "2"), *[fit(ln) for ln in wrap_text(body, W - 3, "   ")]]
+        segs.append(("ctx", []))
+    others = [(k, r) for k, r in items if k != cur]
+    if others:
+        rest = [fit(f"  {r.get('slot', '?')}  {TODO_MARK + 'TO-DO' if ask_kind(r) == TODO else 'ASK'}  "
+                    f"{clean_text(r.get('question'))}") for _k, r in others[:4]]
+        if len(others) > 4:
+            rest.append(f"  … {len(others) - 4} more (Tab)")
+        segs.append((7, ["─" * W, st(fit(f"Also waiting ({len(others)}): Tab or #N switches"), "2"), *rest]))
+    segs.append((6, ["─" * W]))
+    if v.note:
+        segs.append((2, [st(fit(clean_text(v.note)), "36")]))
+    if v.pending:
+        qline = clean_text(next((r.get("question") for k, r in items if k == v.pending.get("id")), "") or "")
+        qshort = qline if len(qline) <= 40 else qline[:39] + "…"
+        segs.append(("confirm", [*[st(ln, "1;35") for ln in wrap_text(
+                         f"Send to {name} as your answer to item {v.pending.get('slot')} «{qshort}»:", W)],
+                         *[st(ln, "1") for ln in wrap_text(f"«{clean_text(v.pending.get('shown'))}»", W, "   ",
+                                                          "   ")[:3]],
+                         fit("y or Enter sends it · n or Esc goes back")]))
+    elif rec and ask_kind(rec) == TODO:
+        segs.append((1, wrap_text(f"{TODO_DONE} done · {TODO_CANT} REASON can't · or a note; Enter, then y or Enter",
+                                  W)[:2]))
+        segs.append((6, [st(fit("Tab next item · m more context · s go to the session · z zoom"), "2")]))
+    else:
+        n = len(rec.get("options") or []) if rec else 0
+        segs.append((1, wrap_text((f"1-{n} (or 2 NOTE) or your own words" if n else "your answer")
+                                  + f" · {ASK_TALK} talk; Enter, then y or Enter", W)[:2]))
+        segs.append((6, [st(fit("Tab next item · m more context · s go to the session · z zoom"), "2")]))
+    segs.append((0, [fit("> " + v.buf)]))
+
+    def size(parts: list[tuple[object, list[str]]], ans: list[str]) -> int:
+        return sum(len(ans) if p == "answers" else len(ls) for p, ls in parts if p != "ctx")
+
+    chosen, ans = segs, answers[-1]
+    for ans_try, lowest in ((answers[0], 5), (answers[1] if len(answers) > 1 else answers[0], 1),
+                            (answers[-1], 1)):
+        cand = list(segs)
+        for prio in (7, 6, 5, 4, 3, 2, 1):
+            if size(cand, ans_try) <= H or prio < lowest:
+                break
+            cand = [(p, ls) for p, ls in cand if p != prio]
+        chosen, ans = cand, ans_try
+        if size(cand, ans_try) <= H:
+            break
+    if v.pending and size(chosen, ans) > H:
+        # confirming: the chosen answer is on the confirm line, so the answers may go, and the
+        # confirm line shrinks; it is never cut (Enter would send what the owner cannot see)
+        short = wrap_text(f"Send «{clean_text(v.pending.get('shown'))}» as item {v.pending.get('slot')}? "
+                          "y/Enter sends, n back", W)
+        chosen = [(p, short if p == "confirm" else ls) for p, ls in chosen]
+        ans = []
+        if size(chosen, ans) > H:
+            # who, the input line and the confirm, its start first: the item, then the answer from
+            # its beginning, cut with … (z zooms the panel to see it all)
+            head = [fit(f"Item {v.pending.get('slot')} «{qshort}»"), fit("y/Enter sends · n back")]
+            body = wrap_text(f"«{clean_text(v.pending.get('shown'))}»", W)
+            room_c = max(1, H - 4)
+            if len(body) > room_c:
+                body = body[:room_c]
+                body[-1] = fit_to(body[-1], W - 2).rstrip("…") + " …"
+            chosen = [(p, head + body if p == "confirm" else ls) for p, ls in chosen
+                      if p == "confirm" or (p == 0 and ls is segs[0][1]) or (p == 0 and ls is segs[-1][1])]
+    room = H - size(chosen, ans)
+    if ctx and room < min(len(ctx), 4):  # give the context a few rows before the optional bits
+        for prio in (7, 5):
+            if room >= min(len(ctx), 4):
+                break
+            freed = sum(len(ls) for p, ls in chosen if p == prio)
+            chosen = [(p, ls) for p, ls in chosen if p != prio]
+            room += freed
+    view: list[str] = ctx
+    if len(ctx) > room:
+        if room <= 1:
+            view = [st(fit("(context: z zooms this panel, m pages it)"), "2;7")] if room == 1 else []
+        else:
+            per = room - 1
+            pages = max(1, math.ceil(len(ctx) / per))
+            page = v.page % pages
+            chunk = ctx[page * per:(page + 1) * per]
+            view = chunk + [st(fit(f"(lines {page * per + 1}-{page * per + len(chunk)} of {len(ctx)} · "
+                                   "m shows more)"), "2;7")]
+    lines: list[str] = []
+    for p, ls in chosen:
+        lines += ans if p == "answers" else view if p == "ctx" else ls
+    return lines[:H - 1] + lines[-1:] if len(lines) > H else lines
+
+
+ANSWER_RE = re.compile(r"([1-9])(?:(?:\s*[:)]\s*|\s+)(.+))?")  # `2`, `2 after 18:00`, `2: …`, `2) …`
+
+
+def ask_answer(rec: dict, line: str) -> tuple[str, str, bool] | None:
+    """(state, message body, keeps the item open) for what the owner typed, or None for nothing usable.
+    The typed text goes through clean_text first: the stored record and `show` print it."""
+    if CONTROL_CHARS.search(line):
+        return None
+    text = clean_text(line).strip()
+    if not text:
+        return None
+    if ask_kind(rec) == TODO:
+        head = f"TO-DO: {rec.get('question')}\nA: "
+        low = text.lower()
+        if low in (TODO_DONE, "done"):
+            return "done", head + "done", False
+        if low == TODO_CANT or low.startswith(TODO_CANT + " "):
+            reason = text[len(TODO_CANT):].strip()
+            return "declined", head + "can't or won't do it" + (f": {reason}" if reason else ""), False
+        return "noted", head + f"note: {text}", False
     options = rec.get("options") or []
-    if text.lower() == ASK_DISCUSS:
-        return "discuss", (f"Q: {rec.get('question')}\nA: the owner wants to discuss this with you here before "
-                           "deciding; wait for them in this session.")
-    if text.isdigit() and 1 <= int(text) <= len(options):
-        return "answered", f"Q: {rec.get('question')}\nA: option {text}: {options[int(text) - 1]}"
-    return "answered", f"Q: {rec.get('question')}\nA: {text}"
+    head = f"Q: {rec.get('question')}\nA: "
+    if text == ASK_TALK:
+        return "open", head + ("not decided yet: the owner wants to talk this over with you in your session "
+                               "first. Keep working; this ask stays open in the panel until they answer it there "
+                               "or you withdraw it."), True
+    m = ANSWER_RE.fullmatch(text)
+    if m and 1 <= int(m.group(1)) <= len(options):
+        n, note = int(m.group(1)), (m.group(2) or "").strip()
+        return "answered", head + f"option {n}: {options[n - 1]}" + (f" (note: {note})" if note else ""), False
+    return "answered", head + text, False
+
+
+def ask_target(rec: dict) -> str:
+    """The session id the answer goes to: the asker's, or, when that session id runs nowhere any
+    more (/clear), the one the asker's Herdr agent name runs now (live, else asleep)."""
+    uuid = str(rec.get("uuid"))
+    name = rec.get("asker_agent")
+    with contextlib.suppress(SleeperError):
+        if session_state(uuid) is not None or not name:
+            return uuid
+        pane, term = rec.get("asker_pane"), rec.get("asker_terminal")  # continuity: see ask_is_mine
+        if not term:
+            return uuid
+        hit = next((a for a in list_agents() if a.get("name") == name and a["pane_id"] == pane
+                    and a.get("terminal_id") == term and a.get("agent") not in (None, CLAIM_AGENT)
+                    and valid_session_id((a.get("agent_session") or {}).get("value"))), None)
+        if hit:
+            return hit["agent_session"]["value"]
+        entry = next((e for e in read_json(JOURNAL).values() if valid_entry(e) and e.get("name") == name
+                      and e.get("pane_id") == pane and e.get("terminal_id") == term), None)
+        if entry:
+            return entry["uuid"]
+    return uuid
+
+
+def kick_delivery(uuid: str, sender: str) -> None:
+    """Deliver the session's queued mail in the background (wake it if it sleeps): the panel never
+    waits on a wake or a busy session; the watcher retries what this one cannot type in."""
+    with contextlib.suppress(OSError):
+        subprocess.Popen([sys.executable, str(SELF), "deliver-pending", uuid, "--from", sender],
+                         start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+SENT, GONE, BUSY = "sent", "gone", "busy"
+
+
+def send_answer(ask_id: str, state: str, body: str, keep_open: bool,
+                focused: bool | None = None) -> tuple[str, str]:
+    """Queue the owner's answer and close the item in one step (a withdraw either came first, and
+    nothing is sent, or comes after and finds it closed). The stored answer is the text queued.
+    Never waits: the session's mailbox lock is only tried, then the global lock (that order:
+    finish_delivery holds the mailbox lock while it takes the global one; close_session takes the
+    mailbox lock without waiting) for at most a moment; busy, the panel retries. Delivery runs
+    detached. Returns (SENT, GONE or BUSY, the line for the panel). `focused`: whether the panel
+    had the focus when it was confirmed, kept in the record only (forensics, not proof)."""
+    rec = read_asks().get(ask_id)
+    if not isinstance(rec, dict) or rec.get("state") != "open":
+        return GONE, "That item was withdrawn or answered meanwhile; nothing sent."
+    uuid = ask_target(rec)
+    sender = f"ask.{ask_id}"
+    busy = (BUSY, f"Item {rec.get('slot') or 1}: {clean_text(rec.get('asker'))} is taking other mail right now; "
+                  "retrying (nothing is lost)…")
+    msg_id = f"ask-{ask_id}" + ("-talk" if keep_open else "")
+    with mailbox_lock(uuid, wait=False) as free:
+        if not free:
+            return busy
+        try:
+            with locked(timeout=0.5):
+                asks = read_asks()
+                rec = asks.get(ask_id)
+                if not isinstance(rec, dict) or rec.get("state") != "open":
+                    return GONE, "That item was withdrawn or answered meanwhile; nothing sent."
+                extra = {"kind": OWNER_ANSWER, "ask": ask_id, "re": ask_id, "thread": rec.get("thread") or ask_id,
+                         "to_name": rec.get("asker")}
+                msg, status = queue_message(uuid, sender, body, msg_id, extra=extra)
+                if status != "new":  # queued before (a crash between queue and record, a second talk): that text
+                    body = str((archived(msg_id) or {}).get("body") or body)
+                if keep_open:
+                    rec.update(talk=True, uuid=uuid, talk_msg=msg["id"])
+                else:
+                    rec.update(state=state, answer=body.split("\nA: ", 1)[-1], msg=msg["id"], to=uuid,
+                               focused=focused, closed=dt.datetime.now().isoformat(timespec="seconds"),
+                               closed_ts=time.time())
+                write_json(ASKS, asks)
+        except SleeperError:
+            return busy
+    event("ask-answered", id=ask_id, uuid=uuid, state=state, msg=msg_id, queued=status, focused=focused)
+    kick_delivery(uuid, sender)
+    if status != "new":
+        return SENT, (f"Item {rec.get('slot')}: the session was told already (msg {msg_id})." if keep_open else
+                      f"Item {rec.get('slot')}: an answer was queued already (msg {msg_id}); it stands.")
+    return SENT, (f"Item {rec.get('slot')}: queued as msg {msg_id} for {clean_text(rec.get('asker'))}; it is typed "
+                  "in when the session is ready (a sleeping one is woken).")
+
+
+def asker_where(rec: dict) -> dict:
+    """Where the asker is now, by the labels the owner sees: {place, status, state}."""
+    try:
+        agents = list_agents()
+    except SleeperError:
+        return {"place": rec.get("asker_place"), "status": None, "state": None}
+    state, row = asker_now(rec, agents)
+    if state == "live" and row:
+        place = ui_place({"place": ui_places(agents).get(row["pane_id"]), "machine": rec.get("machine")})
+        mine = os.environ.get("HERDR_PANE_ID")
+        left = " (left of this panel)" if mine and any(a["pane_id"] == mine and a.get("tab_id") == row.get("tab_id")
+                                                       for a in agents) else ""
+        return {"place": place if place != "-" else rec.get("asker_place"),
+                "status": f"{row.get('agent_status')}{left}", "state": state}
+    if state == "asleep":
+        return {"place": rec.get("asker_place"), "status": "asleep; an answer wakes it", "state": state}
+    return {"place": rec.get("asker_place"), "status": "not running now; the answer waits for it", "state": None}
+
+
+def panel_report(pane: str, items: list, argv: list[str], cur: str | None = None) -> str | None:
+    """Hold the panel's sidebar row: blocked, labelled "needs you", named by machine, asker and
+    count and by the selected (else oldest) item's kind and title, e.g. `❓ mini2/x (2): decide: …`
+    (❗ for a to-do), also as token `$ask`. Every session-supplied value given to a Herdr flag starts
+    with a mark, never with `-`. Then check Herdr shows it. None, or what is wrong."""
+    first = dict(items).get(cur) or items[0][1]
+    machine = clean_text(first.get("machine") or "")
+    mark = TODO_MARK if ask_kind(first) == TODO else ASK_MARK
+    title = ask_title(first, 200)[len(mark):]
+    display = fit_to(f"{mark}{machine + '/' if machine else ''}{clean_text(first.get('asker'))} ({len(items)}): "
+                     f"{title}", 80)
+    try:
+        herdr("pane", "report-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, "--state", "blocked",
+              "--message", fit_to(f"{mark}{clean_text(first.get('question'))}", 120), "--", *argv)
+        herdr("pane", "report-metadata", pane, "--source", ASK_META_SOURCE, "--agent", ASK_AGENT,
+              "--display-agent", display, "--state-label", f"blocked={ASK_STATE_LABEL}",
+              "--token", f"{ASK_TOKEN}={ask_title(first, 80)}", check=False)
+    except SleeperError as exc:
+        return f"report failed ({exc}); retrying"
+    info = ask_pane_info(pane)
+    if info.get("agent") != ASK_AGENT or info.get("agent_status") != "blocked":
+        return (f"Herdr shows this panel as {info.get('agent_status') or 'nothing'}, not blocked; retrying"
+                if info else "could not read this panel's state back; retrying")
+    return None
+
+
+def panel_unreport(pane: str) -> None:
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "release-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, check=False)
+        herdr("pane", "report-metadata", pane, "--source", ASK_META_SOURCE, "--clear-display-agent",
+              "--clear-state-labels", "--clear-token", ASK_TOKEN, check=False)
+
+
+def pane_has_focus(pane: str | None) -> bool | None:
+    if not pane:
+        return None
+    focused = ask_pane_info(pane).get("focused")
+    return focused if isinstance(focused, bool) else None
+
+
+def panel_notify(items: list[tuple[str, dict]], reminder: bool = False) -> None:
+    """One toast and one sound for a bundle of items (new ones, or ones open for long)."""
+    if not items:
+        return
+    rec = items[0][1]
+    mark = TODO_MARK if all(ask_kind(r) == TODO for _k, r in items) else ASK_MARK
+    who = f"{clean_text(rec.get('machine')) + '/' if rec.get('machine') else ''}{clean_text(rec.get('asker'))}"
+    head = "still waits on you" if reminder else ("new for you" if len(items) == 1 else f"{len(items)} new for you")
+    body = "; ".join(ask_title(r, 120) for _k, r in items)
+    with contextlib.suppress(SleeperError):
+        herdr("notification", "show", fit_to(f"{mark}{who}: {head}", 80), "--body", fit_to(f"{mark}{body}", 240),
+              "--sound", "request", check=False)
+
+
+class TtyKeys:
+    """The panel's keyboard: cbreak (no line discipline, no echo, no ctrl-c signal), so the panel
+    keeps what is typed across redraws. get() returns one key: a character, or ENTER, BS, KILL,
+    NEXT, PREV, REDRAW, ESC; None on timeout. EOFError when the terminal is gone. A Ctrl-D is a
+    plain key here (no line discipline), never an end of input."""
+
+    def __init__(self, fd: int) -> None:
+        import codecs
+        self.fd, self.queue = fd, []
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.saved = termios.tcgetattr(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = (attrs[0] | termios.ICRNL) & ~(termios.INLCR | termios.IGNCR | termios.IXON)
+        attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+        attrs[6][termios.VMIN], attrs[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+    def close(self) -> None:
+        with contextlib.suppress(termios.error, OSError):
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+
+    def get(self, timeout: float) -> str | None:
+        import select
+        if not self.queue:
+            try:
+                ready, _w, _x = select.select([self.fd], [], [], timeout)
+            except InterruptedError:
+                return None
+            if not ready:
+                return None
+            try:
+                data = os.read(self.fd, 1024)
+            except InterruptedError:
+                return None
+            except OSError as exc:  # EIO: the pty's other side is gone
+                raise EOFError from exc
+            if not data:
+                raise EOFError
+            self.queue += self.tokens(self.decoder.decode(data))
+        return self.queue.pop(0) if self.queue else None
+
+    @staticmethod
+    def tokens(text: str) -> list[str]:
+        out: list[str] = []
+        i = 0
+        names = {"\r": "ENTER", "\n": "ENTER", "\x7f": "BS", "\x08": "BS", "\x15": "KILL", "\x03": "KILL",
+                 "\t": "NEXT", "\x0c": "REDRAW"}
+        while i < len(text):
+            ch = text[i]
+            if ch == "\x1b":
+                m = re.match(r"\x1b\[[0-9;]*([A-Za-z~])|\x1bO([A-Za-z])", text[i:])
+                if m:
+                    final = m.group(1) or m.group(2)
+                    out += {"A": ["PREV"], "B": ["NEXT"], "Z": ["PREV"]}.get(final, [])
+                    i += m.end()
+                    continue
+                out.append("ESC")
+            elif ch in names:
+                out.append(names[ch])
+            elif ch.isprintable():
+                out.append(ch)
+            i += 1
+        return out
+
+
+def ask_keys() -> TtyKeys:
+    return TtyKeys(sys.stdin.fileno())
+
+
+def panel_items(panel_id: str | None, legacy_id: str | None) -> list:
+    asks = read_asks()
+    if legacy_id:
+        rec = asks.get(legacy_id)
+        if not isinstance(rec, dict) or rec.get("state") != "open" or rec.get("panel"):
+            return []
+        return [(legacy_id, dict(rec, slot=rec.get("slot") or 1))]
+    return sorted(((k, v) for k, v in asks.items() if v.get("panel") == panel_id and v.get("state") == "open"),
+                  key=lambda kv: (kv[1].get("slot") or 99, kv[1].get("created", "")))
+
+
+def keys_are_a_tty(keys: object) -> bool:
+    with contextlib.suppress(OSError, AttributeError, TypeError):
+        return isinstance(keys, TtyKeys) and os.isatty(keys.fd)
+    return False
+
+
+def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> int:
+    """The panel's loop. 0: nothing open any more (its pane is closed); 1: the terminal went away
+    (the items stay open; Herdr's resume command, the session's next ask or the watcher's reaper
+    brings the panel back)."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    argv = ask_panel_argv(panel_id) if panel_id else ask_pane_argv(str(legacy_id))
+    out = sys.stdout
+    items = panel_items(panel_id, legacy_id)
+    if pane and items and not legacy_id:
+        # first of all: the live pane id (Herdr may have given it a new one in a restart) and a new
+        # start stamp, so a reaper that looked before this start abandons what it was about to do
+        set_panel_pane(str(panel_id), pane, started=True)
+    started = time.time()
+    seen: set[str] = set()
+    notified: dict[str, float] = {}
+    for k, r in items:  # a fresh panel tells of its items; a resumed one does not again at once
+        if started - float(r.get("created_ts") or 0) > 60:
+            seen.add(k)
+            notified[k] = float(r.get("created_ts") or started)
+    cur = items[0][0] if items else None
+    page, buf, note, pending = 0, "", "", None
+    retry: dict | None = None
+    retry_at = 0.0
+    who: dict = {}
+    reported_for: tuple = ()
+    last_check = last_place = 0.0
+    shown: tuple = ()
+    fresh_q: list[str] = []
+    fresh_since: float | None = None
+    eofs: list[float] = []
+    woke = False          # this panel sent the last answer: its delivery wakes the session anyway
+    last_items: list = items
+    resized = {"flag": False}
+    if isinstance(keys, TtyKeys):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGWINCH, lambda *_a: resized.update(flag=True))
+    while True:
+        items = panel_items(panel_id, legacy_id)
+        if not items:
+            if pane and not woke and last_items and asker_now(last_items[0][1])[0] == "asleep" \
+                    and pane_has_focus(pane) is not False:
+                # closing a focused pane hands the focus to its neighbour, the sleeping session,
+                # and focus wakes it: viewing or a withdraw must not, so wait until the owner moves
+                panel_unreport(pane)
+                out.write("\033[H\033[2J" + (note + "\n" if note else "") + "Nothing waits on you here any more. "
+                          "The session sleeps: this panel closes once you move away, so it is not woken.\n")
+                out.flush()
+                again = False
+                while pane_has_focus(pane) is not False:
+                    try:
+                        keys.get(ASK_POLL_SECONDS)  # type: ignore[attr-defined]
+                    except EOFError:
+                        break
+                    if panel_items(panel_id, legacy_id):
+                        again = True
+                        break
+                if again:
+                    reported_for, shown = (), ()
+                    continue
+            out.write("\033[H\033[2J" + (note + "\n" if note else "") + "Nothing waits on you here any more; "
+                      "this panel closes.\n")
+            out.flush()
+            if pane:
+                panel_unreport(pane)
+                prog, legacy = (str(panel_id), False) if panel_id else (str(legacy_id), True)
+                for _ in range(5):  # our own pane, proved like any other; can't tell: try again, else leave it
+                    mine = is_ask_pane(pane, prog, legacy)
+                    if mine is True:
+                        with contextlib.suppress(SleeperError):
+                            herdr("pane", "close", pane, check=False)  # its own pane, never a tab
+                    if mine is not None:
+                        break
+                    time.sleep(1)
+            return 0
+        last_items = items
+        woke = False
+        ids = tuple(k for k, _r in items)
+        now_t = time.time()
+        for k, r in items:
+            if k not in seen:
+                seen.add(k)
+                fresh_q.append(k)
+                notified[k] = now_t
+                fresh_since = fresh_since or now_t
+                note = f"New: item {r.get('slot')} ({'to-do' if ask_kind(r) == TODO else 'ask'})"
+        if fresh_q and fresh_since is not None and now_t - fresh_since >= ASK_NOTIFY_BUNDLE_SECONDS:
+            panel_notify([(k, r) for k, r in items if k in fresh_q])  # one toast, one sound for a burst
+            fresh_q, fresh_since = [], None
+        if cur not in ids:
+            cur, page = ids[0], 0
+        if pending and pending["id"] not in ids:
+            pending, note = None, "The item you were answering was withdrawn; nothing sent."
+        if retry and retry["id"] not in ids:
+            retry, note = None, "The item you answered was withdrawn meanwhile; nothing sent."
+        if retry and time.monotonic() >= retry_at:
+            status, note = send_answer(retry["id"], retry["state"], retry["body"], retry["keep"], retry["focused"])
+            if status == BUSY:
+                retry_at = time.monotonic() + ASK_RETRY_SECONDS
+            else:
+                woke = status == SENT and not retry["keep"]
+                retry = None
+                shown = ()
+        now = time.monotonic()
+        if pane and ((ids, cur) != reported_for or now - last_check > ASK_RECHECK_SECONDS):
+            if now - last_check > ASK_RECHECK_SECONDS:  # long-open items are told again (a low-sorted row)
+                due = [(k, r) for k, r in items if now_t - float(r.get("created_ts") or now_t) > ASK_RENOTIFY_SECONDS
+                       and now_t - notified.get(k, 0) > ASK_RENOTIFY_SECONDS]
+                if due:
+                    panel_notify(due, reminder=True)
+                    for k, _r in due:
+                        notified[k] = now_t
+            problem = panel_report(pane, items, argv, cur)
+            who["report"] = problem
+            reported_for = () if problem else (ids, cur)  # a failed report is tried again next round
+            last_check = now
+        if now - last_place > ASK_PLACE_SECONDS or not who.get("place"):
+            who.update(asker_where(items[0][1]), name=items[0][1].get("asker"), machine=items[0][1].get("machine"))
+            last_place = now
+        size = shutil.get_terminal_size((80, 24))
+        view = PanelView(items, cur, page, size.columns, size.lines, who, note, pending, buf)
+        key_view = (tuple((k, json.dumps(r, sort_keys=True, default=str)) for k, r in items), cur, page,
+                    size.columns, size.lines, json.dumps(who, sort_keys=True, default=str), note, str(pending),
+                    int(time.time() // 60))  # "4 min ago" moves on
+        if key_view != shown or resized["flag"]:
+            resized["flag"] = False
+            out.write("\033[H\033[2J" + "\n".join(panel_lines(view)))
+            out.flush()
+            shown = key_view
+        try:
+            key = keys.get(ASK_POLL_SECONDS)  # type: ignore[attr-defined]
+        except EOFError:
+            # A terminal that went away answers EOF at once, again and again; only that burst (or
+            # no terminal at all) ends the panel. The items stay open.
+            mono = time.monotonic()
+            eofs = [t for t in eofs if mono - t < 5] + [mono]
+            if not keys_are_a_tty(keys) or len(eofs) >= 20:
+                return 1
+            continue
+        if key is None:
+            continue
+        rec = dict(items).get(cur) or items[0][1]
+        if pending:  # the confirm step: y or Enter sends, n/Esc goes back, any other key starts anew
+            go = pending
+            if key in ("y", "Y") or (key == "ENTER" and not buf):
+                pending, shown = None, ()
+                focused = pane_has_focus(pane)
+                status, note = send_answer(go["id"], go["state"], go["body"], go["keep"], focused)
+                if status == BUSY:
+                    retry, retry_at = dict(go, focused=focused), time.monotonic() + ASK_RETRY_SECONDS
+                else:
+                    woke = status == SENT and not go["keep"]
+                continue
+            pending, shown, note = None, (), "Not sent; answer again."
+            if key in ("n", "N", "ESC", "KILL", "ENTER", "BS"):
+                continue
+        if key in ("NEXT", "PREV"):
+            i = ids.index(cur) if cur in ids else 0
+            cur, page, pending = ids[(i + (1 if key == "NEXT" else -1)) % len(ids)], 0, None
+            continue
+        if key in ("KILL", "ESC"):
+            buf, pending = "", None
+            shown = ()
+            continue
+        if key == "REDRAW":
+            shown = ()
+            continue
+        if key == "BS":
+            if buf:
+                buf = buf[:-1]
+                out.write("\b \b")
+                out.flush()
+            continue
+        if key != "ENTER":
+            if len(key) == 1 and len(buf) < 2000:
+                buf += key
+                if not shown:
+                    continue  # a redraw is due: it shows the buffer
+                out.write(key)
+                out.flush()
+            continue
+        text, buf = buf.strip(), ""
+        shown = ()  # Enter always redraws
+        if not text:
+            note = ""
+            continue
+        if text.lower() == "m":
+            page, note = page + 1, ""
+            continue
+        if text.lower() == "z":
+            with contextlib.suppress(SleeperError):
+                herdr("pane", "zoom", str(pane), check=False)
+            note = "z again unzooms this panel."
+            continue
+        if text.lower() == "s":
+            state, row = asker_now(rec)
+            if state == "live" and row:
+                with contextlib.suppress(SleeperError):
+                    herdr("agent", "focus", str(row["pane_id"]), check=False)
+                note = "Focused the session's pane."
+            elif state == "asleep":
+                note = "The session sleeps; going there would wake it. Answer here: the answer wakes it."
+            else:
+                note = "The session is not running now; there is nothing to go to."
+            continue
+        if re.fullmatch(r"#\d", text):
+            hit = next((k for k, r in items if str(r.get("slot")) == text[1:]), None)
+            cur, page, note = (hit, 0, "") if hit else (cur, page, f"No item {text[1:]} open.")
+            continue
+        if retry:
+            note = "Still sending your last answer; a moment."
+            continue
+        got_answer = ask_answer(rec, text)
+        if got_answer is None:
+            note = "Nothing usable typed."
+            continue
+        state, body, keep = got_answer
+        pending = {"id": cur, "slot": rec.get("slot"), "state": state, "body": body, "keep": keep,
+                   "shown": body.split("\nA: ", 1)[-1]}
+        note = ""
+
+
+def cmd_ask_panel(args: argparse.Namespace) -> int:
+    """The ask panel's program (internal): every open item of one session, one after another."""
+    set_state_dir(Path(args.state_dir))
+    if not ASK_ID_RE.fullmatch(args.panel_id):
+        print(f"ask-panel: bad panel id {args.panel_id!r}")
+        return 2
+    return _ask_ui(args.panel_id, None)
 
 
 def cmd_ask_pane(args: argparse.Namespace) -> int:
-    """The ask tab's program (internal): show the ask, hold the tab `blocked`, send the answer."""
+    """The tab design's program (internal): one tab-design ask, shown alone in its own tab."""
     set_state_dir(Path(args.state_dir))
-    ask_id = args.ask_id
-    rec = read_asks().get(ask_id) if ASK_ID_RE.fullmatch(ask_id) else None
-    pane = os.environ.get("HERDR_PANE_ID") or (rec or {}).get("pane")
+    if not ASK_ID_RE.fullmatch(args.ask_id):
+        print(f"ask {args.ask_id} is no longer open; closing this tab")
+        return 0
+    rec = read_asks().get(args.ask_id)
+    if isinstance(rec, dict) and rec.get("panel"):  # adopted into a panel meanwhile: this tab is not needed
+        print(f"ask {args.ask_id} moved to its session's ask panel; closing this tab")
+        pane = os.environ.get("HERDR_PANE_ID")
+        if pane and pane != rec.get("pane"):
+            close_ask_pane(pane, args.ask_id, legacy=True)  # this program's own pane, proved by its argv
+        return 0
     if not isinstance(rec, dict) or rec.get("state") != "open":
-        print(f"ask {ask_id} is no longer open; closing this tab")
+        print(f"ask {args.ask_id} is no longer open; closing this tab")
         if isinstance(rec, dict):
-            drop_ask_tab(rec)
+            drop_legacy_tab(rec, args.ask_id)
         return 0
-    with contextlib.suppress(SleeperError):
-        herdr("pane", "report-agent", pane, "--source", ASK_SOURCE, "--agent", ASK_AGENT, "--state", "blocked",
-              "--message", str(rec.get("question"))[:120], "--", *ask_pane_argv(ask_id), check=False)
-    sane_tty()
-    print("\033[H\033[2J", end="")  # the typed command line is noise to the owner
-    print(ask_screen(ask_id, rec))
+    return _ask_ui(None, args.ask_id)
+
+
+def _ask_ui(panel_id: str | None, legacy_id: str | None) -> int:
+    keys: object
+    try:
+        keys = ask_keys()
+    except (termios.error, OSError, ValueError, AttributeError):
+        keys = None
+    if keys is None:
+        print("ask-panel: not a terminal")
+        return 1
+    try:
+        while True:
+            try:
+                return run_ask_panel(panel_id, legacy_id, keys)
+            except Exception as exc:  # the panel must not fall back to a shell: show it, then go on
+                event("ask-panel-error", panel=panel_id, ask=legacy_id, error=f"{type(exc).__name__}: {exc}")
+                print(f"\nask-panel error: {type(exc).__name__}: {exc} (retrying in 5 s)")
+                time.sleep(5)
+    finally:
+        close = getattr(keys, "close", None)
+        if close:
+            close()
+
+
+def inbox_lines(rows: list[dict], problems: list[str], width: int, color: bool = True) -> list[str]:
+    """The inbox: every open item on every machine as the panel's cards, grouped by who asks."""
+    def st(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if color and text else text
+
+    W = max(20, width)
+    lines = [st(fit_to(f"{ASK_MARK}Everything waiting on you, all machines ({len(rows)})", W), "1;7")]
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((clean_text(r.get("machine") or "?"), clean_text(r.get("asker") or "?")), []).append(r)
+    for (machine, asker), group in groups.items():
+        lines += ["", st(fit_to(f"{machine}/{asker} · {clean_text(group[0].get('asker_place') or '-')}", W), "1;36")]
+        for r in group:
+            title, q, answers = item_card(str(r.get("id")), r, W, st, selected=False)
+            lines += [title, *q[:2], *answers[1]]
+    if not rows:
+        lines.append("Nothing waits on you.")
+    for p in problems:
+        lines.append(st(fit_to(f"UNREACHABLE {p}", W), "1;31"))
+    lines += ["", fit_to("Answer an item in its panel, right of its session (❓/❗ rows in the sidebar). "
+                         "Enter refreshes · q closes.", W)]
+    return lines
+
+
+def cmd_ask_inbox(args: argparse.Namespace) -> int:
+    """The inbox popup (plugin pane `ask-inbox`): every open item on every saved machine, as the
+    panel's cards, refreshed on Enter; q closes. Read-only: answers are typed in each panel."""
     while True:
+        rows = [dict(v, id=k) for k, v in sorted(read_asks().items(), key=lambda kv: kv[1].get("created", ""))
+                if v.get("state") == "open" or (v.get("state") == "lost" and not v.get("lost_told"))]
+        rows, problems = rows_everywhere(rows, False)
+        tty = sys.stdout.isatty()
+        size = shutil.get_terminal_size((100, 30))
+        print(("\033[H\033[2J" if tty else "") + "\n".join(inbox_lines(rows, problems, size.columns, tty)),
+              flush=True)
+        if not tty:
+            return 3 if problems else 0
         try:
-            line = input("> ")
-        except EOFError:
-            return 1  # the terminal went away; the record stays open and Herdr's resume command reopens it
-        got = ask_answer(rec, line)
-        if got is None:
-            continue
-        state, body = got
-        if read_asks().get(ask_id, {}).get("state") != "open":
-            print("This ask was withdrawn meanwhile; nothing sent.")
-            drop_ask_tab(rec)
+            if input("> ").strip().lower() in ("q", "quit", "exit"):
+                return 0
+        except (EOFError, KeyboardInterrupt):
             return 0
-        try:
-            config, _src = load_config()
-            with mailbox_lock(rec["uuid"]):
-                msg, _status = queue_message(rec["uuid"], f"ask.{ask_id}", body, f"ask-{ask_id}",
-                                             extra={"kind": OWNER_ANSWER, "ask": ask_id, "re": ask_id,
-                                                    "thread": rec.get("thread") or ask_id,
-                                                    "to_name": rec.get("asker")})
-                code, text = finish_delivery(rec["uuid"], msg["id"], f"ask.{ask_id}", pane, config)
-        except SleeperError as exc:
-            print(f"Could not send it: {exc}\nPress Enter to try again.")
-            continue
-        close_ask(ask_id, state, answer=body.split("\nA: ", 1)[-1], delivered=code == 0)
-        event("ask-answered", id=ask_id, uuid=rec["uuid"], state=state, delivered=code == 0)
-        print(text)
-        drop_ask_tab(rec)
-        return 0
+
+
+def cmd_ask_inbox_open(_args: argparse.Namespace) -> int:
+    """The `ask-inbox` action: open the inbox as a popup over the focused tab."""
+    try:
+        herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "ask-inbox", "--placement", "popup",
+              "--width", "90%", "--height", "80%", "--focus")
+    except SleeperError as exc:
+        print(f"ask-inbox: could not open the popup: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def message_text(body: object) -> list[str]:
@@ -4536,7 +5839,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         for i, o in enumerate(item.get("options") or [], 1):
             print(f"  {i}) {o}" + ("   (recommended)" if item.get("recommend") == i else ""))
         if item.get("answer"):
-            print(f"\nanswer ({item.get('closed', '?')}): {item['answer']}")
+            print(f"\nanswer ({item.get('closed', '?')}): {clean_text(item['answer'])}")
     else:
         print(thread_row(item))
         print(f"\n{item.get('body', '')}")
@@ -6936,6 +8239,15 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     flush_mail_safely(agents)
     if not STOP["requested"]:
         tend_self_closes()
+    if not STOP["requested"] and time.monotonic() - REAPED["at"] >= ASK_REAP_SECONDS:
+        REAPED["at"] = time.monotonic()
+        try:  # items whose panel is gone: reopen it, or mark them lost (never left open with nothing shown)
+            reap_lost_asks(agents)
+        except Exception as exc:
+            say(f"ask reaper: {type(exc).__name__}: {exc}")
+
+
+REAPED = {"at": float("-inf")}
 
 
 def flush_mail_safely(agents: list[dict]) -> None:
@@ -7660,17 +8972,33 @@ def main(argv: list[str] | None = None) -> int:
     clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     clp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
     clp.set_defaults(fn=cmd_close)
-    akp = sub.add_parser("ask", help="ask the owner in a tab of its own (shown blocked); context on stdin")
+    akp = sub.add_parser("ask", help="ask the owner (or give them a to-do) in your session's ask panel, split "
+                                     "right of your pane (shown blocked); context on stdin")
     akp.add_argument("--question", help="the question, one line")
+    akp.add_argument("--todo", help="instead of a question: something only the owner can do, one line (they "
+                                    "answer done, can't, or a note)")
     akp.add_argument("--option", action="append", help="an answer the owner can pick (repeat, up to 9)")
     akp.add_argument("--recommend", type=int, help="the option you recommend, by number (1 = first)")
     akp.add_argument("--re", help="the relayed message this ask is about (the ask tab shows it)")
     akp.add_argument("--withdraw", metavar="ID", help="close your own open ask")
+    akp.add_argument("--done", metavar="ID", help="close your own to-do: you checked it is done yourself")
     akp.add_argument("--list", action="store_true", help="open asks on this machine")
+    akp.add_argument("--inbox", action="store_true",
+                     help="open asks on every saved machine (an unreachable one is named, exit 3)")
     akp.add_argument("--all", action="store_true", help="with --list: answered and withdrawn ones too")
+    akp.add_argument("--everywhere", action="store_true",
+                     help="with --list: every saved machine's too (an unreachable one is named, exit 3)")
     akp.add_argument("--json", action="store_true")
     akp.set_defaults(fn=cmd_ask)
-    app = sub.add_parser("ask-pane", help="an ask tab's program (internal)")
+    apl = sub.add_parser("ask-panel", help="a session's ask panel program (internal)")
+    apl.add_argument("panel_id")
+    apl.add_argument("state_dir")
+    apl.set_defaults(fn=cmd_ask_panel)
+    sub.add_parser("ask-inbox", help="every open ask on every machine as cards, refreshed on Enter (the popup)"
+                   ).set_defaults(fn=cmd_ask_inbox)
+    sub.add_parser("ask-inbox-open", help="open the ask inbox as a popup (the plugin action)"
+                   ).set_defaults(fn=cmd_ask_inbox_open)
+    app = sub.add_parser("ask-pane", help="a tab-design ask's program (internal, kept for old asks)")
     app.add_argument("ask_id")
     app.add_argument("state_dir")
     app.set_defaults(fn=cmd_ask_pane)

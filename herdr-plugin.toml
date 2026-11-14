@@ -1,6 +1,6 @@
 id = "djbclark.herdr-sleeper"
 name = "Herdr Sleeper"
-version = "0.1.31"
+version = "0.1.32"
 min_herdr_version = "0.9.1"
 description = "Sleep idle resumable agents after a configurable window (fail-closed); wake on focus, Enter, or command."
 platforms = ["macos", "linux"]
@@ -51,3 +51,18 @@ command = ["./herdr-sleeper", "startup"]
 [[events]]
 on = "pane.focused"
 command = ["./herdr-sleeper", "on-focus"]
+
+# Everything waiting on the owner (asks and to-dos), on every saved machine: a popup of cards.
+[[actions]]
+id = "ask-inbox"
+title = "Show what waits on you (asks and to-dos, all machines)"
+contexts = []
+command = ["./herdr-sleeper", "ask-inbox-open"]
+
+[[panes]]
+id = "ask-inbox"
+title = "Asks and to-dos waiting on you (all machines)"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["./herdr-sleeper", "ask-inbox"]

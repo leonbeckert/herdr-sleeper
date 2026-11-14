@@ -371,9 +371,115 @@ herdr-sleeper thread 3f9a…    # who asked whom: every message and ask of the t
   on the other saved machines when this one lacks the id, and `thread` asks
   every saved machine, so a conversation that crossed machines reads as one.
 - **Asks:** `ask --re ID` ties an owner question to the relayed message it
-  is about. The ask tab then shows that message's first lines, so the owner
-  answers with the original ask in front of them, and the owner's answer
+  is about. The ask panel then shows that message under the question, so the
+  owner answers with the original ask in front of them, and the owner's answer
   (msg `ask-<ask id>`, `re` the ask) joins the same thread.
+
+### Asking the owner: the ask panel (*v0.1.32*)
+
+An agent that needs the owner never waits in a menu. It adds an item to its
+session's **ask panel** and keeps working:
+
+```sh
+echo "canary green 40 min; rollback is one play" | herdr-sleeper ask \
+    --question "Deploy the gateway now or tonight?" --option now --option tonight --recommend 2
+herdr-sleeper ask --todo "Run ./bin/vault-grant 4h on mini2"   # something only the owner can do
+herdr-sleeper ask --list [--all] [--everywhere] [--json]       # --everywhere: every saved machine
+herdr-sleeper ask --inbox                                       # the same; exit 3 names an unreachable machine
+herdr-sleeper ask --withdraw ID                                 # no longer needed
+herdr-sleeper ask --done ID                                     # a to-do the session checked is done itself
+```
+
+- **One panel per session**, split to the right of the asker's pane in the
+  asker's own tab (60/40), opened on the first item. Later items join it; none
+  replaces another. Up to 9 open items per session, each answered on its own.
+  The session's TUI reflows only when the panel opens and when it closes.
+- **The panel** lists the items as numbered cards: who waits (machine/name)
+  and where the session is now (re-read every 10 s), the selected item's
+  question or to-do (❗) with its answers, its context wrapped to the pane and
+  paged with `m`, and the other items one line each (`Tab` or `#N` switches).
+  The answers are pinned: the options (the recommended one marked ★), `?`, or
+  `d`/`x` for a to-do are never paged away; on a short pane they shrink to one
+  line each. `z` zooms the panel (an 80-column terminal leaves it about 22).
+- **Answering:** a question takes an option number, `N NOTE` (also `N: NOTE`,
+  `N) NOTE`: option N plus a note, `2 after 18:00`), free text, or `?` (talk
+  it over in the session: the session is told, the item stays open). A to-do
+  takes `d` (done), `x REASON` (can't or won't), or a note. Every answer is
+  confirmed: the confirm line names the item number, its question and the
+  answer, and a single `y` or Enter sends it (`2`, Enter, `y`: three keys); a
+  stray `1` meant for a Claude menu next door is never sent on its own. A
+  single Ctrl-D does nothing; only a terminal that is gone ends the panel.
+  `s` focuses the session's pane, re-resolved live; a sleeping session is not
+  focused (that would wake it). Session text is shown without escape, control
+  or bidi characters, and the typed answer is cleaned the same way before it is
+  stored.
+- **Talk, then answer:** `?` queues msg `ask-<id>-talk` and keeps the item
+  open; the later answer is msg `ask-<id>`. The record keeps both ids, and its
+  `answer` is exactly the text the session received in `ask-<id>`, so `show`
+  and `thread` never show what the session did not get.
+- **Sidebar:** the panel reports itself as agent `ask`, state `blocked`,
+  labelled `needs you` (a Claude menu still says `blocked`), named by machine,
+  asker and count and by the selected item: `❓ mini2/orch (2): decide: Push the
+  guardrail fix…` or `❗ … to-do: …` (token `$ask` the same). Every value it
+  passes to a Herdr flag starts with that mark, never with `-`. It reads its
+  state back and reports again until Herdr shows it blocked, and re-checks
+  every 30 s.
+- **Priority relies on the sidebar's sort.** The design needs
+  `ui.agent_panel_sort = "priority"` (blocked rows first). Herdr sorts the
+  rows of a machine whose connection is not Online below every live row, even
+  idle ones, with their cached state, so a "needs you" row from a stale mini
+  endpoint can sink. Two things cover that: a toast with a sound when items
+  arrive (several within 4 s give one toast and one sound), and a reminder
+  toast every 30 min for an item open longer than 30 min.
+- **Delivery:** the answer is queued and the item closed in one step under the
+  session's mailbox lock (only tried; when a delivery holds it the panel shows
+  "retrying" and tries again every half second, never blocking) and then the
+  global lock, so a withdraw either wins or finds it closed, and what is
+  stored is what was queued. A detached `deliver-pending` types it in (waking
+  a sleeper); the panel never waits. After `/clear` the answer goes to the
+  session that now runs under the asker's agent name in the same pane on the
+  same terminal (a name or pane id alone can belong to a later session).
+  Whether the panel had the focus is kept in the record (`focused`) as
+  forensics only; it is not part of the answer's header.
+- **Pane ownership:** a pane counts as a panel only when its foreground argv is
+  exactly `<script> ask-panel <panel id> <state dir>` (or `ask-pane <id>
+  <dir>` for a tab-design item). Only that proof lets `ask` join a pane and
+  lets `close`, the panel or a withdraw close one; a pane id that came back
+  after a restart with something else in it (even another session's panel) is
+  left alone. `ask` checks that the new pane runs the panel within 3 s; if it
+  does not, the split is closed at once and the next ask opens a new one.
+- **No item without a panel:** the watcher (every 30 s), `ask` and `ask --list`
+  look for open items whose panel is gone (it ended, or the owner closed it).
+  Seen gone twice 45 s apart (a restarted panel fixes its own pane id first),
+  the panel is reopened when the asker is live, or asleep with its own wake
+  stub in its pane; otherwise the items become `lost`, shown as LOST in
+  `ask --list` and the inbox, and the asker is told in the output of its next
+  ask.
+- **Inbox:** `ask --inbox` lists every open item on every saved machine and
+  names a machine it cannot reach (exit 3). The plugin action `ask-inbox`
+  opens the same as a popup of cards (`[[panes]] ask-inbox`); bind it in the
+  Herdr config, e.g. `[[keys.command]] key = "prefix+i"`, `type = "popup"`,
+  `command = "herdr-sleeper ask-inbox"`.
+- **Closing:** the panel closes its own pane (never the tab) when nothing is
+  open. When the asker sleeps and the panel has the focus, it waits until the
+  owner moves away first: closing a focused pane hands the focus to the
+  sleeping session next door, and focus wakes it. Only an answer's delivery
+  may wake a session. `close` refuses a session with open items; `--force`
+  withdraws them (and names them in its output and the log) and closes the
+  panel first, so the tab closes whole.
+- **Restart:** the panel reports `env … ask-panel <panel id> <state dir>` as
+  its resume command (no `exec`). On start it writes its current pane id onto
+  its items before anything else, and `ask` looks for the panel in the asker's
+  tab by argv before it would open a second one. Items from the tab design
+  (v0.1.31) still load and answer in their own tab; the session's next ask
+  adopts them into its panel.
+- **Trust:** only the panel queues mail of kind `owner-answer`, the only kind
+  `envelope()` heads with `[the owner's answer to your ask …]`; `deliver`,
+  `--question`, `--option` and the context refuse that text. This does not
+  prove the keys came from the owner's keyboard: Herdr 0.9.5 writes `pane
+  send-text` into a pane like typed keys, and the state dir is the same
+  user's, so a same-user agent set on forging an answer can. The confirm step
+  stops stray keys, not such an agent.
 
 **Claude Code hooks.** `claude-hook` is a hook command for two built-in
 tools. Register it in `~/.claude/settings.json` as a `PostToolUse` hook with
