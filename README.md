@@ -91,6 +91,8 @@ shells or workflows still run while its prompt waits (*v0.1.20*): the line over 
 hold it. The background-task panel under the composer (`⏺ main`, one row per task) counts as footer.
 A colour code the terminal mis-parsed can leave its tail (`;2;136;136;136m`) in front of the rule under
 the composer and make that rule wrap onto a second line; both still count as the rule (*v0.1.28*).
+Only a rule behind such a remnant wraps, onto one line: two plain rules under the prompt are a draft's
+rule and the box, and still refuse (*v0.1.30*).
 
 A displaced sleep row answers to its session id or journal key only (*v0.1.22*): its pane, and the
 pane's wake name with it, went to another session, so `deliver wake-w3-p3` reaches the newcomer or
@@ -715,15 +717,17 @@ done. The watcher continues such turns once the API answers again
   chain's start or the turn's prompt counts as spent); then `mail_refusal`
   (draft, menu, status, journal). At most 4 notes per tick, oldest error
   first. With a 60 s poll the wait between ticks ends early once a note is due.
-- In every typing path (the watcher's flush, its 5 s retries, a `deliver`
-  that flushes the box) the note is checked again on fresh state: first every
-  check above, with the config as it is now (`dry_run` too) and the pane still
+- In every typing path (the watcher's flush, its 5 s retries, a `deliver` that
+  flushes the box) the note is checked again on fresh state: first every check
+  above, with the config as it is now (`dry_run` too) and the pane still
   running that session; then `mail_refusal` (status, composer); then, right
-  before typing, the transcript once more. A note lives 2 minutes, and only
-  while the gate stays up without a break since it was queued (the watcher
-  publishes the gate in `gate.json`, so any process can check it). The tender
-  queues a new one while the stall is still due. Otherwise it is deleted
-  (`auto-resume-dropped`), never typed.
+  before typing, the transcript once more (the text is ready before the first
+  check: nothing runs between the last look and typing). A note lives 2
+  minutes, and only while the gate stays up without a break since it was
+  queued. Only the watcher probes the API, so only the watcher types a note: a
+  `deliver` in another process drops it and types its own message, which
+  resumes the session anyway. The tender queues a new one while the stall is
+  still due. Otherwise it is deleted (`auto-resume-dropped`), never typed.
 - A pane whose stall will be answered is not slept (`scan` shows
   `auto-resume pending (…, gate unknown)`); a sleeper is never woken for it.
   At the cap: one `auto-resume-gave-up` event, and the pane may sleep.
@@ -848,7 +852,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 536 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 538 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

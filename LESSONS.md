@@ -271,9 +271,12 @@ observed]*
   `isApiErrorMessage`; from 2.1.317 `apiError` and `streamCutCause` say why, older records only the text. Gate on a
   verified HTTPS answer from the API itself, probed outside the lock: a route or a DNS answer is not the API, a
   captive portal fails TLS, and another Cloudflare edge answers 403. Type through the same mailbox and gates as any
-  message, and check right before typing that the error is still the last record (a note queued before the owner
-  typed must die there). Count the notes in the transcript over a fixed window, not since the last output: a
-  flapping link produces partial output before each new error, so a counter that resets on output never stops.
+  message, and check right before typing that the error is still the last record (a note queued before the owner typed
+  must die there; build the text before that check, since even reading the config for the envelope can take long
+  enough for the owner to type). Keep the gate's word in the one process that probes and let only that process type: a
+  shared record of it outlives the probe whenever it cannot be replaced. Count the notes in the transcript over a
+  fixed window, not since the last output: a flapping link produces partial output before each new error, so a counter
+  that resets on output never stops.
 
 ## 5. Unknown is not absent
 

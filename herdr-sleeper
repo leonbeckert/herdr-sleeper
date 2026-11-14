@@ -1148,9 +1148,12 @@ def composer_state(screen: str | None) -> tuple[str, str]:
             rule = next((j for j, ln in enumerate(rest) if is_rule(ln)), None)
             if rule is None:  # a bare glyph with no box under it is not a composer we can vouch for
                 return "unknown", "no rule below the prompt"
-            # a rule that wraps (the remnant above made it wider than the pane) is one rule
+            # a rule behind a colour-code remnant may wrap (the remnant made it wider than the pane): it
+            # and the one rule line after it are one rule. Plain rules one above the other stay two (a
+            # draft with a horizontal rule in it)
             end = rule
-            while idx + 2 + end < len(lines) and is_rule(lines[idx + 2 + end]):
+            if (SGR_REMNANT.match(lines[idx + 1 + rule].strip()) and idx + 2 + rule < len(lines)
+                    and is_rule(lines[idx + 2 + rule])):
                 end += 1
             if idx + 1 + end != rules[-1]:  # the footer is skipped only below the composer's own box
                 return "unknown", "another rule below the prompt's box"
@@ -2975,6 +2978,7 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
     sent: list[str] = []
     while True:
         batch: list[tuple[Path, dict]] = []
+        texts: list[str] = []
         size = 0
         for path in pending_mail(uuid):
             try:
@@ -2992,20 +2996,24 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
             if batch and size + len(text.encode()) > MAIL_BATCH_MAX_BYTES:
                 break
             batch.append((path, msg))
+            texts.append(text)
             size += len(text.encode()) + 2
         if not batch:
             break
+        # a pending `close --self` is cancelled by what is typed in now, and the text says so. The text
+        # is ready before the checks: nothing (envelope reads the config) runs after the last look
+        closing = read_self_closes().get(uuid)
+        text = "\n\n".join(texts) + (f"\n\n{SELF_CLOSE_CANCELLED}" if closing else "")
         # an auto-resume note: the slow checks first, then the pane and its composer, then the last look
         if drop_stale_notes(batch, pane, uuid, name):
             continue
         refusal = mail_refusal(pane, uuid)
         if refusal:
             return sent, refusal
+        if read_self_closes().get(uuid) != closing:  # `close --self` as the turn ended: say so in the text
+            continue
         if drop_stale_notes(batch, pane, uuid, name, last_look=True):
             continue
-        # a pending `close --self` is cancelled by what is typed in now, and the text says so
-        closing = read_self_closes().get(uuid)
-        text = "\n\n".join(envelope(m) for _p, m in batch) + (f"\n\n{SELF_CLOSE_CANCELLED}" if closing else "")
         try:
             herdr("agent", "prompt", pane, text)
         except SleeperError:
@@ -6255,7 +6263,6 @@ GATE_FRESH_SECONDS = 30         # an older probe vouches for nothing
 GATE_GAP_SECONDS = 60           # no probe for longer (a suspended watcher, a closed lid): start over
 GATE_STILL_DOWN_SECONDS = 3600
 GATE = {"up_since": None, "down_since": None, "checked": 0.0, "detail": "", "state": None, "still_down": False}
-GATE_FILE = STATE_DIR / "gate.json"  # {up_since, checked}: the watcher's gate for every typing path (resume_note_problem)
 STALLED: dict[str, dict] = {}       # pane -> {uuid, err, seq, first, backoff, focused, early}: watcher memory
 STALL_CACHE: dict[str, tuple] = {}  # transcript path -> ((size, mtime_ns), parsed tail)
 AUTO_RESUME_EVENTED: dict[str, float] = {}  # event key -> when: one event per error record (watcher memory)
@@ -6639,42 +6646,25 @@ def refresh_gate(now: float) -> None:
         elif not GATE["still_down"] and now - GATE["down_since"] >= GATE_STILL_DOWN_SECONDS:
             GATE["still_down"] = True
             event("auto-resume-gate", state="down", still_down=True, detail=detail, stalled=len(STALLED))
-    publish_gate()
     state = "up" if up else "down"
     if state != GATE["state"]:
         GATE["state"] = state
         event("auto-resume-gate", state=state, detail=detail, stalled=len(STALLED))
 
 
-def publish_gate() -> None:
-    """GATE's up_since and checked into GATE_FILE (atomic, 0600, no fsync: a lost write only holds notes;
-    a failed one removes the file)."""
-    try:
-        ensure_state_dir()
-        fd, tmp = tempfile.mkstemp(prefix=GATE_FILE.name + ".", suffix=".tmp", dir=GATE_FILE.parent)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps({"up_since": GATE["up_since"], "checked": GATE["checked"]}) + "\n")
-        os.replace(tmp, GATE_FILE)
-    except OSError as exc:  # an old record must not keep vouching: no file reads as "unknown"
-        with contextlib.suppress(OSError):
-            GATE_FILE.unlink()
-        say(f"WARN could not record the auto-resume gate: {exc}")
-
-
 def gate_vouches(queued_at: float, now: float) -> str | None:
-    """Why the gate does not vouch for a note queued at queued_at, or None: stable now (GATE_FILE, so a
-    `deliver` in another process sees what the watcher saw) and up without a break since the note was
-    queued. A failed probe after queueing resets up_since, so it invalidates every note queued before."""
-    try:
-        rec = json.loads(GATE_FILE.read_text())
-    except (OSError, ValueError):
+    """Why the gate does not vouch for a note queued at queued_at, or None: stable now and up without a
+    break since the note was queued (a failed probe after queueing resets up_since, so it invalidates
+    every note queued before). Only the watcher probes, so only it types a note: in any other process
+    (a `deliver` that flushes the box) and in a watcher that has not probed yet the gate is unknown.
+    A shared record could outlive the watcher's word whenever it could not be replaced."""
+    if not GATE["checked"]:
         return "the API gate is unknown"
-    up, checked = (rec.get("up_since"), rec.get("checked")) if isinstance(rec, dict) else (None, None)
-    if not _number(up) or not _number(checked):
+    if GATE["up_since"] is None:
         return "the API gate is down"
-    if up > queued_at:
+    if GATE["up_since"] > queued_at:
         return "the API gate went down after the note was queued"
-    if now - up < GATE_UP_SECONDS or now - checked > GATE_FRESH_SECONDS:
+    if not gate_stable(now):
         return "the API gate is not stable now"
     return None
 

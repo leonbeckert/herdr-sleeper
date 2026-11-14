@@ -459,6 +459,11 @@ def test_composer_rule_with_a_colour_code_remnant_is_still_the_rule() -> None:
     assert cs(screen.replace(f";2;136;136;136m{rule}\n", f"  second line\n;2;136;136;136m{rule}\n"))[0] == "draft"
     assert not sleeper.is_rule("12 minutes ───")       # text before a rule is still text
     assert not sleeper.is_rule("m───") and sleeper.is_rule("[38;2;1;2;3m───") and sleeper.is_rule(";2;1m───")
+    # without the remnant, two rules one above the other are a draft's rule and the box (unknown, as before)
+    assert cs("❯ \n─────\n────────\n  ⏵⏵ bypass\n")[0] == "unknown"
+    assert cs(f"⏺ done\n{rule}\n❯ \n{rule}\n{'─' * 15}\n  ⏵⏵ bypass\n")[0] == "unknown"
+    # the remnant's rule wraps onto one line, not two
+    assert cs(screen.replace(f"{'─' * 15}\n", f"{'─' * 15}\n{'─' * 15}\n"))[0] == "unknown"
 
 
 def test_manual_command_is_shell_safe() -> None:
@@ -4648,6 +4653,27 @@ def test_delivery_cancels_a_pending_self_close_and_says_so(fake: FakeHerdr, monk
     assert fake.signals == [] and fake.agents
 
 
+def test_a_self_close_recorded_during_the_checks_is_cancelled_too(fake: FakeHerdr,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """The text is built before the checks; a `close --self` recorded while they run (the agent's last
+    command, then it turns idle) still gets the notice and is cancelled."""
+    fake.agents[0]["agent_status"] = "working"
+    assert deliver(monkeypatch, "a") == 3                               # queued: the turn still runs
+    fake.agents[0]["agent_status"] = "idle"
+    real_refusal = sleeper.mail_refusal
+
+    def agent_closes(pane: str, uuid: str) -> str | None:
+        if not _closing():
+            monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+            assert _self_close(monkeypatch) == 0
+            monkeypatch.delenv("HERDR_PANE_ID")
+        return real_refusal(pane, uuid)
+    monkeypatch.setattr(sleeper, "mail_refusal", agent_closes)
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake)[-1][3].endswith("please rebase\n\n" + sleeper.SELF_CLOSE_CANCELLED)
+    assert _closing() == {} and _event_rows("self-close-cancelled")[-1]["via"] == "deliver"
+
+
 def test_queued_mail_flushed_by_the_watcher_cancels_too(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
     fake.agents[0]["agent_status"] = "working"
     assert _self_close(monkeypatch) == 0
@@ -5499,7 +5525,6 @@ def ar_setup(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, *lin
 
 def gate_up(now: float) -> None:
     sleeper.GATE.update(up_since=now - 60, down_since=None, checked=now, state="up")
-    sleeper.publish_gate()
 
 
 def ar_prompts(fake: FakeHerdr) -> list[str]:
@@ -5900,10 +5925,17 @@ def test_a_concurrent_deliver_drops_the_stale_note_and_types_its_own(fake: FakeH
 
 def test_a_note_left_by_a_restarted_watcher_is_checked_again(fake: FakeHerdr, state: Path,
                                                             monkeypatch: pytest.MonkeyPatch) -> None:
-    queued(fake, state, monkeypatch)
+    clock = queued(fake, state, monkeypatch)
     for memory in (sleeper.STALLED, sleeper.STALL_CACHE, sleeper.AUTO_RESUME_EVENTED):
         memory.clear()                                # a new watcher process
     sleeper.GATE.update(PRISTINE_GATE)
+    sleeper.flush_mail(fake.agents)                   # it has not probed yet: its gate vouches for nothing
+    assert ar_prompts(fake) == [] and ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate is unknown"
+    gate_up(T0 + 25)
+    sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, T0 + 25)   # seen once
+    clock["t"] = T0 + 50
+    gate_up(clock["t"])
+    sleeper.tend_api_errors(fake.agents, sleeper.DEFAULTS, clock["t"])   # seen twice: queued again
     sleeper.flush_mail(fake.agents)                   # still the same dead turn: it goes in
     assert len(ar_prompts(fake)) == 1
     fake.calls.clear()
@@ -6127,7 +6159,7 @@ def test_a_note_dies_with_the_gate_it_was_queued_under(fake: FakeHerdr, state: P
     assert prompts(fake) == [] and sleeper.pending_mail(UUID) == []
     assert ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate went down after the note was queued"
     queued(fake, state, monkeypatch)
-    sleeper.GATE_FILE.unlink()                    # no watcher has published a gate here
+    monkeypatch.setattr(sleeper, "GATE", dict(PRISTINE_GATE))   # a `deliver` elsewhere: it never probed
     sleeper.flush_mail(fake.agents)
     assert prompts(fake) == [] and ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate is unknown"
 
@@ -6152,13 +6184,41 @@ def test_a_cut_tail_that_hides_the_chain_or_the_turn_is_unknown(fake: FakeHerdr,
     assert sleeper.stalled_turn(UUID, T0) is None
 
 
-def test_a_gate_that_cannot_be_published_vouches_for_nothing(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    gate_up(T0)
-    assert sleeper.gate_vouches(T0 - 1, T0) is None
+def test_nothing_runs_between_the_last_look_and_typing(fake: FakeHerdr, state: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """The envelope (it reads the config for this machine's label) and the self-close state are
+    ready before the checks; the last look is the last thing before `agent prompt`."""
+    queued(fake, state, monkeypatch)
+    log: list[str] = []
 
-    def full(*a: Any, **k: Any) -> Any:
-        raise OSError(28, "No space left on device")
-    monkeypatch.setattr(sleeper.tempfile, "mkstemp", full)
-    sleeper.GATE.update(up_since=None)            # the probe failed; writing that fails too
-    sleeper.publish_gate()
-    assert not sleeper.GATE_FILE.exists() and sleeper.gate_vouches(T0 - 1, T0 + 1) == "the API gate is unknown"
+    def spy(name: str, real: Any) -> Any:
+        def call(*a: Any, **k: Any) -> Any:
+            log.append(name)
+            return real(*a, **k)
+        return call
+    for name in ("load_config", "read_self_closes", "envelope", "stalled_turn", "mail_refusal"):
+        monkeypatch.setattr(sleeper, name, spy(name, getattr(sleeper, name)))
+    real_herdr = sleeper.herdr
+
+    def herdr(*args: str, **k: Any) -> Any:
+        if args[:2] == ("agent", "prompt"):
+            log.append("prompt")
+        return real_herdr(*args, **k)
+    monkeypatch.setattr(sleeper, "herdr", herdr)
+    sleeper.flush_mail(fake.agents)
+    assert len(ar_prompts(fake)) == 1
+    assert log[log.index("prompt") - 1] == "stalled_turn"
+    assert log.index("mail_refusal") < log.index("prompt")
+
+
+
+def test_a_deliver_elsewhere_never_types_a_note(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the watcher probes the API, so only it vouches: a `deliver` in another process types its own
+    message and drops the note (that message resumes the session anyway)."""
+    queued(fake, state, monkeypatch)
+    monkeypatch.setattr(sleeper, "GATE", dict(PRISTINE_GATE))
+    sleeper.queue_message(UUID, "mini2/peer", "the next step", "0123456789abcdef")
+    sleeper.flush_mail(fake.agents)
+    [typed] = [c[3] for c in prompts(fake)]
+    assert "msg 0123456789abcdef" in typed and "msg ar-" not in typed and sleeper.pending_mail(UUID) == []
+    assert ar_events("auto-resume-dropped")[-1]["reason"] == "the API gate is unknown"
