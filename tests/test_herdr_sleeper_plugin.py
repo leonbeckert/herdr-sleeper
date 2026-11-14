@@ -4329,6 +4329,34 @@ def test_mail_is_retried_between_ticks_only_while_some_waits(fake: FakeHerdr,
     assert len(flushes) == 60 // sleeper.MAIL_POLL_SECONDS - 1  # every 5 s; the last slot is the tick itself
 
 
+def test_pending_self_close_is_tended_between_ticks_only_while_one_waits(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    tends = []
+    monkeypatch.setattr(sleeper, "pause", lambda s: None)
+    monkeypatch.setattr(sleeper, "tend_self_closes", lambda now=None: tends.append(1))
+    sleeper.pause_watching_mail(60)
+    assert tends == []                                      # no wish: no extra Herdr calls
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch, reason="done") == 0
+    sleeper.pause_watching_mail(60)
+    assert len(tends) == 60 // sleeper.MAIL_POLL_SECONDS - 1  # every 5 s; the last slot is the tick itself
+
+
+def test_a_failing_close_retry_between_ticks_waits_for_the_tick(fake: FakeHerdr,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    tends = []
+    monkeypatch.setattr(sleeper, "pause", lambda s: None)
+
+    def broken(now: float | None = None) -> None:
+        tends.append(1)
+        raise sleeper.SleeperError("server gone")
+    monkeypatch.setattr(sleeper, "tend_self_closes", broken)
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch, reason="done") == 0
+    sleeper.pause_watching_mail(60)                         # no exception escapes; one try, then the tick
+    assert tends == [1]
+
+
 def test_deliver_names_the_real_refusal(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
                                         capsys: pytest.CaptureFixture[str]) -> None:
     fake.agents[0]["agent_status"] = "working"
@@ -4544,7 +4572,7 @@ def test_close_self_records_the_request_and_acts_on_nothing(fake: FakeHerdr, mon
     monkeypatch.setattr(sleeper.time, "time", lambda: 1_000_000.0)
     assert _self_close(monkeypatch, reason="B-17 done") == 0
     out = capsys.readouterr().out
-    assert "a closes after this turn ends; a message delivered before then cancels it" in out
+    assert "a closes after this turn ends (checked every 5 s, closed once safe); a message delivered before then cancels it" in out
     rec = _closing()[UUID]
     assert rec["at"] == 1_000_000.0 and rec["reason"] == "B-17 done" and rec["pane"] == "w1:p1"
     assert rec["name"] == "a" and rec["by"] == "a"

@@ -496,8 +496,8 @@ A session that is done closes itself: it runs `herdr-sleeper close --self
 [--reason TEXT]` from its own shell tool as the last step of its final turn.
 `close NAME` refuses the calling session, because the SIGTERM would end the
 very turn that asked; `--self` only records the wish and prints one line
-(`<name> closes after this turn ends; a message delivered before then
-cancels it`). It is always local: no `--machine`, no target, no `--force`.
+(`<name> closes after this turn ends (checked every 5 s, closed once
+safe); a message delivered before then cancels it`). It is always local: no `--machine`, no target, no `--force`.
 
 - The caller is identified like an insomnia claim (`HERDR_PANE_ID`, and that
   pane's agent process must be an ancestor of the command); outside an agent
@@ -506,7 +506,9 @@ cancels it`). It is always local: no `--machine`, no target, no `--force`.
   keeps the wish and its start (`--reason` replaces the reason).
 - The wish lives in `closing.json` in the state dir, keyed by session id
   (`at`, `name`, `pane`, `reason`, `by`), and logs `self-close-requested`.
-- Each watcher tick, after the mail flush, closes a session with a pending
+- Each watcher tick, after the mail flush, and every 5 s between ticks while
+  a wish is pending (*v0.1.31*: a session that said it closes itself no longer
+  stays up to a whole poll after its turn), closes a session with a pending
   wish once it is idle or done, through the same code as `close` (every
   refusal and the asleep-pane checks unchanged, never `--force`, `closed`
   logged with `by: "self"`, `via: "close --self"`). A session that fell
