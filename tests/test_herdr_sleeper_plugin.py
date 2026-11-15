@@ -151,7 +151,7 @@ class FakeHerdr:
         self.start_errors: list[str] = []        # codes the next `agent start` calls fail with, one each
         self.tabs_made = 0
         self.tab_labels: dict[str, str] = {}        # tab id -> the label `tab list` reports
-        self.workspace_labels: dict[str, str] = {}  # workspace id -> the label `workspace list` reports
+        self.workspace_labels: dict[str, str] = {"w1": "agents"}  # workspace id -> its label (`workspace list`)
         self.programs: dict[str, list[str]] = {}    # pane -> the argv of a program `pane run` exec'd there
         self.run_error: str | None = None           # error code `pane run` fails with
         self.run_starts = True                      # a `pane run` really starts its program
@@ -280,6 +280,20 @@ class FakeHerdr:
                    "label": args[args.index("--label") + 1]}
             self.agents.append(row)
             return {"root_pane": dict(row), "tab": {"tab_id": row["tab_id"], "workspace_id": ws, "pane_count": 1}}
+        if args[:2] == ("workspace", "create"):
+            ws = f"w{9 + len(self.workspace_labels)}"
+            self.workspace_labels[ws] = args[args.index("--label") + 1]
+            self.tabs_made += 1
+            n = 7 + self.tabs_made
+            row = {"pane_id": f"{ws}:p{n}", "tab_id": f"{ws}:t{n}", "workspace_id": ws, "focused": False,
+                   "cwd": args[args.index("--cwd") + 1], "terminal_id": f"term-new-{n}", "state_change_seq": 1}
+            self.agents.append(row)
+            self.tab_labels[row["tab_id"]] = "1"
+            return {"root_pane": dict(row), "tab": {"tab_id": row["tab_id"], "workspace_id": ws, "pane_count": 1},
+                    "workspace": {"workspace_id": ws, "label": self.workspace_labels[ws]}}
+        if args[:2] == ("tab", "rename"):
+            self.tab_labels[args[2]] = args[3]
+            return {}
         if args[:2] == ("pane", "split"):
             # a bare shell in the target's tab (Herdr 0.9.5: no command, focus unchanged)
             self.tabs_made += 1
@@ -3580,11 +3594,47 @@ def checkout(state: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _spawn(monkeypatch: pytest.MonkeyPatch, cwd: Path | str, name: str = "impl-1", prompt: str = "build B-1",
-           extra: list[str] | None = None, kind: str = "claude", sender: str | None = "orc", json_out: bool = False) -> int:
+           extra: list[str] | None = None, kind: str = "claude", sender: str | None = "orc", json_out: bool = False,
+           workspace: str | None = None) -> int:
     import io
     monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(prompt))
-    return sleeper.cmd_spawn(types.SimpleNamespace(cwd=str(cwd), name=name, kind=kind, sender=sender, workspace=None,
-                                                   json=json_out, agent_args=extra))
+    return sleeper.cmd_spawn(types.SimpleNamespace(cwd=str(cwd), name=name, kind=kind, sender=sender,
+                                                   workspace=workspace, json=json_out, agent_args=extra))
+
+
+def test_spawn_goes_to_the_agents_workspace_not_the_callers(fake: FakeHerdr, checkout: Path,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "you", "w2": "agents"}   # the caller sits in the owner's `you`
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert _spawn(monkeypatch, checkout) == 0
+    create = next(c for c in fake.calls if c[:2] == ("tab", "create"))
+    assert create[create.index("--workspace") + 1] == "w2"
+
+
+def test_spawn_makes_the_agents_workspace_on_first_use(fake: FakeHerdr, checkout: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "you"}
+    assert _spawn(monkeypatch, checkout) == 0
+    made = next(c for c in fake.calls if c[:2] == ("workspace", "create"))
+    assert made[made.index("--label") + 1] == "agents" and "--no-focus" in made
+    assert not any(c[:2] == ("tab", "create") for c in fake.calls)
+    ws = next(k for k, v in fake.workspace_labels.items() if v == "agents")
+    tab = next(k for k in fake.tab_labels if k.startswith(f"{ws}:"))
+    assert fake.tab_labels[tab] == "impl-1"                    # Herdr calls a new workspace's tab "1"
+    assert any(c[:2] == ("agent", "start") and c[2] == "impl-1" for c in fake.calls)
+
+
+def test_spawn_takes_a_workspace_label_and_refuses_a_missing_one(fake: FakeHerdr, checkout: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch,
+                                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "agents", "w3": "lab"}
+    assert _spawn(monkeypatch, checkout, workspace="lab") == 0
+    create = next(c for c in fake.calls if c[:2] == ("tab", "create"))
+    assert create[create.index("--workspace") + 1] == "w3"
+    n = len(fake.calls)
+    assert _spawn(monkeypatch, checkout, name="impl-2", workspace="nowhere") == 1
+    assert "no workspace 'nowhere'" in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("workspace", "create"), ("agent", "start")) for c in fake.calls[n:])
 
 
 def _close(monkeypatch: pytest.MonkeyPatch, target: str, force: bool = False, caller: str | None = None) -> int:

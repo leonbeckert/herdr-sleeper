@@ -585,12 +585,17 @@ An orchestrator starts named sessions and closes them again:
 
 ```sh
 echo "build B-17 in this worktree" | herdr-sleeper spawn --cwd ~/development/app-b17 \
-    --name app-b17 [--kind claude|codex|opencode] [--from orc] [--workspace w3] [--json] \
+    --name app-b17 [--kind claude|codex|opencode] [--from orc] [--workspace agents|w3] [--json] \
     [-- --dangerously-skip-permissions --model opus]
 herdr-sleeper close app-b17 [--force]
 herdr-sleeper close --self [--reason "B-17 done"]   # from inside the session: close me once this turn ends
 herdr-sleeper close --self --cancel
 ```
+
+The tab goes to the workspace `--workspace` names (a label or an id; a missing
+one is refused), else to the workspace labelled `agents` on that machine, made
+on first use (*v0.1.42*, owner 2026-11-15: spawned sessions live in `agents`,
+never among the caller's tabs).
 
 `spawn` refuses a working directory that is not inside a git checkout below
 `~/development` (realpath), a name that is taken (a live agent or a sleeper),
