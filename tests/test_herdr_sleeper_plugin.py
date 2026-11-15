@@ -7943,6 +7943,22 @@ def test_codex_composer_reads_the_lab_screens(name: str, state: str) -> None:
     assert "draft one line" not in detail and "second line" not in detail   # never what the draft says
 
 
+@pytest.mark.parametrize("name, state", [
+    ("01-home", "empty"),
+    ("04-cleared", "empty"),
+    ("06-done", "empty"),
+    ("07-after-prompt", "empty"),          # after `herdr agent prompt` typed a multi-line envelope
+    ("02-draft", "draft"),
+    ("03-draft-multi", "draft"),
+    ("05-working", "unknown"),
+])
+def test_codex_composer_reads_the_0_169_screens(name: str, state: str) -> None:
+    # mini1 and the minis' managed install run 0.169; the screens are the same shape as 0.163's
+    screen = (CODEX_FIXTURES.parent / "codex-0.169.0" / f"screen-{name}.ansi").read_text()
+    got, detail = sleeper.codex_composer_state(screen)
+    assert got == state, detail
+
+
 def _cx_rows(name: str) -> tuple[list[str], int]:
     """A lab screen's lines and the index of its composer's `›` row."""
     lines = cx_screen(name).split("\n")
