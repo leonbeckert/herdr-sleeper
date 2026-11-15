@@ -157,6 +157,7 @@ class FakeHerdr:
         self.strict_process_info = True             # process-info of a gone pane is an error, as in Herdr
         self.aliases: dict[str, str] = {}           # old pane id -> new one after a move (until a restart)
         self.move_new_terminal: str | None = None   # a move that comes back with another terminal
+        self.stub_typed_as: dict[str, str] = {}     # pane -> the pane id its running stub's argv names (moves keep it)
 
     def restart(self, keep_resume: bool = True) -> None:
         """A Herdr server restart: every terminal gets a new id, saved labels come back, claims (hook
@@ -172,6 +173,7 @@ class FakeHerdr:
             if a.get("agent") == sleeper.CLAIM_AGENT:
                 a.pop("agent", None)
         self.stub_panes = {p for p, argv in self.resumes.items() if "stub" in argv}
+        self.stub_typed_as = {p: argv[argv.index("stub") + 1] for p, argv in self.resumes.items() if "stub" in argv}
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
@@ -207,7 +209,8 @@ class FakeHerdr:
             return [{"argv0": "python3", "name": "python3", "argv": list(self.programs[pane]), "pid": 70}]
         if pane in self.stub_panes:
             return [{"argv0": "python3", "name": "python3",
-                     "argv": ["python3", str(SCRIPT), "stub", pane, self.stub_uuid], "pid": 99}]
+                     "argv": ["python3", str(SCRIPT), "stub", self.stub_typed_as.get(pane, pane), self.stub_uuid],
+                     "pid": 99}]
         if self.empty_foreground:
             return []
         present = (a is not None and bool(a.get("agent"))) if self.process_override is None else self.process_override
@@ -317,6 +320,9 @@ class FakeHerdr:
             self.aliases[args[2]] = f"{ws}:p{n}"
             if args[2] in self.stub_panes:
                 self.stub_panes = (self.stub_panes - {args[2]}) | {f"{ws}:p{n}"}
+                self.stub_typed_as[f"{ws}:p{n}"] = self.stub_typed_as.pop(args[2], args[2])  # argv is not retyped
+            if args[2] in self.resumes:   # the saved resume command travels with the pane, unchanged
+                self.resumes[f"{ws}:p{n}"] = self.resumes.pop(args[2])
             row.update(pane_id=f"{ws}:p{n}", tab_id=f"{ws}:t{n}", workspace_id=ws)
             if self.move_new_terminal:
                 row["terminal_id"] = self.move_new_terminal
@@ -7411,16 +7417,172 @@ def test_move_refuses_an_open_ask_and_queued_mail(fake: FakeHerdr, monkeypatch: 
     assert "waits on the owner (open ask)" in err and "undelivered mail" in err and not _moves(fake)
 
 
-def test_move_refuses_a_sleeper_and_the_calling_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
-                                                        capsys: pytest.CaptureFixture[str]) -> None:
+def test_move_refuses_the_calling_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
     fake.workspace_labels = {"w1": "ao", "w2": "agents"}
     assert _move(monkeypatch, "a", caller="w1:p1") == 1
-    assert "calling session" in capsys.readouterr().err
-    monkeypatch.delenv("HERDR_PANE_ID")
-    slept_entry(fake)
+    assert "calling session" in capsys.readouterr().err and not _moves(fake)
+
+
+def _asleep_with_stub(fake: FakeHerdr) -> dict[str, Any]:
+    """A slept session whose pane runs our wake stub, typed in under w1:p1, with its claim's resume command."""
+    entry = slept_entry(fake)
     fake.stub_panes.add("w1:p1")
-    assert _move(monkeypatch, "a") == 1
-    assert "wake it first" in capsys.readouterr().err and not _moves(fake) and "w1:p1" in journal()
+    fake.stub_typed_as["w1:p1"] = "w1:p1"
+    fake.resumes["w1:p1"] = sleeper.stub_argv("w1:p1", UUID)
+    fake.workspace_labels = {"w1": "ao", "w2": "parked"}
+    sleeper.STUBS.mkdir(parents=True, exist_ok=True)
+    (sleeper.STUBS / f"{UUID}.pid").write_text("99\n")   # the stub (pid 99 in the fake) follows moves
+    return entry
+
+
+def _enter_stub(monkeypatch: pytest.MonkeyPatch, entry: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    monkeypatch.setattr(sleeper.os, "chdir", lambda _p: None)
+    monkeypatch.setattr(sleeper.os, "getcwd", lambda: entry["cwd"])
+    monkeypatch.setattr(sleeper.shutil, "which", lambda b: f"/opt/bin/{b}")
+    monkeypatch.setattr(sleeper.termios, "tcflush", lambda fd, how: None)
+    monkeypatch.setattr(sleeper.sys.stdin, "fileno", lambda: 0, raising=False)
+    execvps: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execvps.append((b, a)))
+    return execvps
+
+
+def test_move_moves_a_sleeper_without_waking_it(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    _asleep_with_stub(fake)
+    assert _move(monkeypatch, "a", workspace="parked") == 0
+    assert "(asleep) to parked" in capsys.readouterr().out
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls)   # nothing woke
+    assert set(journal()) == {"w2:p8"} and journal()["w2:p8"]["pane_id"] == "w2:p8"
+    assert journal()["w2:p8"]["phase"] == "asleep" and journal()["w2:p8"]["resume_reported"]
+    assert fake.resumes["w2:p8"] == sleeper.stub_argv("w2:p8", UUID)   # a restart types a stub for the new pane
+    rec = [json.loads(line) for line in sleeper.EVENTS.read_text().splitlines()][-1]
+    assert rec["event"] == "moved" and rec["state"] == "asleep" and rec["now"] == "w2:p8"
+
+
+def test_the_stub_of_a_moved_sleeper_wakes_it_by_uuid(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    assert _move(monkeypatch, "a", workspace="parked") == 0
+    fake.agents[0].pop("agent", None)
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0          # the running stub still names the old pane id
+    assert execvps and execvps[0][1][-2:] == ["--resume", UUID]
+    row = journal()["w2:p8"]
+    assert row["phase"] == "waking" and "w1:p1" not in journal()
+
+
+def test_a_stub_does_not_take_another_panes_row(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    entry = _asleep_with_stub(fake)
+    assert _move(monkeypatch, "a", workspace="parked") == 0
+    fake.stub_panes.clear()                               # the moved pane no longer runs a stub for the uuid
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert not execvps and "no journal entry" in capsys.readouterr().out
+    assert journal()["w2:p8"]["phase"] == "asleep"
+
+
+def test_reconcile_follows_a_dragged_sleeper_and_reclaims_its_resume(fake: FakeHerdr,
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    fake("pane", "move", "w1:p1", "--new-tab", "--workspace", "w2", "--label", "x", "--no-focus")  # by hand
+    sleeper.reconcile(fake.agents)
+    assert set(journal()) == {"w2:p8"} and fake.resumes["w2:p8"] == sleeper.stub_argv("w2:p8", UUID)
+    fake.agents[0].pop("agent", None)
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps
+    assert journal()["w2:p8"]["phase"] == "waking"
+
+
+def test_a_moved_sleeper_wakes_after_a_herdr_restart(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    assert _move(monkeypatch, "a", workspace="parked") == 0
+    fake.restart()                                        # old ids are forgotten; the saved command is retyped
+    assert fake.stub_typed_as == {"w2:p8": "w2:p8"}
+    sleeper.reconcile(fake.agents)
+    assert "w2:p8" in journal()
+    fake.agents[0].pop("agent", None)
+    execvps = _enter_stub(monkeypatch, {**entry, "terminal_id": fake.agents[0]["terminal_id"]})
+    assert sleeper.cmd_stub("w2:p8", UUID) == 0 and execvps
+
+
+def test_the_stub_marks_itself_as_one_that_follows_a_move(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    (sleeper.STUBS / f"{UUID}.pid").unlink()
+    fake.agents[0].pop("agent", None)
+    _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert (sleeper.STUBS / f"{UUID}.pid").read_text().strip() == str(os.getpid())
+
+
+def test_move_refuses_a_sleeper_whose_stub_predates_the_fix(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    _asleep_with_stub(fake)
+    (sleeper.STUBS / f"{UUID}.pid").write_text("4242\n")   # another (gone) stub's mark: not this process
+    assert _move(monkeypatch, "a", workspace="parked") == 1
+    assert "older herdr-sleeper" in capsys.readouterr().err and not _moves(fake) and "w1:p1" in journal()
+    (sleeper.STUBS / f"{UUID}.pid").unlink()                 # a v0.1.37 stub writes no mark at all
+    assert _move(monkeypatch, "a", workspace="parked") == 1 and not _moves(fake)
+
+
+def test_move_moves_a_sleeper_at_a_bare_shell(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    _asleep_with_stub(fake)
+    fake.stub_panes.clear()                                  # ctrl-c left a plain shell: the stub released
+    fake.agents[0].pop("agent", None)                        # its claim, and Herdr dropped the saved command
+    fake.resumes.clear()
+    assert _move(monkeypatch, "a", workspace="parked") == 0
+    assert set(journal()) == {"w2:p8"} and not fake.resumes  # nothing typed back at a restart: focus or wake
+
+
+def test_enter_after_a_drag_the_watcher_has_not_followed(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    fake("pane", "move", "w1:p1", "--new-tab", "--workspace", "w2", "--label", "x", "--no-focus")  # by hand
+    fake.agents[0].pop("agent", None)
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")             # the stub's shell started in the old pane
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps
+    assert set(journal()) == {"w2:p8"} and journal()["w2:p8"]["phase"] == "waking"
+    assert journal()["w2:p8"]["pane_id"] == "w2:p8"
+
+
+def test_a_restart_before_the_watcher_followed_a_drag(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    fake("pane", "move", "w1:p1", "--new-tab", "--workspace", "w2", "--label", "x", "--no-focus")  # by hand
+    fake.agents[0]["label"] = "💤 Title"
+    fake.restart()                                           # retypes the stub that still names w1:p1
+    assert fake.stub_typed_as == {"w2:p8": "w1:p1"}
+    sleeper.reconcile(fake.agents)
+    assert set(journal()) == {"w2:p8"}
+    sleeper.reconcile(fake.agents)                           # the restart branch re-claims the new pane
+    assert fake.resumes["w2:p8"] == sleeper.stub_argv("w2:p8", UUID)
+    assert journal()["w2:p8"]["terminal_id"] == fake.agents[0]["terminal_id"]
+    fake.agents[0].pop("agent", None)
+    monkeypatch.setenv("HERDR_PANE_ID", "w2:p8")             # the restored shell carries the new id
+    execvps = _enter_stub(monkeypatch, {**entry, "terminal_id": fake.agents[0]["terminal_id"]})
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps
+
+
+@pytest.mark.parametrize("case", ["focused", "shared-tab", "mail", "ask", "vim"])
+def test_move_refuses_a_sleeper_it_could_wake_or_strand(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str], case: str) -> None:
+    _asleep_with_stub(fake)
+    if case == "focused":
+        fake.agents[0]["focused"] = True
+    elif case == "shared-tab":
+        fake.agents.append({**agent(), "pane_id": "w1:p2", "terminal_id": "term-2", "name": "panel",
+                            "agent": None, "agent_session": None})
+    elif case == "mail":
+        with sleeper.mailbox_lock(UUID):
+            sleeper.queue_message(UUID, "orc", "later", None)
+    elif case == "ask":
+        sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
+    else:
+        fake.stub_panes.clear()
+        fake.foreground = "vim"
+    before = journal()
+    assert _move(monkeypatch, "a", workspace="parked") == 1
+    assert not _moves(fake) and journal() == before and capsys.readouterr().err
 
 
 def test_move_refuses_labels_it_cannot_send(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:

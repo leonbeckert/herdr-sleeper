@@ -207,6 +207,7 @@ ASKS = STATE_DIR / "asks.json"                  # ask id -> an owner question wi
 ARCHIVE = STATE_DIR / "messages"               # <msg id>.json: each relayed message, kept ARCHIVE_DAYS (`show`, `thread`)
 INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
 NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names a woken agent gets once Herdr lists it
+STUBS = STATE_DIR / "stubs"                     # <uuid>.pid: a running wake stub that follows a moved pane (B-465)
 
 LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
                         or os.path.expanduser("~/.local/state/herdr-sleeper"))
@@ -923,9 +924,36 @@ def stub_running(pane: str, uuid: str | None = None) -> bool | None:
             unknown = True
             continue
         i = stub_argv_index(argv)
-        if i is not None and argv[i + 2] == pane and (uuid is None or argv[i + 3] == uuid):
+        # process-info is this pane's own: with a uuid, our stub for that session is enough proof (a
+        # moved pane's stub carries the pane id it was typed in under, B-465); without one, the pane id
+        if i is not None and (argv[i + 3] == uuid if uuid is not None else argv[i + 2] == pane):
             return True
     return None if unknown else False
+
+
+def stub_pid(pane: str, uuid: str) -> int | None:
+    """The pid of our wake stub for this session in the pane's foreground, else None."""
+    info = herdr("pane", "process-info", "--pane", pane, check=False).get("process_info")
+    procs = info.get("foreground_processes") if isinstance(info, dict) else None
+    for proc in procs if isinstance(procs, list) else []:
+        argv = [str(a) for a in (proc.get("argv") or [])]
+        i = stub_argv_index(argv)
+        pid = proc.get("pid")
+        if i is not None and argv[i + 3] == uuid and isinstance(pid, int) and not isinstance(pid, bool):
+            return pid
+    return None
+
+
+def stub_follows(pane: str, uuid: str) -> bool:
+    """Does the pane run a wake stub that finds its row after a move? A stub from v0.1.38 on writes
+    its pid to STUBS/<uuid>.pid when it starts; an older one (still running the code it was started
+    with: a deploy restarts only the watcher) looks its row up by the pane id in its argv alone, so
+    moving its pane would leave its Enter without a row."""
+    pid = stub_pid(pane, uuid)
+    try:
+        return pid is not None and int((STUBS / f"{uuid}.pid").read_text().strip()) == pid
+    except (OSError, ValueError):
+        return False
 
 
 def rss_mb(pane: str) -> int:
@@ -1782,7 +1810,7 @@ def waking_alive(entry: dict) -> bool | None:
     uuid = entry.get("uuid") or ""
     i = stub_argv_index(toks)
     if i is not None:
-        return toks[i + 2:i + 4] == [entry.get("pane_id"), uuid]
+        return toks[i + 3:i + 4] == [uuid]  # the pane argument may be an older id of a moved pane
     return any(t == uuid or t.endswith("=" + uuid) for t in toks[1:])
 
 
@@ -2320,7 +2348,7 @@ def stub_argv(pane: str, uuid: str) -> list[str]:
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
-    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS, ARCHIVE
+    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS, ARCHIVE, STUBS
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
@@ -2329,6 +2357,7 @@ def set_state_dir(state_dir: Path) -> None:
     WATCHER_MISSING = STATE_DIR / "watcher-missing"
     ASKS = STATE_DIR / "asks.json"
     ARCHIVE = STATE_DIR / "messages"
+    STUBS = STATE_DIR / "stubs"
 
 
 def sane_tty(fd: int | None = None) -> None:
@@ -2351,6 +2380,41 @@ def sane_tty(fd: int | None = None) -> None:
     attrs[3] |= termios.ICANON | termios.ECHO | termios.ECHOE | termios.ECHOK | termios.ISIG | termios.IEXTEN
     with contextlib.suppress(termios.error, OSError):
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def stub_home(typed: str, uuid: str) -> str:
+    """The pane this stub runs in now. Its argv names the pane it was typed in under; a move (`move`,
+    or a drag in Herdr) gives the pane a new id (B-465). The shell's HERDR_PANE_ID resolves through
+    Herdr's alias to the new id until a restart, and after one the retyped stub runs in a fresh shell
+    that carries the new id; that pane must show our stub for this session in its foreground."""
+    here = own_pane()
+    if here and here != typed and stub_running(here, uuid) is True:
+        return here
+    return typed
+
+
+def stub_row(journal: dict, here: str, uuid: str, typed: str | None = None) -> tuple[str, dict] | None:
+    """The journal row this stub wakes, with its key: the row under the pane it runs in (`here`),
+    else the one under the pane id in its argv (`typed`: a drag the watcher has not followed yet),
+    else the one row for its uuid whose pane runs a stub for that uuid. None: no row of ours."""
+    for key in dict.fromkeys(k for k in (here, typed) if k):
+        entry = journal.get(key)
+        if isinstance(entry, dict) and entry.get("uuid") == uuid and valid_entry(entry) and not is_orphan(key, entry):
+            return key, entry
+    hits = [(k, e) for k, e in journal.items()
+            if k not in (here, typed) and valid_entry(e) and e.get("uuid") == uuid and not is_orphan(k, e)]
+    if len(hits) != 1 or stub_running(hits[0][0], uuid) is not True:
+        return None
+    return hits[0]
+
+
+def mark_stub(uuid: str) -> None:
+    """Record this stub's pid (stub_follows): `move` moves only a sleeper whose stub follows a move."""
+    with contextlib.suppress(OSError):
+        STUBS.mkdir(parents=True, exist_ok=True)
+        tmp = STUBS / f".{uuid}.{os.getpid()}"
+        tmp.write_text(f"{os.getpid()}\n")
+        tmp.replace(STUBS / f"{uuid}.pid")
 
 
 def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
@@ -2377,11 +2441,14 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
     if state_dir:
         set_state_dir(Path(state_dir))
     sane_tty()
-    journal = read_json(JOURNAL)
-    entry = journal.get(pane) or {}
-    if entry.get("uuid") != uuid or not valid_entry(entry):
+    typed = pane
+    here = stub_home(typed, uuid)
+    found = stub_row(read_json(JOURNAL), here, uuid, typed)
+    if found is None:
         print(f"herdr-sleeper: no journal entry for {uuid} in {pane}; type `exit` or start an agent by hand")
         return 0
+    pane, entry = found
+    mark_stub(uuid)
     kind = entry.get("kind") or "claude"
     name = wake_name(entry)
     print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
@@ -2397,6 +2464,10 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
             break
         print(f"herdr-sleeper: ignored {line.strip()[:60]!r} — this pane is asleep. "
               "Press Enter alone to resume, ctrl-c for a plain shell.")
+    here = stub_home(typed, uuid)                     # the pane may have been moved while we waited
+    found = stub_row(read_json(JOURNAL), here, uuid, typed)
+    if found is not None:
+        pane, entry = found
 
     def refuse(why: str, drop_claim: bool = False) -> int:
         if drop_claim:
@@ -2426,6 +2497,14 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         return refuse(f"pane cwd is {os.getcwd()}, slept-in {entry['cwd']}", drop_claim=True)
     with locked():
         journal = read_json(JOURNAL)
+        found = stub_row(journal, here, uuid, typed)
+        if found is not None:
+            pane = found[0]
+            if pane != here and here not in journal and stub_running(here, uuid) is True:
+                # moved and not yet followed by the watcher: the row goes where the stub runs, before it
+                # turns `waking` (reconcile settles a waking row only under the pane it runs in)
+                journal[here] = {**journal.pop(pane), "pane_id": here}
+                pane = here
         cur = journal.get(pane) or {}
         if cur.get("uuid") != uuid or cur.get("phase", "asleep") != "asleep":
             print("herdr-sleeper: the journal entry changed while waiting (woken elsewhere?); left as a shell")
@@ -4865,11 +4944,11 @@ def move_session(uuid: str, target: str, workspace: str, label: str | None, crea
         where = session_state(uuid)
         if where is None:
             return False, f"{target} is neither live nor asleep any more"
-        state, hit, _key = where
-        if state != "live" or any(valid_entry(e) and e["uuid"] == uuid for e in read_json(JOURNAL).values()):
-            return False, (f"{target} is asleep (or waking): wake it first (`herdr-sleeper wake {target}`), then "
-                           "move it once it is idle. A sleeping pane is not moved: its wake stub finds its "
-                           "row by the pane id a move changes")
+        state, hit, key = where
+        if state == "asleep":
+            return move_sleeper(uuid, hit, str(key), workspace, label, create, by)
+        if any(valid_entry(e) and e["uuid"] == uuid for e in read_json(JOURNAL).values()):
+            return False, f"{target} is waking; try again once it is idle"
         name, pane = hit.get("name") or str(hit["pane_id"]), str(hit["pane_id"])
         dest = workspace_with_label(workspace)  # first: every check below is then as fresh as possible
         if dest is None and not create:
@@ -4913,6 +4992,81 @@ def move_session(uuid: str, target: str, workspace: str, label: str | None, crea
     event("moved", name=name, uuid=uuid, pane=pane, now=new, workspace=workspace, tab=tab_label,
           created=dest is None, by=by)
     return True, f"moved {name} to {workspace} › {tab_label} (pane {pane} -> {new})"
+
+
+def move_sleeper(uuid: str, entry: dict, pane: str, workspace: str, label: str | None, create: bool,
+                 by: str) -> tuple[bool, str]:
+    """move_session for a sleeping session, without waking it (B-465). Caller holds both locks.
+    Only a row that is provably this pane's (phase asleep, same terminal) whose pane runs our stub
+    or a bare shell, alone in its tab, unfocused (focus wakes it), with no queued mail (a delivery
+    wakes it) and no open ask. After the move the row is re-keyed to the new pane id in the same lock
+    and the claim is re-reported with the new pane's stub argv, so a Herdr restart types a stub that
+    names the new pane; the running stub finds its row by uuid (stub_row)."""
+    name = wake_name(entry)
+    if is_orphan(pane, entry) or entry.get("phase", "asleep") != "asleep":
+        return False, f"{name}'s sleep row is {entry.get('phase')}; resolve it first (`herdr-sleeper list`)"
+    dest = workspace_with_label(workspace)
+    if dest is None and not create:
+        return False, f"no workspace {workspace!r} on this machine (pass --create to make it)"
+    info = herdr("pane", "get", pane, check=False).get("pane") or {}
+    if not info or identity(entry, info) != "same":
+        return False, (f"{name}'s pane {pane} is not provably its own (gone, reused or not yet seen after a "
+                       "restart); wake it first or leave it")
+    stub = stub_running(pane, uuid)
+    if stub is not True and pane_at_shell(pane) is not True:
+        return False, f"{name}'s pane runs something other than its wake stub or a bare shell"
+    if stub is True and not stub_follows(pane, uuid):
+        return False, (f"{name}'s wake stub was started by an older herdr-sleeper and finds its row only "
+                       "under its old pane id; wake it and move it awake, or move it after the next Herdr "
+                       "restart retypes its stub")
+    tab = (herdr("tab", "get", str(info["tab_id"])).get("tab") or {}) if info.get("tab_id") else {}
+    if dest is not None and dest == info.get("workspace_id"):
+        return True, f"{name} is already in {workspace}"
+    why = []
+    if info.get("focused") is not False:
+        why.append("has the keyboard focus (focus wakes it)" if info.get("focused") else "its focus could not be read")
+    if tab.get("pane_count") != 1:
+        why.append("shares its tab (an ask panel or a split) or its tab could not be read")
+    if open_asks(uuid, entry.get("name"), pane=pane, terminal=entry.get("terminal_id")):
+        why.append("waits on the owner (open ask); its panel would stay behind")
+    if pending_mail(uuid):
+        why.append("has queued mail (its delivery wakes it)")
+    if why:
+        return False, f"{name} " + "; ".join(why)
+    last = herdr("pane", "get", pane).get("pane") or {}
+    last_tab = (herdr("tab", "get", str(last["tab_id"])).get("tab") or {}) if last.get("tab_id") else {}
+    if (last.get("focused") is not False or last.get("terminal_id") != info.get("terminal_id")
+            or last.get("tab_id") != info.get("tab_id") or last_tab.get("pane_count") != 1
+            or read_json(JOURNAL).get(pane) != entry):
+        return False, f"{name} changed while it was being checked (focus, tab or its sleep row); try again"
+    tab_label = label or tab.get("label") or name
+    if dest is not None:
+        done = herdr("pane", "move", pane, "--new-tab", "--workspace", dest, "--label", tab_label, "--no-focus")
+    else:
+        done = herdr("pane", "move", pane, "--new-workspace", "--label", workspace, "--tab-label", tab_label,
+                     "--no-focus")
+    moved = (done.get("move_result") or {}).get("pane") or {}
+    new = str(moved.get("pane_id") or "")
+    term = moved.get("terminal_id") or ((herdr("pane", "get", new, check=False).get("pane") or {}).get("terminal_id")
+                                        if new else None)
+    if not new or term != info.get("terminal_id"):
+        event("move-unverified", name=name, uuid=uuid, pane=pane, now=new or None, by=by, state="asleep")
+        return False, (f"moved {name}, but Herdr's answer does not prove it is the same terminal "
+                       f"(pane {pane} -> {new or '?'}); the watcher's reconcile follows it by terminal id")
+    journal = read_json(JOURNAL)
+    row = journal.pop(pane, None) or entry
+    journal[new] = {**row, "pane_id": new}
+    write_json(JOURNAL, journal)
+    if stub is True:
+        _ok, reported = claim_reporting(new, str(entry.get("kind") or "claude"), done=entry.get("status") == "done",
+                                        resume=stub_argv(new, uuid))
+        journal = read_json(JOURNAL)
+        if isinstance(journal.get(new), dict) and journal[new].get("uuid") == uuid:
+            journal[new]["resume_reported"] = reported
+            write_json(JOURNAL, journal)
+    event("moved", name=name, uuid=uuid, pane=pane, now=new, workspace=workspace, tab=tab_label,
+          created=dest is None, by=by, state="asleep")
+    return True, f"moved {name} (asleep) to {workspace} › {tab_label} (pane {pane} -> {new})"
 
 
 def cmd_move(args: argparse.Namespace) -> int:
@@ -7692,6 +7846,24 @@ def reconcile(agents: list[dict]) -> None:
                 journal.pop(pane)
                 changed = True
                 say(f"reconcile: {pane} moved to {moved} (terminal {entry['terminal_id']})")
+                if entry.get("stub") is not False and stub_running(moved, entry["uuid"]) is True:
+                    # a Herdr restart types the saved resume command back: it must name the new pane (B-465)
+                    _ok, reported = claim_reporting(moved, str(entry.get("kind") or "claude"),
+                                                    done=entry.get("status") == "done",
+                                                    resume=stub_argv(moved, entry["uuid"]))
+                    journal[moved]["resume_reported"] = reported
+            elif pane not in panes and entry.get("phase", "asleep") == "asleep" and entry.get("stub") is not False:
+                # moved, then a Herdr restart before a tick followed it: the old id is gone and so is the
+                # terminal, but the 💤 label and the retyped stub (its saved command still names the old
+                # id) are in the pane it went to. Follow it there; the restart branch re-claims it with the
+                # new pane's stub argv on the next tick.
+                found = [p for p, info in panes.items() if p not in journal and carries_sleep_label(info)
+                         and stub_running(p, entry["uuid"]) is True]
+                if len(found) == 1:
+                    journal[found[0]] = {**entry, "pane_id": found[0]}
+                    journal.pop(pane)
+                    changed = True
+                    say(f"reconcile: {pane} followed to {found[0]} after a restart (its stub runs there)")
             elif pane in panes and identity(entry, panes[pane]) == "reused":
                 orphan_entry(journal, pane, f"pane id now belongs to terminal {panes[pane].get('terminal_id')} "
                                             f"in {panes[pane].get('cwd')}")

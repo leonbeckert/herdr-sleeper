@@ -731,12 +731,28 @@ workspaces with the same label are refused, `--create` makes a missing one)
 without taking the focus, for whoever keeps the owner's layout. It refuses,
 never forced: a busy session, a draft in the composer, a kind whose composer
 cannot be read, the pane with the keyboard focus, a tab shared with another
-pane (an ask panel stays behind otherwise), an open ask, queued mail, the
-calling session, and a sleeper. Herdr gives a moved pane a new id and keeps
-its terminal; the move checks the terminal and logs `moved`. A sleeper is
-woken first: its wake stub finds its journal row by the pane id in its argv,
-which a move changes. `--machine M` (or `M/NAME`) moves on another saved
-machine, never across machines.
+pane (an ask panel stays behind otherwise), an open ask, queued mail, and the
+calling session. Herdr gives a moved pane a new id and keeps its terminal; the
+move checks the terminal and logs `moved`. `--machine M` (or `M/NAME`) moves on
+another saved machine, never across machines.
+
+A sleeper moves without waking (*v0.1.38*, B-465): only a row that is provably
+its pane's (phase asleep, same terminal) whose pane runs its wake stub or a bare
+shell, under the same refusals (focus and a delivery would wake it). The row is
+re-keyed to the new pane id in the same lock and the claim is re-reported with
+the new pane's stub argv, so a Herdr restart types a stub that names the new
+pane. The running stub keeps the old id in its argv and finds its row by
+session id: under the pane it runs in now (the shell's `HERDR_PANE_ID` through
+Herdr's alias, or the fresh shell's id after a restart, proven by our stub in
+that pane's foreground), else under its argv pane (a drag the watcher has not
+followed yet: the row is re-keyed before it turns `waking`), else the one row
+for its session whose pane runs its stub. A stub writes its pid to
+`stubs/<uuid>.pid` when it starts; a stub started by v0.1.37 or older writes
+none and still runs that code (a deploy restarts only the watcher), so `move`
+refuses it: wake that session and move it awake, or move it after a Herdr
+restart. A drag by hand is followed by reconcile through the terminal id (and
+re-claimed the same way); a restart before a tick followed it is followed
+through the 💤 label and the retyped stub.
 
 A moved session keeps `HERDR_PANE_ID=<old id>` in its shell; Herdr answers the
 old id as an alias until its next restart, so every "which session am I"
