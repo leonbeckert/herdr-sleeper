@@ -97,7 +97,12 @@ rule and the box, and still refuse (*v0.1.30*).
 A displaced sleep row answers to its session id or journal key only (*v0.1.22*): its pane, and the
 pane's wake name with it, went to another session, so `deliver wake-w3-p3` reaches the newcomer or
 refuses, never the dead handle's mailbox. `close <session id>` drops a displaced row whose pane is
-gone and sets its queued mail aside in the mailbox's `retired-<time>/` directory.
+gone and sets its queued mail aside in the mailbox's `retired-<time>/` directory. Since *v0.1.40* the
+same goes for an asleep row whose sleeper is gone (its pane closed while it slept; no pane with its
+terminal, no 💤 pane running its stub): `wake`
+can't bring it back, so `close <wake name or session id>` drops it, and `spawn -- --resume <id>`
+resumes it afterwards (a resume of a row like that names `close` first). A pane list Herdr doesn't
+answer never counts as gone.
 
 Lifecycle: `stop` stops the watcher and keeps it stopped (a marker in the
 state dir; hooks spawn nothing, a restarted watcher idles) until `start`.
@@ -690,8 +695,9 @@ tab, when the pane is all the tab holds). A sleeping session is closed only
 when its pane is provably still its own (same terminal, or restarted with our
 💤 label) and runs our stub or a bare shell (after ctrl-c in the stub the pane
 may hold someone's work); its journal row is dropped and its claim released.
-An orphaned, displaced or waking row is never closed, not even with
-`--force`. Either way the transcript stays on disk, and `close` prints
+An orphaned or waking row is never closed, not even with `--force`; neither is
+a displaced one whose pane exists (an asleep or displaced row whose sleeper is
+gone is dropped, see above). Either way the transcript stays on disk, and `close` prints
 the line that resumes it by hand.
 
 ### Codex sessions (`--kind codex`, *v0.1.36*)

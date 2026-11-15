@@ -3736,6 +3736,18 @@ def test_spawn_does_not_resume_a_sleeper(fake: FakeHerdr, checkout: Path, state:
     assert not any(c[:2] == ("tab", "create") for c in fake.calls)
 
 
+def test_spawn_resume_of_a_row_whose_pane_is_gone_names_close(fake: FakeHerdr, checkout: Path, state: Path,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """mbp wake-w1-p8, 2026-11-15: wake said "pane no longer exists", the resume said "wake it instead"."""
+    slept_entry(fake)
+    fake.agents.clear()                                                # the pane was closed while asleep
+    _resumable(state, checkout, UUID)
+    assert _spawn(monkeypatch, checkout, name="fresh", extra=["--resume", UUID]) == 1
+    assert f"whose pane is gone: drop it with `herdr-sleeper close {UUID}`, then resume" in capsys.readouterr().err
+    assert not any(c[:2] == ("tab", "create") for c in fake.calls)
+
+
 def test_spawn_refuses_a_taken_name(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
                                     capsys: pytest.CaptureFixture[str]) -> None:
     assert _spawn(monkeypatch, checkout, name="a") == 1                 # the live agent's Herdr name
@@ -5460,6 +5472,65 @@ def test_close_drops_a_displaced_row_whose_pane_is_gone_and_sets_its_mail_aside(
     assert len(aside) == 1 and "displaced-retired" in events()
     assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
 
+
+
+def test_close_drops_an_asleep_row_whose_pane_is_gone(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    """mbp wake-w1-p8, break-glass, wake-w5-p12, 2026-11-15: panes closed while their sessions slept
+    left rows that neither wake nor close could resolve."""
+    name = sleeper.wake_name(slept_entry(fake))
+    fake.agents[0] = agent(uuid="7d1c2a9e-5b3f-4e8a-9c1d-2f6b8a4e0c13", name="newcomer")
+    assert _close(monkeypatch, UUID) == 1                              # the pane holds another session
+    assert "not provably its own" in capsys.readouterr().err and "w1:p1" in journal()
+    fake.agents.clear()                                                # the pane is gone
+    deliver(monkeypatch, UUID, msg_id="m-old")                         # can't wake: the mail waits
+    capsys.readouterr()
+    assert len(sleeper.pending_mail(UUID)) == 1
+    assert _close(monkeypatch, name) == 0                              # by its wake name, as presence shows it
+    out = capsys.readouterr().out
+    assert "dropped the asleep sleep row" in out and "Resume it by hand" in out and UUID in out
+    assert journal() == {} and sleeper.pending_mail(UUID) == []
+    assert len(list((sleeper.MAILBOX / UUID).glob("retired-*/*.json"))) == 1 and "asleep-retired" in events()
+    assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
+
+
+def test_close_keeps_an_asleep_row_whose_stub_moved_under_another_pane_id(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Codex, 2026-11-15: dragged, then a Herdr restart before a tick followed it: the old id is gone,
+    the 💤 pane it went to runs its stub, and reconcile would follow it there."""
+    slept_entry(fake)
+    moved = agent(uuid="7d1c2a9e-5b3f-4e8a-9c1d-2f6b8a4e0c13", name="other")
+    moved["pane_id"], moved["terminal_id"] = "w2:p8", "term-new"
+    fake.agents[:] = [moved]
+    monkeypatch.setattr(sleeper, "carries_sleep_label", lambda info: info.get("pane_id") == "w2:p8")
+    monkeypatch.setattr(sleeper, "stub_running", lambda pane, uuid=None: pane == "w2:p8" and uuid == UUID)
+    assert _close(monkeypatch, UUID) == 1
+    assert "w1:p1" in journal()
+
+
+def test_close_keeps_an_asleep_row_whose_terminal_lives_on(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    entry = slept_entry(fake)
+    kept = dict(fake.agents[0])
+    kept["pane_id"], kept["terminal_id"] = "w2:p8", entry.get("terminal_id") or "term-1"
+    j = journal(); j["w1:p1"]["terminal_id"] = kept["terminal_id"]; sleeper.write_json(sleeper.JOURNAL, j)
+    fake.agents[:] = [kept]
+    assert _close(monkeypatch, UUID) == 1
+    assert "w1:p1" in journal()
+
+
+def test_close_keeps_an_asleep_row_when_the_pane_list_is_unreadable(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    fake.agents.clear()
+    def unreadable(*a: Any, **k: Any) -> dict:
+        if a[:2] == ("pane", "list"):
+            raise sleeper.SleeperError("herdr did not answer")
+        return real(*a, **k)
+    real = sleeper.herdr
+    monkeypatch.setattr(sleeper, "herdr", unreadable)                  # Herdr didn't answer: not provably gone
+    assert _close(monkeypatch, UUID) == 1
+    assert "w1:p1" in journal()
 
 
 # ------------------------------------------------------------- ask the owner

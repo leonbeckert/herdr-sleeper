@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.39"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.40"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -4210,6 +4210,9 @@ def spawn_resume_problem(uuid: str, cwd: Path) -> str | None:
     short = uuid[:8]
     for key, e in read_json(JOURNAL).items():
         if valid_entry(e) and e.get("uuid") == uuid:
+            if e.get("phase", "asleep") in RETIRABLE_PHASES and not is_orphan(key, e) and sleeper_gone(e):
+                return (f"session {short} has a sleep row in {key} whose pane is gone: drop it with "
+                        f"`herdr-sleeper close {uuid}`, then resume")
             return f"session {short} sleeps in {key}; wake it instead"
     try:
         live = uuid_live_elsewhere(uuid, cwd=str(cwd))
@@ -5149,10 +5152,36 @@ def pane_exists(pane: str) -> bool | None:
     return any(isinstance(p, dict) and p.get("pane_id") == pane for p in panes)
 
 
-def retire_displaced_row(key: str, entry: dict, name: str, by: str) -> tuple[bool, str, list[str]]:
-    """Drop a displaced row whose pane is gone: nothing on this machine is left to protect, and its
-    session runs elsewhere if anywhere (mini2 wake-w3-p3 resumed on mini1). Its queued mail is set
-    aside in the mailbox's retired-<time>/ directory, never deleted. Caller holds both locks."""
+RETIRABLE_PHASES = ("asleep", "displaced")  # an orphan never reaches close; waking/exit-requested settle first
+
+
+def sleeper_gone(entry: dict) -> bool:
+    """Whether this row's sleeper is provably nowhere on this machine: Herdr's pane list is readable, has
+    neither the row's pane id nor its terminal, and no 💤-labelled pane runs a stub for its session (moved,
+    then restarted before a tick followed it, the stub runs under a new id: reconcile follows it there).
+    Anything that can't be told keeps the row."""
+    try:
+        panes = herdr("pane", "list").get("panes")
+    except SleeperError:
+        return False
+    if not isinstance(panes, list) or not all(isinstance(p, dict) for p in panes):
+        return False
+    terminal = entry.get("terminal_id")
+    for info in panes:
+        if info.get("pane_id") == entry["pane_id"] or (terminal and info.get("terminal_id") == terminal):
+            return False
+    for info in panes:
+        if carries_sleep_label(info) and stub_running(str(info.get("pane_id")), entry["uuid"]) is not False:
+            return False
+    return True
+
+
+def retire_gone_row(key: str, entry: dict, name: str, by: str, phase: str) -> tuple[bool, str, list[str]]:
+    """Drop an asleep or displaced row whose sleeper is gone (sleeper_gone): nothing on this machine is left to
+    protect, `wake` can't bring it back ("pane no longer exists"), and its session runs elsewhere if
+    anywhere (mini2 wake-w3-p3 resumed on mini1). Rows of panes closed while asleep stayed for days
+    (mbp wake-w1-p8, break-glass, 2026-11-15). Its queued mail is set aside in the mailbox's
+    retired-<time>/ directory, never deleted; the transcript stays resumable. Caller holds both locks."""
     uuid = entry["uuid"]
     journal = read_json(JOURNAL)
     if not (isinstance(journal.get(key), dict) and journal[key].get("uuid") == uuid):
@@ -5166,10 +5195,10 @@ def retire_displaced_row(key: str, entry: dict, name: str, by: str) -> tuple[boo
     clear_mail_hold(uuid)
     journal.pop(key)
     write_json(JOURNAL, journal)
-    event("displaced-retired", uuid=uuid, name=name, pane=entry.get("pane_id"), by=by, mail_set_aside=len(mail))
+    event(f"{phase}-retired", uuid=uuid, name=name, pane=entry.get("pane_id"), by=by, mail_set_aside=len(mail))
     kept = f"; {len(mail)} queued message(s) set aside in its mailbox (retired-*)" if mail else ""
-    return True, (f"dropped the displaced sleep row {name} ({uuid}): its pane {entry.get('pane_id')} is gone"
-                  f"{kept}. Resume it by hand with `claude --resume {uuid}` if it is still wanted"), []
+    return True, (f"dropped the {phase} sleep row {name} ({uuid}): its pane {entry.get('pane_id')} is gone"
+                  f"{kept}. Resume it by hand if it is still wanted: {manual_command(entry)}"), []
 
 
 def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: float | None = None,
@@ -5196,8 +5225,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
         if state == "asleep":
             info = herdr("pane", "get", str(hit["pane_id"]), check=False).get("pane") or {}
             phase = "orphaned" if is_orphan(str(key), hit) else hit.get("phase", "asleep")
-            if phase == "displaced" and not info and pane_exists(str(hit["pane_id"])) is False:
-                return retire_displaced_row(str(key), hit, name, by)
+            if phase in RETIRABLE_PHASES and not info and sleeper_gone(hit):
+                return retire_gone_row(str(key), hit, name, by, phase)
             if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
                     or info.get("agent") not in (None, CLAIM_AGENT):
                 return refused(f"the sleep row for {name} is {phase} and its pane is not provably its own; "
