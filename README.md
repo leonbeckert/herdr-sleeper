@@ -741,12 +741,16 @@ its pane's (phase asleep, same terminal) whose pane runs its wake stub or a bare
 shell, under the same refusals (focus and a delivery would wake it). The row is
 re-keyed to the new pane id in the same lock and the claim is re-reported with
 the new pane's stub argv, so a Herdr restart types a stub that names the new
-pane. The running stub keeps the old id in its argv and finds its row by
-session id: under the pane it runs in now (the shell's `HERDR_PANE_ID` through
-Herdr's alias, or the fresh shell's id after a restart, proven by our stub in
-that pane's foreground), else under its argv pane (a drag the watcher has not
-followed yet: the row is re-keyed before it turns `waking`), else the one row
-for its session whose pane runs its stub. A stub writes its pid to
+pane. The running stub keeps the old id in its argv and finds its row under
+the pane it runs in now (the shell's `HERDR_PANE_ID` or its argv pane, each
+resolved to Herdr's current id through the alias, or the fresh shell's id after
+a restart, proven by our stub for that session in that pane's foreground;
+resolved again under the lock, since a `move` may run while it waits), else
+under its argv pane (a drag the watcher has not followed yet: re-keyed before it
+turns `waking`, only from the same terminal; otherwise the stub starts over and
+the next Enter finds the followed row). Never a row elsewhere by session id
+alone: an old stub left in an orphaned pane would take the row of the same
+session asleep in another pane. A stub writes its pid to
 `stubs/<uuid>.pid` when it starts; a stub started by v0.1.37 or older writes
 none and still runs that code (a deploy restarts only the watcher), so `move`
 refuses it: wake that session and move it awake, or move it after a Herdr

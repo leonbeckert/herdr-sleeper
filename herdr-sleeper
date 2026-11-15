@@ -2383,29 +2383,34 @@ def sane_tty(fd: int | None = None) -> None:
 
 
 def stub_home(typed: str, uuid: str) -> str:
-    """The pane this stub runs in now. Its argv names the pane it was typed in under; a move (`move`,
-    or a drag in Herdr) gives the pane a new id (B-465). The shell's HERDR_PANE_ID resolves through
-    Herdr's alias to the new id until a restart, and after one the retyped stub runs in a fresh shell
-    that carries the new id; that pane must show our stub for this session in its foreground."""
-    here = own_pane()
-    if here and here != typed and stub_running(here, uuid) is True:
-        return here
+    """The pane this stub runs in now, as Herdr's current id. Its argv names the pane it was typed in
+    under; a move (`move`, or a drag in Herdr) gives the pane a new id (B-465). The shell's
+    HERDR_PANE_ID resolves through Herdr's alias to the new id until a restart, and after one the
+    retyped stub runs in a fresh shell that carries the new id. The pane must show our stub for this
+    session in its foreground. Called again under the lock: a `move` may have run since."""
+    for cand in (own_pane(), typed):
+        if not cand:
+            continue
+        try:
+            now = (herdr("pane", "get", cand, check=False).get("pane") or {}).get("pane_id")
+        except SleeperError:
+            now = None
+        if now and stub_running(str(now), uuid) is True:
+            return str(now)
     return typed
 
 
 def stub_row(journal: dict, here: str, uuid: str, typed: str | None = None) -> tuple[str, dict] | None:
-    """The journal row this stub wakes, with its key: the row under the pane it runs in (`here`),
-    else the one under the pane id in its argv (`typed`: a drag the watcher has not followed yet),
-    else the one row for its uuid whose pane runs a stub for that uuid. None: no row of ours."""
+    """The journal row this stub wakes, with its key: the row under the pane it runs in (`here`: a
+    `move` or a followed drag re-keyed it), else the one under the pane id in its argv (`typed`: a
+    drag the watcher has not followed yet). Never a row elsewhere found by session id alone: an older
+    stub left waiting in an orphaned pane would take the row of the same session asleep in another
+    pane. None: no row of ours."""
     for key in dict.fromkeys(k for k in (here, typed) if k):
         entry = journal.get(key)
         if isinstance(entry, dict) and entry.get("uuid") == uuid and valid_entry(entry) and not is_orphan(key, entry):
             return key, entry
-    hits = [(k, e) for k, e in journal.items()
-            if k not in (here, typed) and valid_entry(e) and e.get("uuid") == uuid and not is_orphan(k, e)]
-    if len(hits) != 1 or stub_running(hits[0][0], uuid) is not True:
-        return None
-    return hits[0]
+    return None
 
 
 def mark_stub(uuid: str) -> None:
@@ -2495,28 +2500,43 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         return refuse(f"the transcript for {uuid} is gone (nothing to resume)")
     if entry.get("cwd") and not same_dir(os.getcwd(), entry["cwd"]):
         return refuse(f"pane cwd is {os.getcwd()}, slept-in {entry['cwd']}", drop_claim=True)
+    unfollowed = False
     with locked():
         journal = read_json(JOURNAL)
+        here = stub_home(typed, uuid)   # again: a `move` that ran while we waited re-keyed the row
         found = stub_row(journal, here, uuid, typed)
-        if found is not None:
-            pane = found[0]
-            if pane != here and here not in journal and stub_running(here, uuid) is True:
-                # moved and not yet followed by the watcher: the row goes where the stub runs, before it
-                # turns `waking` (reconcile settles a waking row only under the pane it runs in)
-                journal[here] = {**journal.pop(pane), "pane_id": here}
-                pane = here
-        cur = journal.get(pane) or {}
-        if cur.get("uuid") != uuid or cur.get("phase", "asleep") != "asleep":
-            print("herdr-sleeper: the journal entry changed while waiting (woken elsewhere?); left as a shell")
-            return 0
-        where = uuid_live_elsewhere(uuid, except_pane=pane, cwd=cur.get("cwd"))  # raises when it cannot tell
-        if where:
-            print(f"herdr-sleeper: session is already live in {where}; left as a shell.\n"
-                  f"  manual: {manual_command(cur)}")
-            return 0
-        journal[pane] = {**cur, "phase": "waking", "waking_pid": os.getpid(),
-                         "waking_at": dt.datetime.now().isoformat(timespec="seconds")}
-        write_json(JOURNAL, journal)
+        if found is not None and found[0] != here:
+            # a drag the watcher has not followed yet: the row goes where the stub runs before it turns
+            # `waking` (reconcile settles a waking row only under the pane it runs in), and only from
+            # the same terminal; after a restart the watcher follows it (💤 label + stub) on its next tick
+            info = herdr("pane", "get", here, check=False).get("pane") or {}
+            if here in journal or not info.get("terminal_id") or info.get("terminal_id") != found[1].get("terminal_id"):
+                unfollowed = True
+            else:
+                journal[here] = {**journal.pop(found[0]), "pane_id": here}
+                found = (here, journal[here])
+        if not unfollowed:
+            if found is None:
+                print("herdr-sleeper: the journal entry changed while waiting (woken elsewhere?); left as a shell")
+                return 0
+            pane, cur = found
+            if cur.get("phase", "asleep") != "asleep":
+                print("herdr-sleeper: the journal entry changed while waiting (woken elsewhere?); left as a shell")
+                return 0
+            where = uuid_live_elsewhere(uuid, except_pane=pane, cwd=cur.get("cwd"))  # raises when it cannot tell
+            if where:
+                print(f"herdr-sleeper: session is already live in {where}; left as a shell.\n"
+                      f"  manual: {manual_command(cur)}")
+                return 0
+            journal[pane] = {**cur, "phase": "waking", "waking_pid": os.getpid(),
+                             "waking_at": dt.datetime.now().isoformat(timespec="seconds")}
+            write_json(JOURNAL, journal)
+    if unfollowed:
+        # the stub stays: start it over (same pid, same argv) so the next Enter finds the followed row
+        print("herdr-sleeper: this pane was moved and the watcher has not followed it yet; "
+              "press Enter again in a few seconds")
+        os.execvp(sys.executable, [sys.executable, str(SELF), "stub", typed, uuid, str(STATE_DIR)])
+        return 0  # unreachable in production
     try:
         release(pane)  # must precede the agent: a stale claim outranks detection
         restore_label(pane, cur, (herdr("pane", "get", pane, check=False).get("pane") or {}).get("label"))

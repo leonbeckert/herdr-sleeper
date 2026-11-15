@@ -11,6 +11,7 @@ import os
 import shlex
 import signal
 import stat
+import sys
 import time
 import types
 from pathlib import Path
@@ -258,6 +259,7 @@ class FakeHerdr:
             return {"pane": pane}
         if args[:2] == ("pane", "process-info"):
             pane = args[args.index("--pane") + 1]
+            pane = pane if pane in by_pane else self.aliases.get(pane, pane)   # Herdr resolves an old id too
             if self.process_info_broken or (pane not in by_pane and self.strict_process_info):
                 return {}      # real Herdr answers a pane that is gone with an error envelope
             return {"process_info": {"foreground_processes": self._procs(pane, by_pane.get(pane))}}
@@ -7561,6 +7563,56 @@ def test_a_restart_before_the_watcher_followed_a_drag(fake: FakeHerdr, monkeypat
     monkeypatch.setenv("HERDR_PANE_ID", "w2:p8")             # the restored shell carries the new id
     execvps = _enter_stub(monkeypatch, {**entry, "terminal_id": fake.agents[0]["terminal_id"]})
     assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps
+
+
+def test_a_move_while_the_stub_waits_is_not_undone(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    fake.agents[0].pop("agent", None)
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    execvps = _enter_stub(monkeypatch, entry)
+    calls = {"n": 0}
+
+    def enter_after_a_move(_prompt: str = "") -> str:   # layout moves the sleeper while its stub waits
+        calls["n"] += 1
+        (sleeper.STUBS / f"{UUID}.pid").write_text("99\n")   # the fake's stub process is pid 99, not us
+        monkeypatch.delenv("HERDR_PANE_ID")
+        assert _move(monkeypatch, "a", workspace="parked") == 0
+        monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+        return ""
+    monkeypatch.setattr("builtins.input", enter_after_a_move)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps and calls["n"] == 1
+    assert set(journal()) == {"w2:p8"} and journal()["w2:p8"]["phase"] == "waking"   # not moved back to w1:p1
+
+
+def test_an_orphaned_stub_does_not_take_the_row_of_its_session_asleep_elsewhere(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    entry = _asleep_with_stub(fake)
+    fake.agents.append({**agent(pane="w3:p3", terminal="term-3"), "tab_id": "w3:t3", "workspace_id": "w3"})
+    fake.agents[0].pop("agent", None)
+    row = journal().pop("w1:p1")                             # pane A's row went (orphaned, then dropped) …
+    sleeper.write_json(sleeper.JOURNAL, {"w3:p3": {**row, "pane_id": "w3:p3", "terminal_id": "term-3"}})
+    fake.stub_panes.add("w3:p3")                             # … the session was resumed in B and slept there
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")             # A's old stub still waits for Enter
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert not execvps and "no journal entry" in capsys.readouterr().out
+    assert set(journal()) == {"w3:p3"} and journal()["w3:p3"]["phase"] == "asleep"
+
+
+def test_enter_after_a_restart_the_watcher_has_not_followed_starts_the_stub_over(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    entry = _asleep_with_stub(fake)
+    fake("pane", "move", "w1:p1", "--new-tab", "--workspace", "w2", "--label", "x", "--no-focus")  # by hand
+    fake.restart()
+    fake.agents[0].pop("agent", None)
+    sleeper.write_json(sleeper.JOURNAL, {**journal()})        # no reconcile tick yet: the row is under w1:p1
+    monkeypatch.setenv("HERDR_PANE_ID", "w2:p8")
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert execvps == [(sys.executable, [sys.executable, str(sleeper.SELF), "stub", "w1:p1", UUID,
+                                         str(sleeper.STATE_DIR)])]
+    assert "not followed it yet" in capsys.readouterr().out
+    assert set(journal()) == {"w1:p1"} and journal()["w1:p1"]["phase"] == "asleep"
 
 
 @pytest.mark.parametrize("case", ["focused", "shared-tab", "mail", "ask", "vim"])
