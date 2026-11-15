@@ -592,7 +592,21 @@ herdr-sleeper close --self --cancel
 and claude flags that would not survive a sleep: everything after `--` goes
 through the same replay filter as a wake, and `-n`/`--name` or a session
 selector (`--resume`, `--continue`) is refused, since the name comes from
-`--name` and a spawn starts a new session. It then:
+`--name` and a spawn starts a new session.
+
+The one exception (*v0.1.38*): `-- --resume <session id>`, given once and
+alone, brings a closed claude session back into a named tab, its first
+message on stdin as usual. It is refused when that session sleeps (wake it),
+runs anywhere on the machine (deliver to it), its liveness can't be verified,
+or its transcript is missing or records another working directory (pass
+that one as `--cwd`). A second resume of the same session while the first is
+starting is refused (a lock in the state dir). A claude that comes up with a
+different session id gets nothing typed and its tab closed
+(`resume-mismatch`). The spawn record keeps `resumed`; `-n <name>` gives the
+resumed session the new name. Codex and opencode sessions can't be resumed
+this way yet.
+
+Steps:
 
 1. creates a tab with `--no-focus`, labelled with the name, in the caller's
    workspace (or `--workspace`);

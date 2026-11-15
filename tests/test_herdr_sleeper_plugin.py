@@ -124,6 +124,7 @@ class FakeHerdr:
         self.calls: list[tuple[str, ...]] = []
         self.exit_leaves_agent = True      # a SIGTERM/prompt removes the agent from its pane
         self.start_uuid: str | None = None  # what agent start reports; None → the requested --resume uuid
+        self.resume_is_spawn = False  # a `--resume` start names the agent and makes it idle, as a spawn does
         self.process_info_broken = False    # process-info returns an error envelope
         self.process_override: bool | None = None  # force process presence regardless of agent registration
         self.pidless = False              # report the agent process without a pid (argv still readable)
@@ -346,7 +347,7 @@ class FakeHerdr:
                                        else args[args.index("-s") + 1] if "-s" in args else self.spawn_uuid)
             kind = args[args.index("--kind") + 1]
             a = by_pane[pane]
-            if "--resume" not in args:
+            if "--resume" not in args or self.resume_is_spawn:
                 a["name"] = args[2]
                 a["agent_status"] = "idle"
             fresh_opencode = (self.prompt_starts_session and kind in ("opencode", "codex") and "-s" not in args
@@ -3613,8 +3614,10 @@ def test_spawn_codex_gets_no_session_name_flag(fake: FakeHerdr, checkout: Path, 
     ({"name": "a b"}, "--name must match"),
     ({"prompt": ""}, "first prompt: empty"),
     ({"prompt": "go\x1b[2J"}, "control characters"),
-    ({"extra": ["--resume", UUID]}, "select a session"),
     ({"extra": ["--continue"]}, "select a session"),
+    ({"extra": ["--resume", UUID, "--continue"]}, "select a session"),
+    ({"extra": ["--resume", UUID, "--resume", SPAWNED_UUID]}, "select a session"),
+    ({"extra": ["--resume=", "--model", "haiku"]}, "select a session"),
     ({"extra": ["-n", "other"]}, "drop -n/--name"),
     ({"extra": ["--name=other"]}, "drop -n/--name"),
     ({"extra": ["-n=other"]}, "drop -n/--name"),
@@ -3628,6 +3631,93 @@ def test_spawn_refusals(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.Mon
     assert _spawn(monkeypatch, cwd, **kw) == 2
     assert needle in capsys.readouterr().err
     assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+
+
+def _resumable(state: Path, cwd: Path | str | None, uuid: str = SPAWNED_UUID, proj: str = "-some-dir") -> Path:
+    path = transcript(state, uuid, 2, proj=proj)
+    lines = ['{"type":"summary"}', "not json"] + ([json.dumps({"type": "user", "cwd": str(cwd)})] if cwd else [])
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_spawn_resumes_a_closed_session_in_a_named_tab(fake: FakeHerdr, checkout: Path, state: Path,
+                                                        monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    _resumable(state, os.path.realpath(checkout))
+    fake.resume_is_spawn = True
+    assert _spawn(monkeypatch, checkout, extra=["--", "--resume", SPAWNED_UUID, "--model", "haiku"], json_out=True) == 0
+    assert json.loads(capsys.readouterr().out)["session"] == SPAWNED_UUID
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert list(start[start.index("--") + 1:]) == ["-n", "impl-1", "--resume", SPAWNED_UUID, "--model", "haiku"]
+    assert any(c[:2] == ("agent", "prompt") for c in fake.calls)
+    assert sleeper.read_json(sleeper.SPAWNED)["impl-1"]["resumed"] == SPAWNED_UUID
+
+
+def test_spawn_resume_accepts_the_equals_form_and_short_flag() -> None:
+    assert sleeper.spawn_resume_id(["--resume=" + UUID]) == UUID
+    assert sleeper.spawn_resume_id(["-r", UUID, "--model", "haiku"]) == UUID
+    assert sleeper.spawn_resume_id(["--model", "haiku"]) is None
+    assert sleeper.spawn_resume_id(["--resume", "../x"]) is None
+    assert sleeper.spawn_args_problem("claude", ["--resume", UUID]) is None
+
+
+@pytest.mark.parametrize("case, needle", [
+    ("no-transcript", "no transcript of session 5f0c1d2e"),
+    ("other-dir", "ran in another directory"),
+    ("look-alike-dir", "ran in another directory"),
+    ("no-cwd", "records no working directory"),
+    ("live", "is live (pane w1:p1); deliver to it"),
+    ("unknown", "cannot verify session liveness"),
+    ("resuming", "a resume of session 5f0c1d2e is starting already"),
+])
+def test_spawn_resume_refusals(fake: FakeHerdr, checkout: Path, state: Path, monkeypatch: pytest.MonkeyPatch,
+                               capsys: pytest.CaptureFixture[str], case: str, needle: str) -> None:
+    if case == "other-dir":
+        _resumable(state, checkout.parent / "not-a-repo")
+    elif case == "look-alike-dir":  # claude files proj.wt and proj-wt under one folder name; the cwd tells them apart
+        (checkout.parent / "proj.wt").mkdir()
+        _resumable(state, checkout.parent / "proj.wt")
+    elif case == "no-cwd":
+        _resumable(state, None)
+    elif case != "no-transcript":
+        _resumable(state, checkout)
+    if case == "resuming":
+        held = sleeper.flocked(sleeper.STATE_DIR / f"resume-{SPAWNED_UUID}.lock")
+        assert held.__enter__()
+        monkeypatch.setattr(sleeper, "_test_held_lock", held, raising=False)
+    if case == "live":
+        monkeypatch.setattr(sleeper, "uuid_live_elsewhere", lambda uuid, except_pane=None, cwd=None: "pane w1:p1")
+    if case == "unknown":
+        def unknown(uuid: str, except_pane: str | None = None, cwd: str | None = None) -> str | None:
+            raise sleeper.SleeperError("cannot verify session liveness: ps failed (x)")
+        monkeypatch.setattr(sleeper, "uuid_live_elsewhere", unknown)
+    assert _spawn(monkeypatch, checkout, extra=["--resume", SPAWNED_UUID]) == 1
+    assert needle in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+    assert "spawn-refused" in events()
+
+
+def test_spawn_resume_that_comes_up_as_another_session_types_nothing(fake: FakeHerdr, checkout: Path, state: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    _resumable(state, checkout)
+    fake.resume_is_spawn, fake.start_uuid = True, UUID
+    assert _spawn(monkeypatch, checkout, extra=["--resume", SPAWNED_UUID]) == 1
+    assert "was to resume session 5f0c1d2e but runs 20603f77; nothing typed" in capsys.readouterr().err
+    assert not any(c[:2] == ("agent", "prompt") for c in fake.calls) and ("tab", "close", "w1:t8") in fake.calls
+    assert "spawn-failed" in events() and not sleeper.SPAWNED.exists()
+    with sleeper.flocked(sleeper.STATE_DIR / f"resume-{SPAWNED_UUID}.lock", wait=False) as free:
+        assert free  # the resume lock is released
+
+
+def test_spawn_does_not_resume_a_sleeper(fake: FakeHerdr, checkout: Path, state: Path,
+                                         monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    slept_entry(fake)
+    _resumable(state, checkout, UUID)
+    assert _spawn(monkeypatch, checkout, name="fresh", extra=["--resume", UUID]) == 1
+    err = capsys.readouterr().err
+    assert "sleeps in w1:p1; wake it instead" in err
+    assert not any(c[:2] == ("tab", "create") for c in fake.calls)
 
 
 def test_spawn_refuses_a_taken_name(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,

@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.37"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.38"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -4052,8 +4052,72 @@ def spawn_args_problem(kind: str, extra: list[str]) -> str | None:
     replay, why = replayable_argv(extra)
     if replay is None:
         return f"agent arguments would not survive a sleep: {why}"
-    if replay != extra:
-        return "agent arguments select a session (--resume, --continue); a spawn starts a new one"
+    if replay != extra and spawn_resume_id(extra) is None:
+        return ("agent arguments select a session; a spawn starts a new one, or resumes a closed one "
+                "with `-- --resume <session id>` given once (no --continue)")
+    return None
+
+
+def spawn_resume_id(extra: list[str]) -> str | None:
+    """The claude session a spawn resumes: `--resume <id>`, `--resume=<id>` or `-r <id>` given exactly once,
+    the id well-formed, no `--continue`, and nothing else stripped by the replay filter. Else None."""
+    ids: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(extra):
+        a = extra[i]
+        if a in ("--resume", "-r") and i + 1 < len(extra) and not extra[i + 1].startswith("-"):
+            ids.append(extra[i + 1])
+            i += 2
+            continue
+        if a.startswith("--resume="):
+            ids.append(a.split("=", 1)[1])
+        else:
+            rest.append(a)
+        i += 1
+    if len(ids) != 1 or not valid_session_id(ids[0]):
+        return None
+    replay, _why = replayable_argv(extra)
+    return ids[0] if replay == rest else None
+
+
+def transcript_cwd(path: Path) -> str | None:
+    """The working directory a claude transcript records (its first record that names one), or None."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                with contextlib.suppress(ValueError):
+                    rec = json.loads(line)
+                    if isinstance(rec, dict) and isinstance(rec.get("cwd"), str) and rec["cwd"]:
+                        return rec["cwd"]
+    except OSError:
+        return None
+    return None
+
+
+def spawn_resume_problem(uuid: str, cwd: Path) -> str | None:
+    """Why a spawn may not resume this claude session here, or None: it sleeps (wake it), it runs (deliver
+    to it), its liveness can't be verified, or its transcript is missing or records another working
+    directory (claude would start a different session or ask). Only the id's first 8 characters are echoed.
+    The caller holds the session's resume lock, so a second resume of it can't pass these checks meanwhile."""
+    short = uuid[:8]
+    for key, e in read_json(JOURNAL).items():
+        if valid_entry(e) and e.get("uuid") == uuid:
+            return f"session {short} sleeps in {key}; wake it instead"
+    try:
+        live = uuid_live_elsewhere(uuid, cwd=str(cwd))
+    except SleeperError as exc:
+        return str(exc)
+    if live:
+        return f"session {short} is live ({live}); deliver to it instead"
+    path = transcript_for(uuid)
+    if path is None:
+        return f"no transcript of session {short} on this machine"
+    where = transcript_cwd(path)
+    if where is None:
+        return f"the transcript of session {short} records no working directory"
+    if not same_dir(where, str(cwd)):
+        return f"session {short} ran in another directory; pass that one as --cwd"
     return None
 
 
@@ -4419,6 +4483,19 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     if taken:
         print(f"spawn: a session named {args.name} is {taken}; pick another name", file=sys.stderr)
         return 1
+    resume = spawn_resume_id(extra) if args.kind == "claude" else None
+    hold = contextlib.ExitStack()  # a resume's lock, held until its session runs (spawn_started returns)
+    if resume:
+        # two resumes of one session at once would both pass the liveness check and fork it
+        if not hold.enter_context(flocked(STATE_DIR / f"resume-{resume}.lock", wait=False)):
+            why: str | None = f"a resume of session {resume[:8]} is starting already"
+        else:
+            why = spawn_resume_problem(resume, cwd) if cwd else "no working directory"
+        if why:
+            hold.close()
+            event("spawn-refused", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, reason=why)
+            print(f"spawn: {why}", file=sys.stderr)
+            return 1
     token: str | None = None  # an opencode lane's reservation in spawned.json, ours until the lane runs
     if args.kind == "opencode":
         policy, why = opencode_policy()
@@ -4448,6 +4525,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     try:
         return spawn_started(args, cwd, body, extra, sender, agents, token)
     finally:
+        hold.close()
         if token:
             # our reservation, if it never became a lane, must not hold one; a list that fails leaves it
             # to run out (OPENCODE_RESERVE_SECONDS) and prune_spawned
@@ -4528,14 +4606,25 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
             break
         time.sleep(1)
         uuid = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session") or {}).get("value")
+    resumed = spawn_resume_id(extra) if args.kind == "claude" else None
+    if resumed and valid_session_id(uuid) and uuid != resumed:
+        # claude started another (empty) session: the work belongs to the requested one, so nothing is typed
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="resume-mismatch")
+        print(f"spawn: {args.name} was to resume session {resumed[:8]} but runs {str(uuid)[:8]}; nothing typed, "
+              f"tab {tab} closed", file=sys.stderr)
+        return 1
     from_pane = own_pane()
     rec = {"pane": pane, "tab": tab, "workspace": made["tab"].get("workspace_id"), "kind": args.kind,
            "cwd": str(cwd), "by": sender, "from_pane": from_pane, "uuid": uuid if valid_session_id(uuid) else None,
            "at": dt.datetime.now().isoformat(timespec="seconds")}
+    if resumed:
+        rec["resumed"] = resumed
     with locked():
         record_spawned(args.name, rec)
     event("spawned", name=args.name, pane=pane, tab=tab, uuid=rec["uuid"], kind=args.kind, cwd=str(cwd),
-          by=sender, from_pane=from_pane)
+          by=sender, from_pane=from_pane, **({"resumed": resumed} if resumed else {}))
     if not rec["uuid"]:
         print(f"spawned {args.name} in {pane} (tab {tab}), but it reports no session id; first prompt not "
               f"typed (send it with `herdr agent prompt {pane} …`)", file=sys.stderr)
@@ -9900,7 +9989,7 @@ def main(argv: list[str] | None = None) -> int:
     spp.add_argument("--workspace", help="Herdr workspace for the tab (default: the caller's)")
     spp.add_argument("--json", action="store_true")
     spp.add_argument("--machine", help="spawn on a Herdr saved machine (its --cwd, its checks)")
-    spp.add_argument("agent_args", nargs=argparse.REMAINDER, help="-- then extra agent flags (claude: must be replayable)")
+    spp.add_argument("agent_args", nargs=argparse.REMAINDER, help="-- then extra agent flags (claude: must be replayable; `--resume <id>` resumes a closed session)")
     spp.set_defaults(fn=cmd_spawn)
     clp = sub.add_parser("close", help="close a live or sleeping session's pane/tab (refuses busy, draft, insomnia)")
     clp.add_argument("target", nargs="?", help="session name, pane id, agent name, wake name, or session id")
