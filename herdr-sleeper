@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.33"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.34"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -304,11 +304,14 @@ def server_down(exc: BaseException) -> bool:
 # argv_after_binary: replay the pane's original argv on wake (claude only —
 # for the others the resume flags carry everything we can vouch for).
 # idle_guards: before sleeping, also require an empty composer (a draft is unsent work: a signal
-# would discard it) and no background work (footer counts, shell children, scheduled wakeups or
-# session crons in the transcript). Claude-shaped, so claude only.
+# would discard it) and no background work (footer counts, shell children; for claude also
+# scheduled wakeups or session crons in the transcript).
+# composer: the kind's composer check (COMPOSERS); mail, close, close --self and move need one.
 PROFILES: dict[str, dict] = {
-    "claude": {"exit": "signal", "argv_after_binary": True, "idle_guards": True},
-    "opencode": {"exit": "signal", "argv_after_binary": False},
+    "claude": {"exit": "signal", "argv_after_binary": True, "idle_guards": True, "composer": "claude"},
+    # sleeping it waits for the Phase 6 proof (ansible-orchestration plan.opencode-herdr.md D7):
+    # the host's `agents` list leaves it out until then
+    "opencode": {"exit": "signal", "argv_after_binary": False, "idle_guards": True, "composer": "opencode"},
     # codex is deliberately absent: its TUI does not restore the terminal's keyboard protocol on
     # any signal, so it would need the typed-command exit, and our composer-empty check is
     # claude-shaped (prompt glyphs) — an unknown composer must refuse, which would make a codex
@@ -1169,6 +1172,153 @@ def composer_state(screen: str | None) -> tuple[str, str]:
     return "unknown", "no prompt glyph on screen"
 
 
+# opencode 1.19's TUI (captures in tests/fixtures/opencode-1.19.4, from ansible-orchestration
+# docs/macos/captures): the composer is a block of `┃` rows ending in the agent row
+# (`┃  Build · <model> <provider>`), closed by `╹▀▀▀…`; below it is the footer. The transcript's user
+# messages are `┃` blocks too, and a queued one touches the composer, so a composer row is told
+# from them by its background, which is the agent row's.
+OPENCODE_BAR, OPENCODE_BOTTOM = "┃", "╹▀▀▀"
+OPENCODE_BUSY = ("esc interrupt", "retrying in")          # a turn runs, or a provider retry loop
+OPENCODE_DIALOG = ("△ Permission required", "↑↓ select", "enter submit", "esc dismiss")
+OPENCODE_PLACEHOLDER = re.compile(r'^Ask anything… ".*"$')  # the home screen's hint ...
+OPENCODE_PLACEHOLDER_FG = ("2", "128", "128", "128")          # ... in its grey (a typed copy is 238)
+OPENCODE_EMPTY_ROWS = 3  # spacer, one input row, spacer: the textarea's minimum height (Phase 0 captures)
+
+
+def sgr_color(codes: list[str], j: int) -> tuple[str, tuple[str, ...], int]:
+    """At codes[j] (a 38/48 parameter): ('fg'|'bg', the colour normalised, codes consumed). Both the
+    `48;2;r;g;b` and the `48:2::r:g:b` (or `48:2:r:g:b`) forms give ('2', r, g, b); `5;n` gives ('5', n)."""
+    which = "fg" if codes[j].split(":", 1)[0] == "38" else "bg"  # (58 is the caller's to drop)
+    if ":" in codes[j]:
+        parts = codes[j].split(":")
+        if parts[1:2] == ["2"]:
+            return which, ("2", *[str(int(x or 0)) for x in parts[-3:]]), 1
+        if parts[1:2] == ["5"]:
+            return which, ("5", str(int(parts[2] or 0))), 1
+        return which, ("?", codes[j]), 1
+    n = SGR_COLOR_ARGS.get(codes[j + 1], 0) if j + 1 < len(codes) else 0
+    args = codes[j + 1:j + 2 + n]
+    return which, tuple(str(int(x or 0)) for x in args) if n else ("?",), 1 + (1 + n if n else 0)
+
+
+def colors_after(line: str, glyph: str, text: bool = False) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """(foreground, background) in force on the first visible character after glyph (with text=True:
+    the first one that isn't a space), each normalised by sgr_color, () for the default; None when
+    glyph (or such a character) isn't on the line."""
+    fg: tuple[str, ...] = ()
+    bg: tuple[str, ...] = ()
+    seen, i = False, 0
+    while i < len(line):
+        m = ANSI_SGR.match(line, i)
+        if m:
+            codes = (m.group(1) or "0").split(";")
+            j = 0
+            while j < len(codes):
+                code = codes[j].split(":", 1)[0]
+                if code in ("38", "48", "58"):  # 58 (underline colour): its arguments are skipped, not read
+                    which, color, used = sgr_color(codes, j)
+                    if code != "58":
+                        fg, bg = (color, bg) if which == "fg" else (fg, color)
+                    j += used
+                    continue
+                if code in ("", "0"):
+                    fg, bg = (), ()
+                elif code == "39":
+                    fg = ()
+                elif code == "49":
+                    bg = ()
+                elif code.isdigit() and (30 <= int(code) <= 37 or 90 <= int(code) <= 97):
+                    fg = (code,)
+                elif code.isdigit() and (40 <= int(code) <= 47 or 100 <= int(code) <= 107):
+                    bg = (code,)
+                j += 1
+            i = m.end()
+            continue
+        m = ANSI_ANY.match(line, i)
+        if m:
+            i = m.end()
+            continue
+        if seen and (not text or line[i] != " "):
+            return fg, bg
+        if line[i] == glyph:
+            seen = True
+        i += 1
+    return None
+
+
+def background_after(line: str, glyph: str) -> tuple[str, ...] | None:
+    """The background in force on the first visible character after glyph, or None."""
+    got = colors_after(line, glyph)
+    return None if got is None else got[1]
+
+
+def opencode_composer_state(screen: str | None) -> tuple[str, str]:
+    """composer_state for opencode panes: ('empty' | 'draft' | 'unknown', detail), failing closed.
+
+    The composer is the block of `┃` rows (one background) above its `╹▀▀▀` bottom line: a spacer,
+    the input rows, a spacer and the agent row, with a bar-less line above it. Only the textarea at
+    its minimum height (one input row) with nothing on it, or the home screen's grey hint, is empty:
+    a taller one holds a draft even when the rows in view are blank (it scrolls). A block that doesn't
+    start at a bar-less line, a screen without the bottom line (a dialog replaces the composer), a
+    dialog cue in the block, or a running turn or retry loop in the footer is unknown. Shell mode (`!`)
+    and an open `@` autocomplete row are a draft."""
+    if screen is None:
+        return "unknown", "screen unreadable"
+    raw = [ln.rstrip() for ln in screen.splitlines()]
+    lines = [strip_ansi(ln).strip() for ln in raw]
+    bottom = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith(OPENCODE_BOTTOM)), None)
+    if bottom is None or bottom < 1:
+        dialog = any(cue in ln for ln in lines for cue in OPENCODE_DIALOG)
+        return "unknown", "a permission or question dialog is open" if dialog else "no opencode composer on screen"
+    footer = " ".join(lines[bottom + 1:])
+    if any(cue in footer for cue in OPENCODE_BUSY):
+        return "unknown", "a turn or a provider retry runs (footer)"
+    agent_row = lines[bottom - 1]
+    if not agent_row.startswith(OPENCODE_BAR) or not agent_row[1:].strip():
+        return "unknown", "no agent row above the composer's bottom"
+    shade = background_after(raw[bottom - 1], OPENCODE_BAR)
+    if shade is None:
+        return "unknown", "the agent row has no readable background"
+    top = bottom - 1
+    for i in range(bottom - 2, -1, -1):
+        if not lines[i].startswith(OPENCODE_BAR):
+            break
+        if lines[i].endswith(OPENCODE_BAR) and len(lines[i]) > 1:
+            return "draft", "an autocomplete row is open above the composer"
+        if background_after(raw[i], OPENCODE_BAR) != shade:
+            return "unknown", "the composer block runs into other bar rows (no line between)"
+        top = i
+    if top == 0:
+        return "unknown", "the composer block reaches the top of the screen (no line above it)"
+    if any(cue in ln for ln in lines[top:] for cue in OPENCODE_DIALOG):
+        return "unknown", "a permission or question dialog is open"
+    if agent_row[1:].strip().split()[0] == "Shell":
+        return "draft", "shell mode (a `!` command being typed)"
+    rows = list(range(top, bottom - 1))
+    if len(rows) < OPENCODE_EMPTY_ROWS:
+        return "unknown", f"{len(rows)} composer row(s), fewer than its minimum"
+    typed = [i for i in rows if lines[i][1:].strip()]
+    if len(rows) > OPENCODE_EMPTY_ROWS:
+        return "draft", f"the composer is {len(rows) - 2} input rows tall"
+    if typed and typed != [rows[1]]:
+        return "draft", "text on a composer spacer row"
+    if typed:
+        hint = lines[rows[1]][1:].strip()
+        colors = colors_after(raw[rows[1]], OPENCODE_BAR, text=True)
+        if not (OPENCODE_PLACEHOLDER.match(hint) and colors and colors[0] == OPENCODE_PLACEHOLDER_FG):
+            return "draft", "text in the composer, 1 row"
+    return "empty", ""
+
+
+COMPOSERS = {"claude": composer_state, "opencode": opencode_composer_state}
+
+
+def composer_for(kind: object) -> Callable[[str | None], tuple[str, str]] | None:
+    """The composer check of an agent kind's profile, or None when its composer can't be read."""
+    name = PROFILES.get(str(kind), {}).get("composer")
+    return COMPOSERS.get(name) if isinstance(name, str) else None
+
+
 # Claude Code's spinner line once the turn is over and only background agents, shells or
 # workflows still run ("✻ Waiting for 1 background agent and 1 dynamic workflow to finish").
 # Herdr reports such a pane as `working`, yet its prompt takes input like an idle one.
@@ -1201,7 +1351,7 @@ def mail_ready_status(agent: dict, screen: str | None = None, read_screen: bool 
     status = agent.get("agent_status")
     if status in SLEEPABLE_STATUSES:
         return True
-    if status != "working" or not PROFILES.get(agent.get("agent"), {}).get("idle_guards"):
+    if status != "working" or agent.get("agent") != "claude":  # the background-wait spinner is Claude Code's
         return False
     if screen is None and read_screen:
         screen = herdr_screen(agent["pane_id"])
@@ -1346,8 +1496,11 @@ def busy_reason(agent: dict) -> str | None:
     background shells, subagents, or a scheduled wakeup may still run.
     """
     pane, kind = agent["pane_id"], agent.get("agent")
+    check = composer_for(kind)
+    if check is None:
+        return f"{kind}'s composer cannot be checked for a draft"
     screen = herdr_screen(pane)
-    state, detail = composer_state(screen)
+    state, detail = check(screen)
     if state != "empty":
         return f"composer {state}: {detail}"
     bg = background_work(screen)
@@ -1739,7 +1892,8 @@ def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
         if busy:
             return busy, now
     elif profile.get("exit") == "prompt":
-        state, detail = composer_state(herdr_screen(agent["pane_id"]))
+        check = composer_for(now.get("agent"))
+        state, detail = check(herdr_screen(agent["pane_id"])) if check else ("unknown", "no composer check")
         if state != "empty":
             return f"composer {state}: {detail}", now
     return None, now
@@ -2947,7 +3101,8 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
     if (agent.get("agent_session") or {}).get("value") != uuid:
         return "the pane runs another session"
     profile = PROFILES.get(agent.get("agent"), {})
-    screen = herdr_screen(pane) if profile.get("idle_guards") or profile.get("exit") == "prompt" else None
+    check = composer_for(agent.get("agent"))
+    screen = herdr_screen(pane) if check or profile.get("exit") == "prompt" else None
     if not mail_ready_status(agent, screen, read_screen=False):
         return f"status {agent.get('agent_status')}"
     row = read_json(JOURNAL).get(pane)
@@ -2956,11 +3111,22 @@ def mail_refusal(pane: str, uuid: str) -> str | None:
     if isinstance(row, dict) and not (row.get("phase") == "waking" and row.get("uuid") == uuid) \
             and not (row.get("phase") == "displaced" and row.get("uuid") != uuid):
         return f"the pane is in the sleep journal ({row.get('phase', 'asleep')})"
-    if profile.get("idle_guards") or profile.get("exit") == "prompt":
-        state, detail = composer_state(screen)
+    if check or profile.get("exit") == "prompt":
+        state, detail = check(screen) if check else ("unknown", "no composer check")
         if state != "empty":
             return f"composer {state}: {detail}"
     return None
+
+
+# opencode reads a typed `@path` as an attachment and runs a typed leading `!` as a shell command,
+# both past its guardrail plugin (ansible-orchestration docs/macos/report.2026-11-15-opencode-phase0-lab.md,
+# items 3 and 5). `herdr agent prompt` pastes, which kept both as text in the lab; a word joiner
+# (U+2060, invisible) in front of each keeps them text even if a paste were ever typed.
+OPENCODE_TRIGGER = re.compile(r"(?<!\S)([@!])")
+
+
+def opencode_safe(text: str) -> str:
+    return OPENCODE_TRIGGER.sub("\u2060\\1", text)
 
 
 def well_formed_mail(msg: object) -> bool:
@@ -2978,6 +3144,8 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
     (resume_note_problem). Returns (ids typed in, why it stopped early or None).
     Caller holds the mailbox lock."""
     sent: list[str] = []
+    # mail_refusal checks the pane still runs this session, so its kind holds for the whole loop
+    kind = next((a.get("agent") for a in list_agents() if a.get("pane_id") == pane), None)
     while True:
         batch: list[tuple[Path, dict]] = []
         texts: list[str] = []
@@ -3006,6 +3174,8 @@ def type_mail(pane: str, uuid: str, name: str) -> tuple[list[str], str | None]:
         # is ready before the checks: nothing (envelope reads the config) runs after the last look
         closing = read_self_closes().get(uuid)
         text = "\n\n".join(texts) + (f"\n\n{SELF_CLOSE_CANCELLED}" if closing else "")
+        if kind == "opencode":
+            text = opencode_safe(text)
         # an auto-resume note: the slow checks first, then the pane and its composer, then the last look
         if drop_stale_notes(batch, pane, uuid, name):
             continue
@@ -3913,7 +4083,7 @@ def close_refusals(state: str, hit: dict, uuid: str) -> list[str]:
         status = hit.get("agent_status")
         if status not in SLEEPABLE_STATUSES:
             why.append(f"is busy (status {status})")
-        elif hit.get("agent") == "claude":
+        elif composer_for(hit.get("agent")):
             busy = busy_reason(hit)
             if busy:
                 why.append(busy)
@@ -3994,12 +4164,13 @@ def move_refusals(hit: dict, uuid: str, info: dict, tab: dict) -> list[str]:
     never urgent. A sleeper is refused before this (its wake stub finds its row by the pane id in its
     argv, which a move changes)."""
     why = []
+    check = composer_for(hit.get("agent"))
     if hit.get("agent_status") not in SLEEPABLE_STATUSES:
         why.append(f"is busy (status {hit.get('agent_status')})")
-    elif hit.get("agent") != "claude":
+    elif check is None:
         why.append(f"runs {hit.get('agent')}, whose composer cannot be checked for a draft")
     else:
-        state, detail = composer_state(herdr_screen(str(hit["pane_id"])))
+        state, detail = check(herdr_screen(str(hit["pane_id"])))
         if state != "empty":
             why.append(f"composer {state}: {detail}")
     if info.get("focused") is not False:
@@ -4317,7 +4488,7 @@ def close_self(args: argparse.Namespace) -> int:
         event("self-close-cancelled", uuid=uuid, name=name, pane=me["pane_id"], via="cancel")
         print(f"close --self cancelled for {name}; the session stays open")
         return 0
-    if me.get("agent") != "claude":  # close_refusals: no other kind's composer can be checked for a draft
+    if composer_for(me.get("agent")) is None:  # close_refusals: a draft must be checkable
         print(f"close --self: {name} runs {me.get('agent')}, whose composer cannot be checked for a draft, so "
               "it is never closed unattended; ask its spawner to close it", file=sys.stderr)
         return 1

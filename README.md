@@ -125,6 +125,36 @@ one whose flags are unknown) and
 **opencode** (`-s <session>`). Codex is deliberately absent — see the
 comment on `PROFILES` in the script.
 
+### opencode panes (*v0.1.34*)
+
+Mail, `close`, `close --self` and `move` need a composer check for the pane's
+kind (`PROFILES[kind]["composer"]`, dispatched by `composer_for`); opencode
+1.19 has its own, `opencode_composer_state`, built from screens of a lab run
+(`tests/fixtures/opencode-1.19.4`, from ansible-orchestration
+`docs/macos/captures/`). Herdr does not see an opencode draft (the pane stays
+`idle`/`done`), and `agent prompt` into one sends the draft with the mail, so
+this check is all that protects it.
+
+- The composer is the `┃` block closed by `╹▀▀▀…`; its last row is the agent
+  row (`┃  Build · <model> <provider>`). A transcript user message is a `┃`
+  block too, and one opencode queued touches the composer: a composer row is
+  told from it by its background, the agent row's. Without styling every `┃`
+  row above counts, so a plain screen fails towards `draft`.
+- `empty`: blank rows, or the home screen's grey hint (`Ask anything… "…"`).
+- `draft`: text on a composer row (`[Pasted ~N lines]` included), shell mode
+  (agent row `Shell`), an open `@` autocomplete row.
+- `unknown` (refuse): `esc interrupt` or `retrying in` in the footer (a turn,
+  or a provider retry loop after a 5xx or 429; Esc ends it), a permission or
+  question dialog, no composer bottom on screen.
+
+Mail into an opencode pane gets a word joiner (U+2060) in front of every
+`@` and `!` that starts a token: a typed `@path` becomes an attachment opencode
+reads itself and a leading `!` a shell command, both past its guardrail plugin.
+`agent prompt` pastes, which kept them as text in the lab; the joiner keeps
+them text regardless. Sleeping opencode panes needs `opencode` in `agents`
+(the host config); its sleep guards are the same as claude's, without the
+transcript checks.
+
 ### Restarts and reboots
 
 Herdr saves a pane's label and a resume command a reporter gave it, not its
@@ -632,7 +662,7 @@ safe); a message delivered before then cancels it`). It is always local: no `--m
 - The caller is identified like an insomnia claim (`HERDR_PANE_ID`, and that
   pane's agent process must be an ancestor of the command); outside an agent
   pane, without a session id, or for a kind whose composer cannot be checked
-  for a draft (anything but claude), it refuses (exit 1). Running it again
+  for a draft (anything but claude and opencode), it refuses (exit 1). Running it again
   keeps the wish and its start (`--reason` replaces the reason).
 - The wish lives in `closing.json` in the state dir, keyed by session id
   (`at`, `name`, `pane`, `reason`, `by`), and logs `self-close-requested`.
@@ -984,13 +1014,13 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 613 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 643 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close (and `close --self`), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), auto-resume (its
+and close (and `close --self`), the opencode composer (fixtures of the 1.19.4 screens), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), auto-resume (its
 classifier rows on 2.1.231–2.1.322 record shapes, the gate on a fake clock with a 60 s poll; an autouse fixture keeps
 every test off the network), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's

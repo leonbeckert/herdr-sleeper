@@ -4689,10 +4689,10 @@ def test_close_self_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, c
     assert needle in capsys.readouterr().err and not sleeper.SELF_CLOSE.exists()
 
 
-def test_close_self_needs_a_claude_session_with_an_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+def test_close_self_needs_a_checkable_session_with_an_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
                                                       capsys: pytest.CaptureFixture[str]) -> None:
-    fake.agents[0]["agent"] = "opencode"
-    assert _self_close(monkeypatch) == 1 and "composer cannot be checked" in capsys.readouterr().err
+    fake.agents[0]["agent"] = "codex"                                   # no composer check (opencode has one)
+    assert _self_close(monkeypatch) == 1 and "runs codex" in capsys.readouterr().err
     fake.agents[0]["agent"] = "claude"
     fake.agents[0].pop("agent_session")
     assert _self_close(monkeypatch) == 1 and "no session id" in capsys.readouterr().err
@@ -7367,3 +7367,149 @@ def test_move_refuses_a_session_that_changes_while_it_is_checked(fake: FakeHerdr
     monkeypatch.setattr(sleeper, "herdr_screen", screen_then_change)
     assert _move(monkeypatch, "a") == 1
     assert "changed while it was being checked" in capsys.readouterr().err and not _moves(fake)
+
+
+# ------------------------------------------------------------------ opencode composer (plan.opencode-herdr.md 4a)
+
+OPENCODE_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "opencode-1.19.4"
+
+
+def oc_screen(name: str) -> str:
+    """A screen of opencode 1.19.4 as `herdr pane read --format ansi` gave it in the Phase 0 lab."""
+    return (OPENCODE_FIXTURES / f"screen-{name}.ansi").read_text()
+
+
+@pytest.mark.parametrize("name, state", [
+    ("01-firstrun", "empty"),               # the home screen's grey hint is no draft
+    ("02-after-multiline", "empty"),
+    ("09-idle-after", "empty"),
+    ("15-after-401", "empty"),             # an inline provider error leaves an empty composer
+    ("19-resumed", "empty"),
+    ("03-draft-typed", "draft"),
+    ("04-draft-multiline", "draft"),
+    ("06-pasted", "draft"),                # `[Pasted ~12 lines]`
+    ("10-at-autocomplete", "draft"),
+    ("11-at-selected", "draft"),
+    ("25-bang-typed", "draft"),            # shell mode
+    ("07-working", "unknown"),
+    ("08-working-queued", "unknown"),      # a queued user message touches the composer
+    ("13-sustained-500", "unknown"),       # `[retrying in 12s attempt #5]`
+    ("18-after-sigterm", "unknown"),       # the shell is back, no composer
+    ("20-permission-dialog", "unknown"),
+    ("21-question-dialog", "unknown"),
+])
+def test_opencode_composer_reads_the_lab_screens(name: str, state: str) -> None:
+    got, detail = sleeper.opencode_composer_state(oc_screen(name))
+    assert got == state, detail
+    assert "draft not yet sent" not in detail and "README" not in detail   # never what the draft says
+
+
+def test_opencode_composer_fails_closed() -> None:
+    cs = sleeper.opencode_composer_state
+    assert cs(None)[0] == "unknown"
+    assert cs(EMPTY_SCREEN)[0] == "unknown"                      # a Claude screen is no opencode composer
+    assert cs(CLAUDE_SCREEN.format(composer=""))[0] == "unknown"
+    # without styling a queued message can't be told from the composer: never empty
+    plain = sleeper.strip_ansi(oc_screen("08-working-queued")).replace("esc interrupt", "")
+    assert cs(plain)[0] == "unknown"
+    # a footer or row we don't know stays unknown
+    no_bottom = "\n".join(ln for ln in oc_screen("09-idle-after").splitlines() if "╹" not in ln)
+    assert cs(no_bottom)[0] == "unknown"
+
+
+def _oc_rows(name: str) -> tuple[list[str], int]:
+    """A lab screen's lines and the index of its composer's bottom line."""
+    lines = oc_screen(name).split("\n")
+    return lines, max(i for i, ln in enumerate(lines) if sleeper.strip_ansi(ln).strip().startswith("╹▀▀▀"))
+
+
+def test_opencode_composer_counts_a_tall_blank_composer_as_a_draft() -> None:
+    # the textarea scrolls: a draft followed by blank lines can show only blank rows (Codex review of 4a)
+    lines, bottom = _oc_rows("04-draft-multiline")
+    blank = lines[bottom - 2]                                    # the spacer row under the input rows
+    lines[bottom - 5:bottom - 3] = [blank, blank]                # the two typed rows scrolled out of view
+    assert sleeper.opencode_composer_state("\n".join(lines)) == ("draft", "the composer is 2 input rows tall")
+
+
+def test_opencode_composer_tells_the_grey_hint_from_a_typed_copy() -> None:
+    assert sleeper.opencode_composer_state(oc_screen("01-firstrun"))[0] == "empty"
+    lines, bottom = _oc_rows("01-firstrun")
+    lines[bottom - 3] = lines[bottom - 3].replace("38;2;128;128;128", "38;2;238;238;238")
+    assert sleeper.opencode_composer_state("\n".join(lines))[0] == "draft"
+    lines, bottom = _oc_rows("03-draft-typed")
+    row = lines[bottom - 3]
+    text = sleeper.strip_ansi(row).split("┃", 1)[1].strip()
+    lines[bottom - 3] = row.replace(text, 'Ask anything… "real unsent draft"')
+    assert sleeper.opencode_composer_state("\n".join(lines))[0] == "draft"
+
+
+def test_opencode_composer_reads_both_truecolour_forms() -> None:
+    lines, bottom = _oc_rows("03-draft-typed")
+    lines[bottom - 3] = lines[bottom - 3].replace("48;2;30;30;30", "48:2::30:30:30")
+    assert sleeper.opencode_composer_state("\n".join(lines))[0] == "draft"
+    idle = oc_screen("09-idle-after").replace("48;2;30;30;30", "48:2::30:30:30")
+    assert sleeper.opencode_composer_state(idle)[0] == "empty"
+    lines, bottom = _oc_rows("09-idle-after")                   # one row in another shade: ambiguous
+    lines[bottom - 3] = lines[bottom - 3].replace("48;2;30;30;30", "48;2;20;20;20")
+    assert sleeper.opencode_composer_state("\n".join(lines))[0] == "unknown"
+
+
+def test_opencode_composer_without_a_line_above_is_unknown() -> None:
+    lines, bottom = _oc_rows("09-idle-after")                   # a truncated snapshot: the block starts at row 0
+    assert sleeper.opencode_composer_state("\n".join(lines[bottom - 4:]))[0] == "unknown"
+
+
+@pytest.mark.parametrize("underline", ["58;2;0;0;0", "58;5;7", "58:2::0:0:0"])
+def test_underline_colour_is_not_read_as_attributes(underline: str) -> None:
+    line = f"\x1b[38;2;238;238;238;48;2;30;30;30;{underline}m┃ x"
+    assert sleeper.colors_after(line, "┃") == (("2", "238", "238", "238"), ("2", "30", "30", "30"))
+
+
+def test_opencode_dialog_cues_in_the_transcript_are_text() -> None:
+    lines, bottom = _oc_rows("09-idle-after")
+    lines[bottom - 8] = "  The menu uses enter submit and esc dismiss; ↑↓ select moves."
+    assert sleeper.opencode_composer_state("\n".join(lines))[0] == "empty"
+    assert sleeper.opencode_composer_state(oc_screen("20-permission-dialog"))[1].startswith("a permission")
+    assert sleeper.opencode_composer_state(oc_screen("21-question-dialog"))[1].startswith("a permission")
+
+
+def test_composer_checks_go_by_profile() -> None:
+    assert sleeper.composer_for("claude") is sleeper.composer_state
+    assert sleeper.composer_for("opencode") is sleeper.opencode_composer_state
+    assert sleeper.composer_for("codex") is None and sleeper.composer_for(None) is None
+
+
+def test_mail_into_opencode_waits_for_an_empty_composer_and_keeps_triggers_as_text(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.agents[0]["agent"] = "opencode"
+    fake.screen = oc_screen("03-draft-typed")
+    assert deliver(monkeypatch, "a", body="read @README.md then\n!rm -rf x, mail me@example.org") == 3
+    assert prompts(fake) == [] and len(sleeper.pending_mail(UUID)) == 1          # the draft is the owner's
+    fake.screen = oc_screen("13-sustained-500")
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == []                                                    # a retry loop is busy
+    fake.screen = oc_screen("09-idle-after")
+    sleeper.flush_mail(fake.agents)
+    (call,) = prompts(fake)
+    assert "read \u2060@README.md then\n\u2060!rm -rf x, mail me@example.org" in call[3]
+    assert "@README" not in call[3].replace("\u2060@README", "")
+
+
+def test_mail_into_claude_is_not_reshaped(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert deliver(monkeypatch, "a", body="see @README.md") == 0
+    (call,) = prompts(fake)
+    assert call[3].endswith("see @README.md")
+
+
+def test_close_and_close_self_work_for_opencode(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent"] = "opencode"
+    fake.screen = oc_screen("04-draft-multiline")
+    assert _close(monkeypatch, "a") == 1 and "composer draft" in capsys.readouterr().err
+    assert _self_close(monkeypatch, reason="done") == 0 and UUID in _closing()
+    monkeypatch.delenv("HERDR_PANE_ID")
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.signals == [] and UUID in _closing()                    # the draft keeps it open
+    fake.screen = oc_screen("09-idle-after")
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.signals and UUID not in _closing()
