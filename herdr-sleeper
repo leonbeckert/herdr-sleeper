@@ -35,7 +35,8 @@ Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
   herdr-sleeper spawn --cwd DIR --name NAME [-- FLAGS]   new tab + named agent, first prompt on stdin
   herdr-sleeper close NAME [--force]    close a session's pane (refuses busy, draft, insomnia)
   herdr-sleeper close --self [--reason T|--cancel]   close the calling session once its turn ends
-  herdr-sleeper … --machine M | M/NAME  deliver, wake, close, presence, insomnia list, spawn on a
+  herdr-sleeper move NAME --workspace W [--label T] [--create]   a live idle session into a tab of W
+  herdr-sleeper … --machine M | M/NAME  deliver, wake, close, move, presence, insomnia list, spawn on a
                                         Herdr saved machine (over SSH); presence --all merges them
   herdr-sleeper claude-hook             Claude Code hook: ListAgents shows sleepers, SendMessage wakes them
   herdr-sleeper uninstall               stop the watcher, wake everything, report what is left
@@ -157,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.32"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.33"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -3101,22 +3102,53 @@ def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str,
     raise SleeperError(f"no live or sleeping agent matches {target!r} (see `herdr-sleeper presence`)")
 
 
-def context_sender(agents: list[dict]) -> str | None:
-    """The calling agent's name (or pane id), when the caller runs inside a Herdr pane."""
+def own_pane_moved() -> tuple[str | None, bool]:
+    """(the pane this process runs in now, whether HERDR_PANE_ID named an older id of it). That
+    variable is fixed when the pane's shell starts; a move (`move`, or a drag in Herdr) gives the
+    pane a new id, and Herdr answers the old id as an alias for the new one until its next restart.
+    An alias is an address, not proof of ownership: a detached child can outlive a restart with a
+    stale variable (LESSONS.md), so callers that attribute a session to a followed id prove it by
+    process ancestry (calling_agent). An unknown pane keeps the variable."""
     pane = os.environ.get("HERDR_PANE_ID")
     if not pane:
+        return None, False
+    try:
+        now = (herdr("pane", "get", pane, check=False).get("pane") or {}).get("pane_id")
+    except SleeperError:
+        now = None
+    resolved = str(now) if now else pane
+    return resolved, resolved != pane
+
+
+def own_pane() -> str | None:
+    """The pane this process runs in now (own_pane_moved without the flag)."""
+    return own_pane_moved()[0]
+
+
+def followed_agent(agents: list[dict]) -> tuple[str | None, dict | None]:
+    """(own pane, the agent there). Through a followed (moved) id the agent counts only when this
+    process runs under it (calling_agent's ancestry proof); the plain id is believed as before."""
+    pane, moved = own_pane_moved()
+    if not pane:
+        return None, None
+    if moved:
+        me, _why = calling_agent(agents)
+        return pane, (me if me and me.get("pane_id") == pane else None)
+    return pane, next((a for a in agents if a["pane_id"] == pane), None)
+
+
+def context_sender(agents: list[dict]) -> str | None:
+    """The calling agent's name (or pane id), when the caller runs inside a Herdr pane."""
+    pane, hit = followed_agent(agents)
+    if not pane:
         return None
-    hit = next((a for a in agents if a["pane_id"] == pane), None)
     return (hit or {}).get("name") or pane
 
 
 def calling_session() -> str | None:
     """The session id of the agent in the calling pane, or None (a shell, another machine)."""
-    pane = os.environ.get("HERDR_PANE_ID")
-    if not pane:
-        return None
     with contextlib.suppress(SleeperError):
-        hit = next((a for a in list_agents() if a["pane_id"] == pane), None)
+        _pane, hit = followed_agent(list_agents())
         uuid = ((hit or {}).get("agent_session") or {}).get("value")
         return uuid if valid_session_id(uuid) else None
     return None
@@ -3185,7 +3217,7 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         print(f"deliver: {name} reports no session id; nothing to queue against "
               "(use `herdr agent prompt` for a session that cannot be resumed)", file=sys.stderr)
         return 1
-    from_pane = os.environ.get("HERDR_PANE_ID")
+    from_pane = own_pane()
     with mailbox_lock(uuid):
         extra = {k: v for k, v in threading_.items() if v}
         msg, status = queue_message(uuid, sender, body, args.id, extra=dict(extra, to_name=name))
@@ -3375,8 +3407,9 @@ def ancestors(table: dict[int, tuple[int, str]], pid: int) -> list[int]:
 def calling_agent(agents: list[dict]) -> tuple[dict | None, str | None]:
     """The live agent this command runs under, or (None, why). The pane comes from HERDR_PANE_ID and
     is believed only when that pane's agent process is an ancestor of this one: a variable inherited
-    from another pane or session must not claim for someone else's session."""
-    pane = os.environ.get("HERDR_PANE_ID")
+    from another pane or session must not claim for someone else's session. A moved pane is followed
+    to its new id (own_pane)."""
+    pane = own_pane()
     if not pane:
         return None, "not run inside a Herdr pane (no HERDR_PANE_ID)"
     hit = next((a for a in agents if a["pane_id"] == pane and a.get("agent")
@@ -3676,7 +3709,7 @@ def name_taken(name: str, agents: list[dict]) -> str | None:
 
 
 def caller_workspace(agents: list[dict]) -> str | None:
-    pane = os.environ.get("HERDR_PANE_ID")
+    pane = own_pane()
     hit = next((a for a in agents if a["pane_id"] == pane), None) if pane else None
     return (hit or {}).get("workspace_id")
 
@@ -3842,7 +3875,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             break
         time.sleep(1)
         uuid = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session") or {}).get("value")
-    from_pane = os.environ.get("HERDR_PANE_ID")
+    from_pane = own_pane()
     rec = {"pane": pane, "tab": tab, "workspace": made["tab"].get("workspace_id"), "kind": args.kind,
            "cwd": str(cwd), "by": sender, "from_pane": from_pane, "uuid": uuid if valid_session_id(uuid) else None,
            "at": dt.datetime.now().isoformat(timespec="seconds")}
@@ -3939,6 +3972,158 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 1
     print(text)
     return 0
+
+
+MOVE_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,63}")  # workspace and tab labels `move` names
+
+
+def workspace_with_label(label: str) -> str | None:
+    """The id of the one workspace on this machine whose id or label is `label`; None when none is.
+    Two with that label raise: guessing would file a session in the wrong place."""
+    spaces = [w for w in (herdr("workspace", "list").get("workspaces") or []) if isinstance(w, dict)]
+    if any(w.get("workspace_id") == label for w in spaces):
+        return label
+    hits = [str(w["workspace_id"]) for w in spaces if w.get("label") == label and w.get("workspace_id")]
+    if len(hits) > 1:
+        raise SleeperError(f"{len(hits)} workspaces are labelled {label!r} ({', '.join(hits)}); name one by id")
+    return hits[0] if hits else None
+
+
+def move_refusals(hit: dict, uuid: str, info: dict, tab: dict) -> list[str]:
+    """Why moving this live session now could cost the owner something. Never overridable: a move is
+    never urgent. A sleeper is refused before this (its wake stub finds its row by the pane id in its
+    argv, which a move changes)."""
+    why = []
+    if hit.get("agent_status") not in SLEEPABLE_STATUSES:
+        why.append(f"is busy (status {hit.get('agent_status')})")
+    elif hit.get("agent") != "claude":
+        why.append(f"runs {hit.get('agent')}, whose composer cannot be checked for a draft")
+    else:
+        state, detail = composer_state(herdr_screen(str(hit["pane_id"])))
+        if state != "empty":
+            why.append(f"composer {state}: {detail}")
+    if info.get("focused") is not False:
+        why.append("has the keyboard focus (the owner may be typing there)" if info.get("focused")
+                   else "its focus could not be read")
+    count = tab.get("pane_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        why.append("its tab could not be read (is it alone there?)")
+    elif count > 1:
+        why.append(f"shares its tab with {count - 1} other pane(s) (an ask panel or a split); "
+                   "a move would take only the session's pane")
+    held = insomnia_reason(uuid, str(hit.get("pane_id")), hit.get("terminal_id"))
+    if held:
+        why.append(f"holds {held} (the claim is tied to its pane)")
+    if uuid in read_self_closes():
+        why.append("is closing itself (close --self pending)")
+    if open_asks(uuid, hit.get("name"), pane=hit.get("pane_id"), terminal=hit.get("terminal_id")):
+        why.append("waits on the owner (open ask); its panel would stay behind")
+    if pending_mail(uuid):
+        why.append("has undelivered mail; try again once it is typed in")
+    return why
+
+
+def move_session(uuid: str, target: str, workspace: str, label: str | None, create: bool,
+                 by: str) -> tuple[bool, str]:
+    """The core of `move`: under the global lock and the session's mailbox lock, from fresh state,
+    refuse what could cost something, else move the session's pane into a new tab of `workspace`
+    (created with --create) without focus. Herdr gives the pane a new id and keeps its terminal;
+    the watcher's idle clock for it restarts (the next sleep comes one idle window later)."""
+    with locked(), mailbox_lock(uuid, wait=False) as free:
+        if not free:
+            return False, MAIL_BUSY + "; try again"
+        where = session_state(uuid)
+        if where is None:
+            return False, f"{target} is neither live nor asleep any more"
+        state, hit, _key = where
+        if state != "live" or any(valid_entry(e) and e["uuid"] == uuid for e in read_json(JOURNAL).values()):
+            return False, (f"{target} is asleep (or waking): wake it first (`herdr-sleeper wake {target}`), then "
+                           "move it once it is idle. A sleeping pane is not moved: its wake stub finds its "
+                           "row by the pane id a move changes")
+        name, pane = hit.get("name") or str(hit["pane_id"]), str(hit["pane_id"])
+        dest = workspace_with_label(workspace)  # first: every check below is then as fresh as possible
+        if dest is None and not create:
+            return False, f"no workspace {workspace!r} on this machine (pass --create to make it)"
+        hit = live_agent(uuid, ready=False) or {}
+        if str(hit.get("pane_id")) != pane:
+            return False, f"{name} changed panes meanwhile; try again"
+        info = herdr("pane", "get", pane).get("pane") or {}
+        tab = (herdr("tab", "get", str(info["tab_id"])).get("tab") or {}) if info.get("tab_id") else {}
+        if dest is not None and dest == info.get("workspace_id"):
+            return True, f"{name} is already in {workspace}"
+        refusals = move_refusals(hit, uuid, info, tab)
+        if refusals:
+            return False, f"{name} " + "; ".join(refusals)
+        # last look right before the move: the session, status, focus, terminal and lone tab the
+        # checks above saw must still hold. Herdr has no conditional move, so a change in the two
+        # calls' time (owner input, a split, a /clear) can still slip through; the mailbox and global
+        # locks keep this tool's own deliveries, sleeps and closes out of that window.
+        last = herdr("pane", "get", pane).get("pane") or {}
+        last_tab = (herdr("tab", "get", str(last["tab_id"])).get("tab") or {}) if last.get("tab_id") else {}
+        if (last.get("agent_status") not in SLEEPABLE_STATUSES or last.get("focused") is not False
+                or (last.get("agent_session") or {}).get("value") != uuid
+                or last.get("terminal_id") != info.get("terminal_id") or last.get("tab_id") != info.get("tab_id")
+                or last_tab.get("pane_count") != 1):
+            return False, f"{name} changed while it was being checked (session, status, focus or tab); try again"
+        tab_label = label or tab.get("label") or name
+        if dest is not None:
+            done = herdr("pane", "move", pane, "--new-tab", "--workspace", dest, "--label", tab_label, "--no-focus")
+        else:
+            done = herdr("pane", "move", pane, "--new-workspace", "--label", workspace, "--tab-label", tab_label,
+                         "--no-focus")
+        moved = (done.get("move_result") or {}).get("pane") or {}
+        new = str(moved.get("pane_id") or "")
+        term = moved.get("terminal_id")
+        if new and not term:
+            term = (herdr("pane", "get", new, check=False).get("pane") or {}).get("terminal_id")
+        if not new or not info.get("terminal_id") or term != info.get("terminal_id"):
+            event("move-unverified", name=name, uuid=uuid, pane=pane, now=new or None, by=by)
+            return False, (f"moved {name}, but Herdr's answer does not prove it is the same terminal "
+                           f"(pane {pane} -> {new or '?'}); check `herdr-sleeper presence`")
+    event("moved", name=name, uuid=uuid, pane=pane, now=new, workspace=workspace, tab=tab_label,
+          created=dest is None, by=by)
+    return True, f"moved {name} to {workspace} › {tab_label} (pane {pane} -> {new})"
+
+
+def cmd_move(args: argparse.Namespace) -> int:
+    """Move a live idle session into a tab of another workspace on its machine, for whoever keeps
+    the owner's layout. Refuses a busy session, a draft, the focused pane, a shared tab, an open
+    ask, queued mail and a sleeper; never forced, never across machines."""
+    if not args.target or not args.workspace:
+        print("move: name the session and --workspace", file=sys.stderr)
+        return 2
+    for value in (args.workspace, args.label):
+        if value is not None and not MOVE_LABEL_RE.fullmatch(value):
+            print(f"move: {value!r} is not a label move takes (letters, digits, _.:@+-; up to 64)", file=sys.stderr)
+            return 2
+    remote = routed("move", args)
+    if remote is not None:
+        return remote
+    agents = list_agents()
+    by = args.sender or context_sender(agents) or f"pid {os.getppid()}"
+    try:
+        journal = read_json(JOURNAL)
+        record = spawned_records().get(args.target)
+        try:
+            state, hit, _key = resolve_target((record or {}).get("uuid") or args.target, agents, journal)
+        except SleeperError:
+            if not record:
+                raise
+            state, hit, _key = resolve_target(args.target, agents, journal)
+        uuid = (hit.get("agent_session") or {}).get("value") if state == "live" else hit["uuid"]
+        if not valid_session_id(uuid):
+            print(f"move: {args.target} reports no session id", file=sys.stderr)
+            return 1
+        me, _why = calling_agent(agents)
+        if me and me["agent_session"]["value"] == uuid:
+            print("move: refusing to move the calling session mid-turn", file=sys.stderr)
+            return 1
+        ok, text = move_session(uuid, args.target, args.workspace, args.label, args.create, by)
+    except SleeperError as exc:
+        print(f"move: {exc}", file=sys.stderr)
+        return 1
+    print(text, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def pane_exists(pane: str) -> bool | None:
@@ -5276,7 +5461,7 @@ def asker_where(rec: dict) -> dict:
     state, row = asker_now(rec, agents)
     if state == "live" and row:
         place = ui_place({"place": ui_places(agents).get(row["pane_id"]), "machine": rec.get("machine")})
-        mine = os.environ.get("HERDR_PANE_ID")
+        mine = own_pane()
         left = " (left of this panel)" if mine and any(a["pane_id"] == mine and a.get("tab_id") == row.get("tab_id")
                                                        for a in agents) else ""
         return {"place": place if place != "-" else rec.get("asker_place"),
@@ -5430,7 +5615,7 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
     """The panel's loop. 0: nothing open any more (its pane is closed); 1: the terminal went away
     (the items stay open; Herdr's resume command, the session's next ask or the watcher's reaper
     brings the panel back)."""
-    pane = os.environ.get("HERDR_PANE_ID")
+    pane = own_pane()
     argv = ask_panel_argv(panel_id) if panel_id else ask_pane_argv(str(legacy_id))
     out = sys.stdout
     items = panel_items(panel_id, legacy_id)
@@ -5665,7 +5850,7 @@ def cmd_ask_pane(args: argparse.Namespace) -> int:
     rec = read_asks().get(args.ask_id)
     if isinstance(rec, dict) and rec.get("panel"):  # adopted into a panel meanwhile: this tab is not needed
         print(f"ask {args.ask_id} moved to its session's ask panel; closing this tab")
-        pane = os.environ.get("HERDR_PANE_ID")
+        pane = own_pane()
         if pane and pane != rec.get("pane"):
             close_ask_pane(pane, args.ask_id, legacy=True)  # this program's own pane, proved by its argv
         return 0
@@ -6176,7 +6361,7 @@ def machine_label(machine: str | None) -> str | None:
 
 
 def routed(cmd: str, args: argparse.Namespace) -> int | None:
-    """Run wake, close, presence or insomnia list on the machine the arguments name (exit code),
+    """Run wake, close, move, presence or insomnia list on the machine the arguments name (exit code),
     or None: it runs here, with `args.target` rewritten to the local target. The remote end runs
     with --here (no second hop) and applies its own refusals to its own state."""
     target = getattr(args, "target", None)
@@ -6208,6 +6393,14 @@ def routed(cmd: str, args: argparse.Namespace) -> int | None:
                 return 2
             return relay_remote(cmd, label, ["close", "--here", "--from", who] + (["--force"] if args.force else [])
                                 + ["--", target])
+        if cmd == "move":
+            who = remote_sender(args.sender)
+            if not who:
+                print("move: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+                return 2
+            return relay_remote(cmd, label, ["move", "--here", "--from", who, "--workspace", args.workspace]
+                                + (["--label", args.label] if args.label else [])
+                                + (["--create"] if args.create else []) + ["--", target])
         argv = ["presence"] if cmd == "presence" else ["insomnia", "list"]
         return relay_remote(cmd, label, argv + (["--json"] if args.json else []))
     except SleeperError as exc:  # a broken config or catalog: refuse, never guess the other machine
@@ -8673,7 +8866,7 @@ def context_pane() -> str | None:
     server from an outer session would name another session's pane). Manual runs fall back."""
     raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON")
     if raw is None:
-        return os.environ.get("HERDR_PANE_ID")
+        return own_pane()
     try:
         ctx = json.loads(raw or "{}")
     except ValueError:
@@ -8972,6 +9165,16 @@ def main(argv: list[str] | None = None) -> int:
     clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     clp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
     clp.set_defaults(fn=cmd_close)
+    mvp = sub.add_parser("move", help="move a live idle session into a tab of another workspace (refuses busy, "
+                                      "draft, focus, shared tab, open ask, mail, asleep)")
+    mvp.add_argument("target", nargs="?", help="session name, pane id, agent name, or session id")
+    mvp.add_argument("--workspace", help="the workspace's label (or id) on the session's machine")
+    mvp.add_argument("--label", help="the new tab's label (default: the old tab's)")
+    mvp.add_argument("--create", action="store_true", help="create the workspace when no workspace carries the label")
+    mvp.add_argument("--from", dest="sender", help="who moves it (default: the calling pane's agent name)")
+    mvp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    mvp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
+    mvp.set_defaults(fn=cmd_move)
     akp = sub.add_parser("ask", help="ask the owner (or give them a to-do) in your session's ask panel, split "
                                      "right of your pane (shown blocked); context on stdin")
     akp.add_argument("--question", help="the question, one line")

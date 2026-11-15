@@ -596,6 +596,30 @@ An orphaned, displaced or waking row is never closed, not even with
 `--force`. Either way the transcript stays on disk, and `close` prints
 the line that resumes it by hand.
 
+### Moving a session (`move`, *v0.1.33*)
+
+`herdr-sleeper move NAME --workspace W [--label T] [--create] [--from SENDER]`
+moves a live session into a new tab of workspace `W` (a label or an id; two
+workspaces with the same label are refused, `--create` makes a missing one)
+without taking the focus, for whoever keeps the owner's layout. It refuses,
+never forced: a busy session, a draft in the composer, a kind whose composer
+cannot be read, the pane with the keyboard focus, a tab shared with another
+pane (an ask panel stays behind otherwise), an open ask, queued mail, the
+calling session, and a sleeper. Herdr gives a moved pane a new id and keeps
+its terminal; the move checks the terminal and logs `moved`. A sleeper is
+woken first: its wake stub finds its journal row by the pane id in its argv,
+which a move changes. `--machine M` (or `M/NAME`) moves on another saved
+machine, never across machines.
+
+A moved session keeps `HERDR_PANE_ID=<old id>` in its shell; Herdr answers the
+old id as an alias until its next restart, so every "which session am I"
+lookup (`ask`, `insomnia`, `close --self`, `deliver --from`) resolves it
+through `pane get` (`own_pane`); attributing a session through such a followed
+id needs the process-ancestry proof (a detached child may keep a stale
+variable). A session holding insomnia (its own claim or one made in its pane
+before a `/clear`) or closing
+itself is not moved: both records name its pane.
+
 ### Closing yourself (`close --self`, *v0.1.13*)
 
 A session that is done closes itself: it runs `herdr-sleeper close --self
@@ -960,7 +984,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 538 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 613 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

@@ -151,6 +151,8 @@ class FakeHerdr:
         self.run_error: str | None = None           # error code `pane run` fails with
         self.run_starts = True                      # a `pane run` really starts its program
         self.strict_process_info = True             # process-info of a gone pane is an error, as in Herdr
+        self.aliases: dict[str, str] = {}           # old pane id -> new one after a move (until a restart)
+        self.move_new_terminal: str | None = None   # a move that comes back with another terminal
 
     def restart(self, keep_resume: bool = True) -> None:
         """A Herdr server restart: every terminal gets a new id, saved labels come back, claims (hook
@@ -160,6 +162,7 @@ class FakeHerdr:
         Herdr that saves no resume commands."""
         if not keep_resume:
             self.resumes.clear()
+        self.aliases.clear()   # Herdr forgets old pane ids at a restart
         for a in self.agents:
             a["terminal_id"] = f"{a.get('terminal_id')}-r"
             if a.get("agent") == sleeper.CLAIM_AGENT:
@@ -231,13 +234,14 @@ class FakeHerdr:
             a = by_pane.get(args[2])
             return {"agent": a} if a else {}
         if args[:2] == ("pane", "get"):
-            a = by_pane.get(args[2])
+            a = by_pane.get(args[2]) or by_pane.get(self.aliases.get(args[2], ""))
             if a is None:
                 if check:
                     raise sleeper.SleeperError("no such pane")
                 return {}
-            pane = {"pane_id": args[2], "label": a.get("label"), "cwd": a.get("cwd"),
+            pane = {"pane_id": a["pane_id"], "label": a.get("label"), "cwd": a.get("cwd"),
                     "terminal_id": a.get("terminal_id"), "tab_id": a.get("tab_id"),
+                    "workspace_id": a.get("workspace_id"),
                     "agent_status": a.get("agent_status") or "unknown", "display_agent": a.get("display_agent"),
                     "tokens": dict(a.get("tokens") or {}), "state_labels": dict(a.get("state_labels") or {}),
                     "focused": bool(a.get("focused"))}
@@ -290,7 +294,34 @@ class FakeHerdr:
                         tokens.pop(nxt, None)
             return {}
         if args[:2] == ("tab", "get"):
-            return {"tab": {"tab_id": args[2], "pane_count": sum(a.get("tab_id") == args[2] for a in self.agents)}}
+            tab = {"tab_id": args[2], "pane_count": sum(a.get("tab_id") == args[2] for a in self.agents)}
+            if args[2] in self.tab_labels:
+                tab["label"] = self.tab_labels[args[2]]
+            return {"tab": tab}
+        if args[:2] == ("pane", "move"):
+            # Herdr 0.9.5: the pane gets a new id in its new tab and keeps its terminal; an emptied tab closes
+            row = by_pane[args[2]]
+            if "--new-workspace" in args:
+                ws = f"w{9 + len(self.workspace_labels)}"
+                self.workspace_labels[ws] = args[args.index("--label") + 1]
+                label = args[args.index("--tab-label") + 1]
+            else:
+                ws, label = args[args.index("--workspace") + 1], args[args.index("--label") + 1]
+            self.tabs_made += 1
+            n = 7 + self.tabs_made
+            old_tab = row.get("tab_id")
+            self.aliases[args[2]] = f"{ws}:p{n}"
+            if args[2] in self.stub_panes:
+                self.stub_panes = (self.stub_panes - {args[2]}) | {f"{ws}:p{n}"}
+            row.update(pane_id=f"{ws}:p{n}", tab_id=f"{ws}:t{n}", workspace_id=ws)
+            if self.move_new_terminal:
+                row["terminal_id"] = self.move_new_terminal
+            self.tab_labels[f"{ws}:t{n}"] = label
+            if not any(a.get("tab_id") == old_tab for a in self.agents):
+                self.tab_labels.pop(str(old_tab), None)
+            return {"move_result": {"changed": True, "pane": {"pane_id": row["pane_id"], "tab_id": row["tab_id"],
+                                                              "workspace_id": ws,
+                                                              "terminal_id": row.get("terminal_id")}}}
         if args[:2] in (("tab", "close"), ("pane", "close")):
             field = "tab_id" if args[0] == "tab" else "pane_id"
             for a in self.agents:
@@ -7145,3 +7176,194 @@ def test_a_panel_restarting_on_the_same_pane_id_is_neither_reopened_nor_lost(
     monkeypatch.setattr(sleeper, "asker_now", ownership_back)
     assert sleeper.reap_lost_asks() == []
     assert all(v["state"] == "open" for v in _asks().values())
+
+
+def _move(monkeypatch: pytest.MonkeyPatch, target: str, workspace: str = "agents", label: str | None = None,
+          create: bool = False, caller: str | None = None, machine: str | None = None) -> int:
+    if caller:
+        monkeypatch.setenv("HERDR_PANE_ID", caller)
+        monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1])
+    return sleeper.cmd_move(types.SimpleNamespace(target=target, workspace=workspace, label=label, create=create,
+                                                  sender="layout", machine=machine))
+
+
+def _moves(fake: FakeHerdr) -> list[tuple[str, ...]]:
+    return [c for c in fake.calls if c[:2] == ("pane", "move")]
+
+
+def test_move_puts_an_idle_session_into_a_new_tab_of_the_named_workspace(fake: FakeHerdr,
+                                                                         monkeypatch: pytest.MonkeyPatch,
+                                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    fake.tab_labels = {"w1:t1": "impl"}
+    assert _move(monkeypatch, "a") == 0
+    (call,) = _moves(fake)
+    assert call[2] == "w1:p1" and call[call.index("--workspace") + 1] == "w2" and "--no-focus" in call
+    assert call[call.index("--label") + 1] == "impl"                     # the tab keeps its label
+    assert fake.agents[0]["workspace_id"] == "w2" and fake.agents[0]["terminal_id"] == "term-1"
+    assert "moved a to agents › impl (pane w1:p1 -> w2:p8)" in capsys.readouterr().out
+    rec = _event_rows("moved")[-1]
+    assert rec["by"] == "layout" and rec["now"] == "w2:p8" and rec["created"] is False
+
+
+def test_move_names_the_tab_and_takes_a_workspace_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    assert _move(monkeypatch, "a", workspace="w2", label="impl-1") == 0
+    (call,) = _moves(fake)
+    assert call[call.index("--workspace") + 1] == "w2" and call[call.index("--label") + 1] == "impl-1"
+
+
+def test_move_makes_a_missing_workspace_only_with_create(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao"}
+    assert _move(monkeypatch, "a", workspace="parked") == 1
+    assert "pass --create" in capsys.readouterr().err and not _moves(fake)
+    assert _move(monkeypatch, "a", workspace="parked", create=True) == 0
+    (call,) = _moves(fake)
+    assert "--new-workspace" in call and call[call.index("--label") + 1] == "parked"
+    assert call[call.index("--tab-label") + 1] == "a" and _event_rows("moved")[-1]["created"] is True
+
+
+def test_move_refuses_two_workspaces_with_the_label(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents", "w3": "agents"}
+    assert _move(monkeypatch, "a") == 1
+    assert "2 workspaces are labelled 'agents'" in capsys.readouterr().err and not _moves(fake)
+
+
+def test_move_leaves_a_session_already_there(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "agents"}
+    assert _move(monkeypatch, "a") == 0
+    assert "already in agents" in capsys.readouterr().out and not _moves(fake)
+
+
+@pytest.mark.parametrize("setup, needle", [
+    (lambda f: f.agents[0].update(agent_status="working"), "is busy (status working)"),
+    (lambda f: setattr(f, "screen", CLAUDE_SCREEN.format(composer="half a thought")), "composer draft"),
+    (lambda f: f.agents[0].update(focused=True), "keyboard focus"),
+    (lambda f: f.agents[0].update(agent="codex"), "composer cannot be checked"),
+    (lambda f: f.agents.append({"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_id": "t2"}),
+     "shares its tab with 1 other pane"),
+])
+def test_move_refuses_what_could_cost_the_owner_something(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str], setup: Any,
+                                                          needle: str) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    setup(fake)
+    assert _move(monkeypatch, "a") == 1
+    assert needle in capsys.readouterr().err and not _moves(fake) and "moved" not in events()
+
+
+def test_move_refuses_an_open_ask_and_queued_mail(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
+    with sleeper.mailbox_lock(UUID):
+        sleeper.queue_message(UUID, "orc", "later", None)
+    assert _move(monkeypatch, "a") == 1
+    err = capsys.readouterr().err
+    assert "waits on the owner (open ask)" in err and "undelivered mail" in err and not _moves(fake)
+
+
+def test_move_refuses_a_sleeper_and_the_calling_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    assert _move(monkeypatch, "a", caller="w1:p1") == 1
+    assert "calling session" in capsys.readouterr().err
+    monkeypatch.delenv("HERDR_PANE_ID")
+    slept_entry(fake)
+    fake.stub_panes.add("w1:p1")
+    assert _move(monkeypatch, "a") == 1
+    assert "wake it first" in capsys.readouterr().err and not _moves(fake) and "w1:p1" in journal()
+
+
+def test_move_refuses_labels_it_cannot_send(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _move(monkeypatch, "a", workspace="you › x") == 2 and not _moves(fake)
+
+
+def test_move_runs_on_the_named_machine(ssh: FakeSsh, fake: FakeHerdr) -> None:
+    ssh.reply(stdout="moved impl-1\n")
+    assert sleeper.cmd_move(types.SimpleNamespace(target="dev2/impl-1", workspace="agents", label="impl-1",
+                                                  create=True, sender="layout", machine=None)) == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "move", "--here", "--from", "dev1/layout", "--workspace", "agents",
+                                 "--label", "impl-1", "--create", "--", "impl-1"]
+    assert not any(c[:2] == ("pane", "move") for c in fake.calls)
+
+
+def test_a_moved_session_is_still_found_as_the_caller(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    assert _move(monkeypatch, "a") == 0
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")              # the shell's variable keeps the old id
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [101, 50, 1])
+    assert sleeper.own_pane() == "w2:p8"
+    hit, why = sleeper.calling_agent(sleeper.list_agents())
+    assert why is None and hit is not None and hit["pane_id"] == "w2:p8"
+    assert sleeper.calling_session() == UUID and sleeper.context_sender(sleeper.list_agents()) == "a"
+
+
+def test_move_refuses_insomnia_and_a_pending_self_close(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    assert _claim(monkeypatch) == 0
+    monkeypatch.delenv("HERDR_PANE_ID")
+    sleeper.write_json(sleeper.SELF_CLOSE, {UUID: {"at": 1.0, "since": 1.0, "name": "a", "pane": "w1:p1"}})
+    assert _move(monkeypatch, "a") == 1
+    err = capsys.readouterr().err
+    assert "holds insomnia (ssh master)" in err and "closing itself" in err and not _moves(fake)
+
+
+def test_move_refuses_focus_or_tab_it_cannot_read(fake: FakeHerdr) -> None:
+    hit = sleeper.list_agents()[0]
+    why = sleeper.move_refusals(hit, UUID, {}, {})
+    assert "its focus could not be read" in why and "its tab could not be read (is it alone there?)" in why
+
+
+def test_move_reports_a_terminal_it_cannot_prove(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    fake.move_new_terminal = "term-other"
+    assert _move(monkeypatch, "a") == 1
+    assert "does not prove it is the same terminal" in capsys.readouterr().err
+    assert "move-unverified" in events() and "moved" not in events()
+
+
+def test_a_followed_pane_id_needs_the_ancestry_proof_and_dies_with_a_restart(fake: FakeHerdr,
+                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    assert _move(monkeypatch, "a") == 0
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    monkeypatch.setattr(sleeper, "ancestors", lambda table, pid: [999])   # a detached child, not under the agent
+    assert sleeper.own_pane() == "w2:p8"
+    assert sleeper.calling_session() is None and sleeper.context_sender(sleeper.list_agents()) == "w2:p8"
+    fake.restart()
+    assert sleeper.own_pane_moved() == ("w1:p1", False)                  # the alias is gone
+    assert sleeper.calling_agent(sleeper.list_agents())[1] == "w1:p1 runs no agent"
+
+
+def test_move_refuses_a_claim_made_under_the_previous_session_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+    other = "11111111-2222-4333-8444-555555555555"                     # before /clear: same pane and terminal
+    sleeper.write_json(sleeper.INSOMNIA, {other: {"pane": "w1:p1", "terminal_id": "term-1", "reason": "ssh master",
+                                                  "name": "a", "at": time.time()}})
+    assert _move(monkeypatch, "a") == 1
+    assert "holds insomnia (ssh master)" in capsys.readouterr().err and not _moves(fake)
+
+
+@pytest.mark.parametrize("change", [
+    lambda f: f.agents[0].update(agent_status="working", focused=True),        # the owner clicks in and types
+    lambda f: f.agents[0].update(agent_session={"value": "11111111-2222-4333-8444-555555555555"}),  # a /clear
+    lambda f: f.agents.append({"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_id": "t2"}),
+])
+def test_move_refuses_a_session_that_changes_while_it_is_checked(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str],
+                                                                 change: Any) -> None:
+    fake.workspace_labels = {"w1": "ao", "w2": "agents"}
+
+    def screen_then_change(pane: str) -> str | None:
+        change(fake)                                                    # meanwhile, during the composer read
+        return EMPTY_SCREEN
+    monkeypatch.setattr(sleeper, "herdr_screen", screen_then_change)
+    assert _move(monkeypatch, "a") == 1
+    assert "changed while it was being checked" in capsys.readouterr().err and not _moves(fake)
