@@ -8685,15 +8685,26 @@ def _turn_rows() -> list[dict]:
     return [json.loads(line) for line in sleeper.TURN_ENDS.read_text().splitlines()]
 
 
+def turn_hook_io(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+                 payload: dict | str) -> tuple[str, str]:
+    """Run claude-hook on a payload (a dict, or raw stdin text) and return its (stdout, stderr)."""
+    import io
+    raw = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(raw))
+    capsys.readouterr()
+    assert sleeper.cmd_claude_hook(types.SimpleNamespace()) == 0
+    got = capsys.readouterr()
+    return got.out, got.err
+
+
 def test_a_turn_is_one_metadata_row_and_the_hooks_print_nothing(
         fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
-                                          "prompt": "build the frobnicator"}) is None
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                          "prompt": "build the frobnicator"}) == ("", "")
     assert sleeper.turn_marker(UUID).exists()
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
-                                          "last_assistant_message": "Built. Should I push it to main?"}) is None
-    assert capsys.readouterr().err == ""
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                          "last_assistant_message": "Built. Should I push it to main?"}) == ("", "")
     (row,) = _turn_rows()
     assert row["v"] == sleeper.TURN_SCHEMA and row["session"] == UUID and row["name"] == "a"
     assert row["origin"] == "owner" and row["waits"] == "question" and row["open_asks"] == 0
@@ -8704,7 +8715,7 @@ def test_a_turn_is_one_metadata_row_and_the_hooks_print_nothing(
 def test_a_stop_without_a_prompt_or_reply_is_still_counted(
         fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID}) is None
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID}) == ("", "")
     (row,) = _turn_rows()
     assert row["origin"] == "no-prompt" and row["waits"] == "unknown" and row["open_asks"] == 1
 
@@ -8713,11 +8724,10 @@ def test_a_damaged_ask_file_is_neither_moved_nor_counted_as_no_ask(
         fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     sleeper.ensure_state_dir()
     sleeper.ASKS.write_text("{not json")
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
-                                          "last_assistant_message": "Which one?"}) is None
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                          "last_assistant_message": "Which one?"}) == ("", "")
     assert sleeper.ASKS.read_text() == "{not json"                      # not quarantined by a measurement
     assert _turn_rows()[0]["open_asks"] is None
-    assert capsys.readouterr().err == ""
 
 
 def test_a_held_lock_drops_the_row_instead_of_waiting(
@@ -8725,8 +8735,8 @@ def test_a_held_lock_drops_the_row_instead_of_waiting(
     sleeper.ensure_state_dir()
     with sleeper.flocked(sleeper.TURN_ENDS.with_name(sleeper.TURN_ENDS.name + ".lock")):
         t0 = time.monotonic()
-        assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
-                                              "last_assistant_message": "ok"}) is None
+        assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "ok"}) == ("", "")
         assert time.monotonic() - t0 < 5
     assert not sleeper.TURN_ENDS.exists()
 
@@ -8735,15 +8745,14 @@ def test_a_failing_stop_leaves_an_error_row_with_the_class_only(
         fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     def boom() -> None:
         raise RuntimeError("secret detail")
-    monkeypatch.setattr(sleeper, "own_pane", boom)
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
-                                          "last_assistant_message": "ok"}) is None
-    assert capsys.readouterr().err == ""
+    monkeypatch.setattr(sleeper, "turn_identity", boom)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                          "last_assistant_message": "ok"}) == ("", "")
     (row,) = _turn_rows()
     assert row["error"] == "RuntimeError" and "secret" not in json.dumps(row)
     # an odd session id writes no marker anywhere
-    assert run_hook(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": "../x",
-                                          "prompt": "hi"}) is None
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": "../x",
+                                          "prompt": "hi"}) == ("", "")
     assert not (sleeper.STATE_DIR / "turns").exists() or not list((sleeper.STATE_DIR / "turns").iterdir())
 
 
@@ -8768,3 +8777,52 @@ def test_turn_ends_summarises_waits_without_an_ask(state: Path, capsys: pytest.C
     assert out["by_origin"]["relay"] == {"turns": 1, "waits": 1, "without_ask": 1}
     assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=168.0, json=False)) == 0
     assert "3 of them without an open ask" in capsys.readouterr().out
+
+
+def test_an_ask_kept_over_a_clear_counts_by_name_pane_and_terminal(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    term = next(a for a in sleeper.list_agents() if a["pane_id"] == "w1:p1").get("terminal_id")
+    assert term, "the fake gives agents a terminal id"
+    sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": "an-older-session", "asker_agent": "a",
+                                             "asker_pane": "w1:p1", "asker_terminal": term, "created": 1}})
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "Which one?"}) == ("", "")
+    assert _turn_rows()[0]["open_asks"] == 1
+
+
+def test_the_stop_makes_one_short_herdr_call(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def slow(*args: str, check: bool = True, timeout: float = sleeper.HERDR_TIMEOUT) -> dict:
+        calls.append((args, timeout))
+        raise sleeper.SleeperError("timed out")
+    monkeypatch.setattr(sleeper, "herdr", slow)
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "ok"}) == ("", "")
+    assert calls == [(("agent", "list"), sleeper.TURN_HERDR_TIMEOUT)]
+    (row,) = _turn_rows()
+    assert row["pane"] == "w1:p1" and row["name"] is None and row["waits"] == "none"
+
+
+@pytest.mark.parametrize("raw", ['{"hook_event_name": "Stop", "session_id": ', '["x", {"hook_event_name": "Stop"}]',
+                                 '{"hook_event_name": "UserPromptSubmit", "prompt": "x"'])
+def test_a_malformed_turn_payload_is_silent(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                            capsys: pytest.CaptureFixture[str], raw: str) -> None:
+    logged: list[str] = []
+    monkeypatch.setattr(sleeper, "say", logged.append)   # the outer handler would swallow a raise
+    assert turn_hook_io(monkeypatch, capsys, raw) == ("", "")
+    assert logged == []
+
+
+def test_a_week_old_marker_is_pruned_on_the_next_prompt(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    stale = sleeper.turn_marker("killed-session")
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("{}")
+    os.utime(stale, (time.time() - 8 * 86400,) * 2)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": "hi"}) == ("", "")
+    assert not stale.exists() and sleeper.turn_marker(UUID).exists()

@@ -7623,6 +7623,7 @@ def live_claude_named(to: str) -> bool:
 # ("this turn may wait on the owner without an ask"), not confirmed misses.
 TURN_SCHEMA = 1                 # row layout and classifier version; bump when either changes
 TURN_MAX_BYTES = 2_000_000      # turn-ends.jsonl rotates to .1 past this (summaries report the retained range)
+TURN_HERDR_TIMEOUT = 2.0        # the one Herdr call a Stop makes (the hook's own timeout is 5 s)
 WAIT_ASK_RE = re.compile(
     r"(?i)\b(should i|shall i|do you want|would you like|want me to|which (?:one|option|do you)|your call|"
     r"do you prefer|(?:is|are) (?:that|this|these) (?:ok|okay|fine|right)|ok to (?:go|proceed)|"
@@ -7630,6 +7631,7 @@ WAIT_ASK_RE = re.compile(
 WAIT_TODO_RE = re.compile(
     r"(?i)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
     r"bitte (?:führe|starte|gib|tipp))")
+TURN_EVENT_RE = re.compile(r'"hook_event_name"\s*:\s*"(?:Stop|UserPromptSubmit)"')
 RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
 PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
 
@@ -7663,7 +7665,22 @@ def waits_on_owner(text: str) -> str:
     return "none"
 
 
-def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None) -> int | None:
+def turn_identity() -> tuple[str | None, str | None, str | None]:
+    """(pane, Herdr name, terminal id) from one short `agent list`; the pane as HERDR_PANE_ID names it
+    (after a move that id is stale and nothing matches: the ask count then rests on the session id)."""
+    pane = os.environ.get("HERDR_PANE_ID") or None
+    if not pane:
+        return None, None, None
+    try:
+        agents = herdr("agent", "list", timeout=TURN_HERDR_TIMEOUT).get("agents")
+    except Exception:  # noqa: BLE001 - a slow or absent Herdr only loses the name
+        return pane, None, None
+    hit = next((a for a in agents if isinstance(a, dict) and a.get("pane_id") == pane), None) \
+        if isinstance(agents, list) else None
+    return pane, (hit or {}).get("name"), (hit or {}).get("terminal_id")
+
+
+def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None, terminal: str | None) -> int | None:
     """How many open asks this session holds, read without the lock and without quarantining a
     damaged file (read_asks() would): None when the file can't be read."""
     try:
@@ -7671,7 +7688,7 @@ def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None) -> int
     except (SleeperError, OSError):
         return None
     return sum(1 for v in asks.values() if isinstance(v, dict) and v.get("state") == "open"
-               and ask_is_mine(v, uuid, name, pane))
+               and ask_is_mine(v, uuid, name, pane, terminal))
 
 
 def append_turn_row(row: dict) -> bool:
@@ -7699,6 +7716,10 @@ def record_prompt(payload: dict) -> None:
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(rec))
     os.replace(tmp, marker)   # no fsync: a lost marker only makes one row's origin "no-prompt"
+    with contextlib.suppress(OSError):   # a session killed mid-turn never Stops: its marker goes after a week
+        for old in os.scandir(marker.parent):
+            if old.name.endswith(".json") and time.time() - old.stat().st_mtime > 7 * 86400:
+                os.unlink(old.path)
 
 
 def record_turn_end(payload: dict) -> None:
@@ -7715,15 +7736,12 @@ def record_turn_end(payload: dict) -> None:
         with contextlib.suppress(OSError):
             marker.unlink()
     reply = payload.get("last_assistant_message")
-    pane, name = own_pane(), None
-    with contextlib.suppress(Exception):
-        hit = next((a for a in list_agents() if a.get("pane_id") == pane), None) if pane else None
-        name = (hit or {}).get("name")
+    pane, name, terminal = turn_identity()
     append_turn_row({
         "v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"), "session": uuid, "name": name,
         "pane": pane, "origin": origin, "turn_s": int(time.time() - started) if started else None,
         "waits": waits_on_owner(reply) if isinstance(reply, str) else "unknown",
-        "open_asks": open_asks_quiet(uuid, name, pane), "stop_hook_active": bool(payload.get("stop_hook_active"))})
+        "open_asks": open_asks_quiet(uuid, name, pane, terminal), "stop_hook_active": bool(payload.get("stop_hook_active"))})
 
 
 def turn_hook(hook_event: str, payload: dict) -> None:
@@ -7794,12 +7812,21 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
     turn count (turn_hook). Fails open: on any error
     it prints nothing and the tool behaves as without the plugin. Never takes the global lock: a
     sleep transaction may hold it longer than the hook may run."""
+    raw = ""
+    with contextlib.suppress(Exception):
+        raw = sys.stdin.read()
+    payload = None
+    with contextlib.suppress(Exception):
+        payload = json.loads(raw or "{}")
+    if isinstance(payload, dict) and payload.get("hook_event_name") in ("Stop", "UserPromptSubmit"):
+        turn_hook(str(payload["hook_event_name"]), payload)
+        return 0
+    if not isinstance(payload, dict) and TURN_EVENT_RE.search(raw):
+        return 0  # a malformed turn payload stays silent: no say(), whose log lock may wait
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("hook payload is not a JSON object")
         hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
-        if hook_event in ("Stop", "UserPromptSubmit"):
-            turn_hook(hook_event, payload)
-            return 0
         if hook_event == "PostToolUse" and tool == "ListAgents":
             asleep = [r for r in presence_rows() if r["state"] == "asleep"]
             missing = watcher_missing()
