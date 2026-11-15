@@ -535,6 +535,20 @@ Live peers are left to `SendMessage`. A message that `deliver` would reject
 the tool run as if the plugin were absent. The hook never waits for the
 global lock, which a sleep transaction may hold longer than a hook may run.
 
+**Turn-end count.** Registered also as a `UserPromptSubmit` and a `Stop` hook
+(no matcher), `claude-hook` counts how often a turn ends with a reply that
+seems to wait on the owner (a question or a step for him in its last two
+paragraphs) while the session holds no open ask. It reads no transcript: the
+prompt's origin (owner, relay, ask-answer, notification) comes from the
+`UserPromptSubmit` payload, the reply from the `Stop` payload's
+`last_assistant_message`, both classified in memory. `turn-ends.jsonl` keeps
+one row per turn with the classes, the session, pane, Herdr name, turn length
+and open-ask count, never text. Both hooks print nothing, never wait on a lock
+(a held one drops the row) and leave only an error's class name. The rows are
+candidates, not confirmed misses: a question the owner asked for in his own
+chat is fine. `herdr-sleeper turn-ends [--hours N] [--json]` sums them by
+origin and session, with the range the file still holds.
+
 ## Insomnia
 
 An agent that must stay up (it holds an SSH master or a tunnel, waits on a

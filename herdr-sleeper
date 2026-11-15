@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.42"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.43"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -206,6 +206,7 @@ DELIVERED = STATE_DIR / "delivered.json"       # id -> when: recent deliveries, 
 ASKS = STATE_DIR / "asks.json"                  # ask id -> an owner question with its own tab (`ask`)
 ARCHIVE = STATE_DIR / "messages"               # <msg id>.json: each relayed message, kept ARCHIVE_DAYS (`show`, `thread`)
 INSOMNIA = STATE_DIR / "insomnia.json"         # session id -> claim: sessions that never sleep (never quarantined)
+TURN_ENDS = STATE_DIR / "turn-ends.jsonl"       # one row per Claude turn end, metadata only (`turn-ends`)
 NAMES_OWED = STATE_DIR / "names.json"          # pane -> {uuid, name, at}: names a woken agent gets once Herdr lists it
 STUBS = STATE_DIR / "stubs"                     # <uuid>.pid: a running wake stub that follows a moved pane (B-465)
 
@@ -2348,7 +2349,7 @@ def stub_argv(pane: str, uuid: str) -> list[str]:
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, STOPPED
-    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS, ARCHIVE, STUBS
+    global MAILBOX, DELIVERED, WATCHER_MISSING, ASKS, ARCHIVE, STUBS, TURN_ENDS
     STATE_DIR = state_dir
     JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
     LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
@@ -2358,6 +2359,7 @@ def set_state_dir(state_dir: Path) -> None:
     ASKS = STATE_DIR / "asks.json"
     ARCHIVE = STATE_DIR / "messages"
     STUBS = STATE_DIR / "stubs"
+    TURN_ENDS = STATE_DIR / "turn-ends.jsonl"
 
 
 def sane_tty(fd: int | None = None) -> None:
@@ -7613,13 +7615,191 @@ def live_claude_named(to: str) -> bool:
     return False
 
 
+# ------------------------------------------------------------ turn ends
+
+# Counted, never acted on (owner 2026-11-15: "count" before any gate). Reads no transcript: the
+# UserPromptSubmit payload's prompt gives the turn's origin, the Stop payload's last_assistant_message
+# the reply; both are classified in memory and only the class is kept. Rows are heuristic candidates
+# ("this turn may wait on the owner without an ask"), not confirmed misses.
+TURN_SCHEMA = 1                 # row layout and classifier version; bump when either changes
+TURN_MAX_BYTES = 2_000_000      # turn-ends.jsonl rotates to .1 past this (summaries report the retained range)
+WAIT_ASK_RE = re.compile(
+    r"(?i)\b(should i|shall i|do you want|would you like|want me to|which (?:one|option|do you)|your call|"
+    r"do you prefer|(?:is|are) (?:that|this|these) (?:ok|okay|fine|right)|ok to (?:go|proceed)|"
+    r"soll ich|möchtest du|willst du|sollen wir|passt das|einverstanden)\b")
+WAIT_TODO_RE = re.compile(
+    r"(?i)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
+    r"bitte (?:führe|starte|gib|tipp))")
+RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
+PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
+
+
+def turn_marker(session: str) -> Path | None:
+    return STATE_DIR / "turns" / f"{session}.json" if SESSION_ID_RE.fullmatch(session) else None
+
+
+def prompt_origin(prompt: str) -> str:
+    """owner (typed in the pane, as far as the text shows), relay (a peer's message), ask-answer (the
+    owner's answer to an ask, typed in by the panel), notification (a background task's event)."""
+    head = prompt.lstrip()[:800]
+    if head.startswith("<task-notification>") or "<task-notification>" in head[:200]:
+        return "notification"
+    if OWNER_ANSWER_HEADER in head:
+        return "ask-answer"
+    if any(h in head for h in RELAY_HEADS) or PEER_HEAD_RE.search(head):
+        return "relay"
+    return "owner"
+
+
+def waits_on_owner(text: str) -> str:
+    """question, todo or none, from the last two paragraphs of a reply (code blocks and quotes stripped)."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    paras = [p for p in re.split(r"\n\s*\n", text) if p.strip() and not p.lstrip().startswith(">")]
+    tail = "\n".join(paras[-2:])
+    if WAIT_TODO_RE.search(tail):
+        return "todo"
+    if WAIT_ASK_RE.search(tail) or re.search(r"\?[*_)\]\s]*$", tail.strip()) or re.search(r"\?[*_)]*\s*\n", tail):
+        return "question"
+    return "none"
+
+
+def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None) -> int | None:
+    """How many open asks this session holds, read without the lock and without quarantining a
+    damaged file (read_asks() would): None when the file can't be read."""
+    try:
+        asks = read_json(ASKS)
+    except (SleeperError, OSError):
+        return None
+    return sum(1 for v in asks.values() if isinstance(v, dict) and v.get("state") == "open"
+               and ask_is_mine(v, uuid, name, pane))
+
+
+def append_turn_row(row: dict) -> bool:
+    """Append without waiting: a held lock drops the row (a hook must never stall a turn)."""
+    with flocked(TURN_ENDS.with_name(TURN_ENDS.name + ".lock"), wait=False) as held:
+        if not held:
+            return False
+        with contextlib.suppress(OSError):
+            if TURN_ENDS.stat().st_size > TURN_MAX_BYTES:
+                os.replace(TURN_ENDS, TURN_ENDS.with_name(TURN_ENDS.name + ".1"))
+        with os.fdopen(open_private(TURN_ENDS, os.O_WRONLY | os.O_APPEND), "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    return True
+
+
+def record_prompt(payload: dict) -> None:
+    """UserPromptSubmit: note the turn's origin and start (no text) for the Stop that ends it."""
+    marker = turn_marker(str(payload.get("session_id") or ""))
+    if marker is None:
+        return
+    ensure_state_dir()
+    marker.parent.mkdir(mode=0o700, exist_ok=True)
+    rec = {"origin": prompt_origin(str(payload.get("prompt") or "")), "ts": time.time()}
+    fd, tmp = tempfile.mkstemp(prefix=marker.name + ".", suffix=".tmp", dir=marker.parent)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(rec))
+    os.replace(tmp, marker)   # no fsync: a lost marker only makes one row's origin "no-prompt"
+
+
+def record_turn_end(payload: dict) -> None:
+    """Stop: one metadata row for the turn that just ended. origin "no-prompt": no prompt since the
+    last Stop (a background event that woke the session without one); waits "unknown": the payload
+    carried no reply text."""
+    uuid = str(payload.get("session_id") or "") or None
+    marker = turn_marker(uuid or "")
+    origin, started = "no-prompt", None
+    if marker is not None:
+        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+            rec = json.loads(marker.read_text())
+            origin, started = str(rec["origin"]), float(rec["ts"])
+        with contextlib.suppress(OSError):
+            marker.unlink()
+    reply = payload.get("last_assistant_message")
+    pane, name = own_pane(), None
+    with contextlib.suppress(Exception):
+        hit = next((a for a in list_agents() if a.get("pane_id") == pane), None) if pane else None
+        name = (hit or {}).get("name")
+    append_turn_row({
+        "v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"), "session": uuid, "name": name,
+        "pane": pane, "origin": origin, "turn_s": int(time.time() - started) if started else None,
+        "waits": waits_on_owner(reply) if isinstance(reply, str) else "unknown",
+        "open_asks": open_asks_quiet(uuid, name, pane), "stop_hook_active": bool(payload.get("stop_hook_active"))})
+
+
+def turn_hook(hook_event: str, payload: dict) -> None:
+    """The silent path for UserPromptSubmit and Stop: nothing to stdout (a UserPromptSubmit hook's stdout
+    becomes context), nothing to stderr or the log. A failure leaves one row naming its class only."""
+    try:
+        (record_prompt if hook_event == "UserPromptSubmit" else record_turn_end)(payload)
+    except Exception as exc:  # noqa: BLE001 - a measurement hook never changes a turn
+        if hook_event == "Stop":
+            with contextlib.suppress(Exception):
+                append_turn_row({"v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"),
+                                 "error": type(exc).__name__})
+
+
+def cmd_turn_ends(args: argparse.Namespace) -> int:
+    """Turn ends that may wait on the owner without an open ask, by origin and session."""
+    since = dt.datetime.now() - dt.timedelta(hours=args.hours)
+    rows, errors, first = [], 0, None
+    for p in (TURN_ENDS.with_name(TURN_ENDS.name + ".1"), TURN_ENDS):
+        with contextlib.suppress(OSError):
+            for line in p.read_text().splitlines():
+                with contextlib.suppress(ValueError, TypeError, KeyError):
+                    r = json.loads(line)
+                    at = dt.datetime.fromisoformat(r["at"])
+                    first = first or at
+                    if at < since:
+                        continue
+                    if "error" in r:
+                        errors += 1
+                    else:
+                        rows.append(r)
+    waits = [r for r in rows if r.get("waits") in ("question", "todo")]
+    unasked = [r for r in waits if r.get("open_asks") == 0]
+    by_origin: dict[str, dict[str, int]] = {}
+    for r in rows:
+        c = by_origin.setdefault(str(r.get("origin")), {"turns": 0, "waits": 0, "without_ask": 0})
+        c["turns"] += 1
+        c["waits"] += r in waits
+        c["without_ask"] += r in unasked
+    per: dict[str, int] = {}
+    for r in unasked:
+        if r.get("origin") not in ("relay", "notification"):
+            key = str(r.get("name") or r.get("session") or "?")
+            per[key] = per.get(key, 0) + 1
+    summary = {
+        "hours": args.hours, "retained_since": first.isoformat() if first else None,
+        "turns": len(rows), "waits": len(waits), "waits_without_ask": len(unasked),
+        "unknown_reply": sum(1 for r in rows if r.get("waits") == "unknown"),
+        "unknown_asks": sum(1 for r in waits if r.get("open_asks") is None), "errors": errors,
+        "by_origin": dict(sorted(by_origin.items())), "sessions": dict(sorted(per.items(), key=lambda kv: -kv[1])[:10])}
+    if args.json:
+        print(json.dumps(summary))
+        return 0
+    kept = f" (rows kept since {summary['retained_since']})" if first and first > since else ""
+    print(f"last {args.hours:g} h{kept}: {len(rows)} turn ends, {len(waits)} may wait on the owner, {len(unasked)} "
+          f"of them without an open ask; {summary['unknown_reply']} without reply text, {errors} hook errors")
+    for k, v in summary["by_origin"].items():
+        print(f"  {k:13} {v['turns']:5} turns  {v['waits']:4} wait  {v['without_ask']:4} without an ask")
+    if per:
+        print("  owner-started or ask-answer turns that wait without an ask, by session:")
+    for k, v in summary["sessions"].items():
+        print(f"  {v:4}  {k}")
+    return 0
+
+
 def cmd_claude_hook(_args: argparse.Namespace) -> int:
-    """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook. Fails open: on any error
+    """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook, and the silent UserPromptSubmit/Stop
+    turn count (turn_hook). Fails open: on any error
     it prints nothing and the tool behaves as without the plugin. Never takes the global lock: a
     sleep transaction may hold it longer than the hook may run."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
+        if hook_event in ("Stop", "UserPromptSubmit"):
+            turn_hook(hook_event, payload)
+            return 0
         if hook_event == "PostToolUse" and tool == "ListAgents":
             asleep = [r for r in presence_rows() if r["state"] == "asleep"]
             missing = watcher_missing()
@@ -10314,8 +10494,12 @@ def main(argv: list[str] | None = None) -> int:
     ilp.add_argument("--json", action="store_true")
     ilp.add_argument("--machine", help="list a Herdr saved machine's claims")
     ip.set_defaults(fn=cmd_insomnia)
-    sub.add_parser("claude-hook", help="Claude Code hook for ListAgents/SendMessage (stdin)").set_defaults(
+    sub.add_parser("claude-hook", help="Claude Code hook for ListAgents/SendMessage, UserPromptSubmit and Stop (stdin)").set_defaults(
         fn=cmd_claude_hook)
+    tep = sub.add_parser("turn-ends", help="how often turns ended waiting on the owner without an open ask")
+    tep.add_argument("--hours", type=float, default=168.0, help="look back this far (default a week)")
+    tep.add_argument("--json", action="store_true")
+    tep.set_defaults(fn=cmd_turn_ends)
     sub.add_parser("stop", help="stop the watcher and keep it stopped").set_defaults(fn=cmd_stop)
     sub.add_parser("start", help="undo `stop`").set_defaults(fn=cmd_start)
     sub.add_parser("uninstall", help="stop, wake everything, report what is left").set_defaults(fn=cmd_uninstall)

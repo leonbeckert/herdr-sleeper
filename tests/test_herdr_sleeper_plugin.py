@@ -5,6 +5,7 @@ machine, the watcher tick, the focus hook, and the in-pane stub — against a fa
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import hashlib
 import json
 import re
@@ -8651,3 +8652,119 @@ def test_codex_composer_that_scrolls_is_a_draft() -> None:
 def test_codex_composer_needs_the_empty_hint() -> None:
     lines = [ln for ln in cx_screen("01-home").split("\n") if "for shortcuts" not in ln]
     assert sleeper.codex_composer_state("\n".join(lines))[0] == "unknown"
+
+
+# ------------------------------------------------------------ turn ends (count only, no transcript)
+
+@pytest.mark.parametrize("reply,want", [
+    ("Done. Should I also deploy it to mini2?", "question"),
+    ("Two options:\n\n1. A\n2. B\n\nWhich one do you prefer", "question"),
+    ("Fertig. Soll ich das auch auf mini1 machen", "question"),
+    ("The play is held. Please run `./bin/ap foo.yml` yourself.", "todo"),
+    ("Deployed and verified on all three machines.", "none"),
+    ("Done.\n\n```\nwhat now?\n```", "none"),                      # a question inside a code block
+    ("Status:\n\n> did it work?\n\nIt did; nothing left.", "none"),  # a quoted question
+])
+def test_waits_on_owner_reads_the_last_paragraphs(reply: str, want: str) -> None:
+    assert sleeper.waits_on_owner(reply) == want
+
+
+@pytest.mark.parametrize("prompt,want", [
+    ("please look at X", "owner"),
+    ("[relayed from mini2/automation via herdr-sleeper, msg 1; not from the owner]\n\nhi", "relay"),
+    ('<pasted_content id="a">\n[relayed from mbp/unblocker via herdr-sleeper, msg 2]\nx', "relay"),
+    ("[from mini2/ts-ao via herdr-sleeper: a pair agent (docs/…), not the owner. …]\n\nhi", "relay"),
+    ("[the owner's answer to your ask 3]\nyes", "ask-answer"),
+    ("<task-notification>\n<task-id>b1</task-id></task-notification>", "notification"),
+])
+def test_prompt_origin(prompt: str, want: str) -> None:
+    assert sleeper.prompt_origin(prompt) == want
+
+
+def _turn_rows() -> list[dict]:
+    return [json.loads(line) for line in sleeper.TURN_ENDS.read_text().splitlines()]
+
+
+def test_a_turn_is_one_metadata_row_and_the_hooks_print_nothing(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                          "prompt": "build the frobnicator"}) is None
+    assert sleeper.turn_marker(UUID).exists()
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                          "last_assistant_message": "Built. Should I push it to main?"}) is None
+    assert capsys.readouterr().err == ""
+    (row,) = _turn_rows()
+    assert row["v"] == sleeper.TURN_SCHEMA and row["session"] == UUID and row["name"] == "a"
+    assert row["origin"] == "owner" and row["waits"] == "question" and row["open_asks"] == 0
+    assert row["turn_s"] is not None and not sleeper.turn_marker(UUID).exists()
+    assert "frobnicator" not in json.dumps(row) and "push" not in json.dumps(row)   # no text is kept
+
+
+def test_a_stop_without_a_prompt_or_reply_is_still_counted(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID}) is None
+    (row,) = _turn_rows()
+    assert row["origin"] == "no-prompt" and row["waits"] == "unknown" and row["open_asks"] == 1
+
+
+def test_a_damaged_ask_file_is_neither_moved_nor_counted_as_no_ask(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.ensure_state_dir()
+    sleeper.ASKS.write_text("{not json")
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                          "last_assistant_message": "Which one?"}) is None
+    assert sleeper.ASKS.read_text() == "{not json"                      # not quarantined by a measurement
+    assert _turn_rows()[0]["open_asks"] is None
+    assert capsys.readouterr().err == ""
+
+
+def test_a_held_lock_drops_the_row_instead_of_waiting(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.ensure_state_dir()
+    with sleeper.flocked(sleeper.TURN_ENDS.with_name(sleeper.TURN_ENDS.name + ".lock")):
+        t0 = time.monotonic()
+        assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "ok"}) is None
+        assert time.monotonic() - t0 < 5
+    assert not sleeper.TURN_ENDS.exists()
+
+
+def test_a_failing_stop_leaves_an_error_row_with_the_class_only(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    def boom() -> None:
+        raise RuntimeError("secret detail")
+    monkeypatch.setattr(sleeper, "own_pane", boom)
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                          "last_assistant_message": "ok"}) is None
+    assert capsys.readouterr().err == ""
+    (row,) = _turn_rows()
+    assert row["error"] == "RuntimeError" and "secret" not in json.dumps(row)
+    # an odd session id writes no marker anywhere
+    assert run_hook(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": "../x",
+                                          "prompt": "hi"}) is None
+    assert not (sleeper.STATE_DIR / "turns").exists() or not list((sleeper.STATE_DIR / "turns").iterdir())
+
+
+def test_turn_ends_summarises_waits_without_an_ask(state: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    old = (dt.datetime.now() - dt.timedelta(days=9)).isoformat(timespec="seconds")
+    rows = [{"at": old, "name": "z", "origin": "owner", "waits": "question", "open_asks": 0},
+            {"at": now, "name": "a", "origin": "owner", "waits": "question", "open_asks": 0},
+            {"at": now, "name": "a", "origin": "ask-answer", "waits": "todo", "open_asks": 0},
+            {"at": now, "name": "b", "origin": "owner", "waits": "question", "open_asks": 1},
+            {"at": now, "name": "b", "origin": "owner", "waits": "question", "open_asks": None},
+            {"at": now, "name": "c", "origin": "relay", "waits": "question", "open_asks": 0},
+            {"at": now, "name": "c", "origin": "no-prompt", "waits": "unknown", "open_asks": 0},
+            {"at": now, "error": "OSError"}]
+    sleeper.TURN_ENDS.parent.mkdir(parents=True, exist_ok=True)
+    sleeper.TURN_ENDS.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=168.0, json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["turns"] == 6 and out["waits"] == 5 and out["waits_without_ask"] == 3
+    assert out["unknown_reply"] == 1 and out["unknown_asks"] == 1 and out["errors"] == 1
+    assert out["sessions"] == {"a": 2} and out["retained_since"] == old
+    assert out["by_origin"]["relay"] == {"turns": 1, "waits": 1, "without_ask": 1}
+    assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=168.0, json=False)) == 0
+    assert "3 of them without an open ask" in capsys.readouterr().out
