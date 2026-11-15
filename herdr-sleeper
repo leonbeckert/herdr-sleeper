@@ -4429,6 +4429,15 @@ def opencode_lanes(agents: list[dict], exclude: str | None = None) -> int:
     return len(live) + pending
 
 
+def renewed_or_why(name: str, token: str, **fields: object) -> str | None:
+    """renew_reservation for spawn_started: a renewal that raises (agent list failed) is a lost
+    reservation too, so the caller's cleanup closes the tab (or the workspace made for it)."""
+    try:
+        return renew_reservation(name, token, **fields)
+    except SleeperError as exc:
+        return f"the reservation could not be renewed ({exc})"
+
+
 def renew_reservation(name: str, token: str, **fields: object) -> str | None:
     """Under the lock: refresh our reservation's clock (and add fields), after checking it is still
     ours and the machine still has room for it; why not, or None. A slow step (a shell that takes long,
@@ -4485,7 +4494,9 @@ def spawn_tab(cwd: Path, name: str, workspace: str | None) -> dict:
     would land among them). A named workspace that does not exist is refused, not created. Lookup
     and creation hold a machine-local lock: two first-use spawns at once would make two `agents`
     workspaces, and every later spawn would then refuse the ambiguous label."""
-    with flocked(STATE_DIR / "spawn-workspace.lock"):
+    with flocked(STATE_DIR / "spawn-workspace.lock") as held:
+        if not held:
+            raise SleeperError(f"could not lock {STATE_DIR / 'spawn-workspace.lock'}; nothing was created")
         dest = workspace_with_label(workspace or SPAWN_WORKSPACE)
         if dest is not None:
             return herdr("tab", "create", "--cwd", str(cwd), "--label", name, "--no-focus", "--workspace", dest)
@@ -4671,10 +4682,7 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
         print(f"spawn: could not create a tab: {exc}", file=sys.stderr)
         return 1
     if token:  # the reservation now names its pane (cmd_spawn drops it if no lane runs there)
-        try:
-            lost = renew_reservation(args.name, token, pane=pane, tab=tab)
-        except SleeperError as exc:   # the tab (or a workspace made for it) must not stay behind
-            lost = f"the reservation could not be renewed ({exc})"
+        lost = renewed_or_why(args.name, token, pane=pane, tab=tab)
         if lost:
             with contextlib.suppress(SleeperError):
                 close_tab_or_pane(pane, tab)
@@ -4692,7 +4700,7 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
               file=sys.stderr)
         return 1
     argv = (["-n", args.name] if args.kind == "claude" else [CODEX_NO_DAEMON] if args.kind == "codex" else []) + extra
-    lost = renew_reservation(args.name, token) if token else None  # the shell may have taken long
+    lost = renewed_or_why(args.name, token) if token else None  # the shell may have taken long
     if lost:
         with contextlib.suppress(SleeperError):
             close_tab_or_pane(pane, tab)

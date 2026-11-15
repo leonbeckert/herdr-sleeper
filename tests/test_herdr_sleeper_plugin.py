@@ -3652,13 +3652,18 @@ def test_spawn_looks_up_and_makes_the_agents_workspace_under_one_lock(fake: Fake
     assert list(fake.workspace_labels.values()).count("agents") == 1
 
 
+@pytest.mark.parametrize("failing", [1, 2])   # the renewal after the tab exists, or the one after the shell
 def test_a_failed_reservation_renewal_closes_the_new_tab(fake: FakeHerdr, checkout: Path,
                                                          monkeypatch: pytest.MonkeyPatch,
-                                                         capsys: pytest.CaptureFixture[str]) -> None:
+                                                         capsys: pytest.CaptureFixture[str], failing: int) -> None:
     fake.workspace_labels = {"w1": "you"}
+    calls = {"n": 0}
 
     def broken(*a: object, **k: object) -> str | None:
-        raise sleeper.SleeperError("herdr agent list failed")
+        calls["n"] += 1
+        if calls["n"] == failing:
+            raise sleeper.SleeperError("herdr agent list failed")
+        return None
     monkeypatch.setattr(sleeper, "renew_reservation", broken)
     args = types.SimpleNamespace(cwd=str(checkout), name="oc-1", kind="opencode", sender="orc", workspace=None,
                                  json=False, agent_args=[])
@@ -3667,6 +3672,20 @@ def test_a_failed_reservation_renewal_closes_the_new_tab(fake: FakeHerdr, checko
     assert made and any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
     assert not any(c[:2] == ("agent", "start") for c in fake.calls)
     assert "could not be renewed" in capsys.readouterr().err
+
+
+def test_spawn_refuses_when_the_workspace_lock_cannot_be_taken(fake: FakeHerdr, checkout: Path,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "you"}
+
+    @contextlib.contextmanager
+    def failing(path: Path, wait: bool = True):  # type: ignore[no-untyped-def]
+        yield False
+    monkeypatch.setattr(sleeper, "flocked", failing)
+    assert _spawn(monkeypatch, checkout) == 1
+    assert "could not lock" in capsys.readouterr().err
+    assert not any(c[:2] in (("workspace", "create"), ("tab", "create"), ("agent", "start")) for c in fake.calls)
 
 
 def test_spawn_takes_a_workspace_label_and_refuses_a_missing_one(fake: FakeHerdr, checkout: Path,
