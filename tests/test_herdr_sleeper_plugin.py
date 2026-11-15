@@ -1905,6 +1905,33 @@ def test_uuid_live_elsewhere_skips_only_a_real_stub(fake: FakeHerdr, monkeypatch
     assert REAL_UUID_LIVE(UUID) == "pid 125"
 
 
+def test_uuid_live_elsewhere_skips_our_own_deliver_pending(fake: FakeHerdr,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ask panel wakes a sleeping asker through `deliver-pending UUID`: that process must not
+    count as the session being live, or every wake it asks for is refused (2026-11-15)."""
+    monkeypatch.setattr(sleeper, "list_agents", lambda: [])
+    kick = (f"77 /opt/homebrew/bin/python3.15 /x/plugins/herdr-sleeper/herdr-sleeper deliver-pending {UUID} "
+            "--from ask.ab12cd34")
+    relay = f"78 /x/herdr-relay/herdr-sleeper-4264cca4c703 deliver-pending {UUID} --from mini2/x"
+    me = f"{sleeper.os.getpid()} /usr/bin/python3 /somewhere/else {UUID}"
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps([kick, relay, me]))
+    assert REAL_UUID_LIVE(UUID) is None
+    sneaky = f"79 claude --resume {UUID} -- herdr-sleeper deliver-pending"
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps([kick, sneaky]))
+    assert REAL_UUID_LIVE(UUID) == "pid 79"
+    # `deliver <uuid>` (local or relayed) waits on the stub it started; the stub's own check sees it
+    waiting = f"80 /usr/bin/python3 /x/herdr-sleeper deliver --from mini2/x -- {UUID}"
+    relayed = f"81 /x/herdr-relay/herdr-sleeper-4264cca4c703 deliver --here --from mini2/x --id ab -- {UUID}"
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps([waiting, relayed]))
+    assert REAL_UUID_LIVE(UUID) is None
+    not_python = f"82 /usr/bin/env /x/herdr-sleeper deliver {UUID}"
+    node = f"83 node /opt/claude-code/cli.js --resume {UUID}"
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps([not_python, node]))
+    assert REAL_UUID_LIVE(UUID) == "pid 82"
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps([node]))
+    assert REAL_UUID_LIVE(UUID) == "pid 83"
+
+
 def test_uuid_live_elsewhere_continue_cwd_and_ps_failure(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sleeper, "list_agents", lambda: [])
     monkeypatch.setattr(sleeper.subprocess, "run", Ps(["7 claude --continue"]))

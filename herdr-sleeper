@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.36"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.37"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -869,6 +869,26 @@ def agent_process(pane: str, kind: str) -> tuple[bool | None, list[str] | None, 
                 str(p).endswith(f"{kind}-code/cli.js") or str(p).endswith(f"{kind}/cli.js") for p in argv[1:3]):
             return True, [str(a) for a in argv[1:]], proc.get("pid")
     return (None, None, None) if unknown else (False, None, None)
+
+
+# No process of this plugin is ever a session (sessions are claude, codex or opencode), yet many of
+# ours carry a session id on their command line: the wake stub, deliver-pending (the ask panel's
+# kick and the claude hook), `deliver <uuid>` (also relayed) waiting on the stub it started. Counting
+# them as "live" refused the very wake they asked for (2026-11-15: four answers to a sleeping asker,
+# none woke it; docs/macos/report.2026-11-15-ask-answer-did-not-wake.md in ansible-orchestration).
+def own_command_index(argv: list[str]) -> int | None:
+    """Index of the script token when argv is this plugin running any subcommand, else None.
+    Structural like stub_argv_index: the script (or the relay's `herdr-sleeper-<commit>` copy) as
+    argv[0], or as argv[1] after a python interpreter. A claude whose arguments merely mention this
+    plugin is not matched."""
+    for i in (0, 1):
+        if i < len(argv):
+            base = os.path.basename(str(argv[i]))
+            if base == "herdr-sleeper" or re.fullmatch(r"herdr-sleeper-[0-9a-f]{12}", base):
+                if i == 1 and not os.path.basename(str(argv[0])).lower().startswith("python"):
+                    return None
+                return i if len(argv) > i + 1 else None
+    return None
 
 
 def stub_argv_index(argv: list[str]) -> int | None:
@@ -1631,9 +1651,13 @@ def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | No
         # selects the uuid on its command line (claude, node …/claude, node …/cli.js) is treated as one
         if os.path.basename(parts[1]) in ("bash", "sh", "zsh", "fish", "dash", "login"):
             continue
+        if parts[0] == str(os.getpid()):
+            continue  # this very process (deliver-pending, a wake) is not the session
         i = stub_argv_index(parts[1:])
         if i is not None and parts[i + 4:i + 5] == [uuid]:
             continue  # our own in-pane wake stub carries the uuid as an argument; it is not a session
+        if own_command_index(parts[1:]) is not None:
+            continue  # our own deliver, deliver-pending, stub …: they wake the session, they are not one
         selects = any(p == uuid or p.endswith("=" + uuid) for p in parts[2:])
         if selects:
             return f"pid {parts[0]}"
