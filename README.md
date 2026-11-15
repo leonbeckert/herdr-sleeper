@@ -618,8 +618,8 @@ this way yet.
 
 Steps:
 
-1. creates a tab with `--no-focus`, labelled with the name, in the caller's
-   workspace (or `--workspace`);
+1. creates a tab with `--no-focus`, labelled with the name, in `--workspace`
+   or else the `agents` workspace (made on first use, under a lock);
 2. waits for the shell and runs `herdr agent start <name> --kind claude …
    -- -n <name> <flags>`, so the session can sleep and is found by name after
    a Herdr restart;

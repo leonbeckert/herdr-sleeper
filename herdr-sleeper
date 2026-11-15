@@ -4482,13 +4482,16 @@ def spawn_tab(cwd: Path, name: str, workspace: str | None) -> dict:
     """The new tab for a spawn, as Herdr answers `tab create` (root_pane, tab). `workspace` is a label
     or an id on this machine; without one the tab goes to the workspace labelled SPAWN_WORKSPACE,
     made on first use (never the caller's workspace: a helper spawned from the owner's `you` tabs
-    would land among them). A named workspace that does not exist is refused, not created."""
-    dest = workspace_with_label(workspace or SPAWN_WORKSPACE)
-    if dest is not None:
-        return herdr("tab", "create", "--cwd", str(cwd), "--label", name, "--no-focus", "--workspace", dest)
-    if workspace:
-        raise SleeperError(f"no workspace {workspace!r} on this machine")
-    made = herdr("workspace", "create", "--cwd", str(cwd), "--label", SPAWN_WORKSPACE, "--no-focus")
+    would land among them). A named workspace that does not exist is refused, not created. Lookup
+    and creation hold a machine-local lock: two first-use spawns at once would make two `agents`
+    workspaces, and every later spawn would then refuse the ambiguous label."""
+    with flocked(STATE_DIR / "spawn-workspace.lock"):
+        dest = workspace_with_label(workspace or SPAWN_WORKSPACE)
+        if dest is not None:
+            return herdr("tab", "create", "--cwd", str(cwd), "--label", name, "--no-focus", "--workspace", dest)
+        if workspace:
+            raise SleeperError(f"no workspace {workspace!r} on this machine")
+        made = herdr("workspace", "create", "--cwd", str(cwd), "--label", SPAWN_WORKSPACE, "--no-focus")
     herdr("tab", "rename", made["tab"]["tab_id"], name, check=False)
     return made
 
@@ -4668,7 +4671,10 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
         print(f"spawn: could not create a tab: {exc}", file=sys.stderr)
         return 1
     if token:  # the reservation now names its pane (cmd_spawn drops it if no lane runs there)
-        lost = renew_reservation(args.name, token, pane=pane, tab=tab)
+        try:
+            lost = renew_reservation(args.name, token, pane=pane, tab=tab)
+        except SleeperError as exc:   # the tab (or a workspace made for it) must not stay behind
+            lost = f"the reservation could not be renewed ({exc})"
         if lost:
             with contextlib.suppress(SleeperError):
                 close_tab_or_pane(pane, tab)

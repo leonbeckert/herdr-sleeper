@@ -4,6 +4,7 @@ machine, the watcher tick, the focus hook, and the in-pane stub — against a fa
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -3622,6 +3623,50 @@ def test_spawn_makes_the_agents_workspace_on_first_use(fake: FakeHerdr, checkout
     tab = next(k for k in fake.tab_labels if k.startswith(f"{ws}:"))
     assert fake.tab_labels[tab] == "impl-1"                    # Herdr calls a new workspace's tab "1"
     assert any(c[:2] == ("agent", "start") and c[2] == "impl-1" for c in fake.calls)
+
+
+def test_spawn_looks_up_and_makes_the_agents_workspace_under_one_lock(fake: FakeHerdr, checkout: Path,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.workspace_labels = {"w1": "you"}
+    held: list[str] = []
+    real = sleeper.flocked
+
+    @contextlib.contextmanager
+    def watching(path: Path, wait: bool = True):  # type: ignore[no-untyped-def]
+        with real(path, wait) as ok:
+            held.append(path.name)
+            yield ok
+            held.remove(path.name)
+    inside: list[tuple[str, bool]] = []
+    orig_herdr = sleeper.herdr
+
+    def spy(*args: str, **kw: object) -> dict:
+        if args[:2] in (("workspace", "list"), ("workspace", "create")):
+            inside.append((args[1], "spawn-workspace.lock" in held))
+        return orig_herdr(*args, **kw)
+    monkeypatch.setattr(sleeper, "flocked", watching)
+    monkeypatch.setattr(sleeper, "herdr", spy)
+    assert _spawn(monkeypatch, checkout) == 0
+    assert ("list", True) in inside and ("create", True) in inside and all(ok for _, ok in inside)
+    assert _spawn(monkeypatch, checkout, name="impl-2") == 0      # the second one finds it: one workspace
+    assert list(fake.workspace_labels.values()).count("agents") == 1
+
+
+def test_a_failed_reservation_renewal_closes_the_new_tab(fake: FakeHerdr, checkout: Path,
+                                                         monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    fake.workspace_labels = {"w1": "you"}
+
+    def broken(*a: object, **k: object) -> str | None:
+        raise sleeper.SleeperError("herdr agent list failed")
+    monkeypatch.setattr(sleeper, "renew_reservation", broken)
+    args = types.SimpleNamespace(cwd=str(checkout), name="oc-1", kind="opencode", sender="orc", workspace=None,
+                                 json=False, agent_args=[])
+    assert sleeper.spawn_started(args, checkout, "go", [], "orc", [], token="t") == 1
+    made = next(c for c in fake.calls if c[:2] == ("workspace", "create"))
+    assert made and any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls)
+    assert "could not be renewed" in capsys.readouterr().err
 
 
 def test_spawn_takes_a_workspace_label_and_refuses_a_missing_one(fake: FakeHerdr, checkout: Path,
