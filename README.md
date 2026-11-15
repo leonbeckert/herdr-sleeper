@@ -736,7 +736,7 @@ calling session. Herdr gives a moved pane a new id and keeps its terminal; the
 move checks the terminal and logs `moved`. `--machine M` (or `M/NAME`) moves on
 another saved machine, never across machines.
 
-A sleeper moves without waking (*v0.1.38*, B-465): only a row that is provably
+A sleeper moves without waking (*v0.1.39*, B-465): only a row that is provably
 its pane's (phase asleep, same terminal) whose pane runs its wake stub or a bare
 shell, under the same refusals (focus and a delivery would wake it). The row is
 re-keyed to the new pane id in the same lock and the claim is re-reported with
@@ -753,7 +753,7 @@ recorded in the terminal its pane has now (a `move` and then a drag before a
 tick; the same terminal is the same pane). Never a row elsewhere by session id
 alone: an old stub left in an orphaned pane would take the row of the same
 session asleep in another pane. A stub writes its pid to
-`stubs/<uuid>.pid` when it starts; a stub started by v0.1.37 or older writes
+`stubs/<uuid>.pid` when it starts; a stub started by v0.1.38 or older writes
 none and still runs that code (a deploy restarts only the watcher), so `move`
 refuses it: wake that session and move it awake, or move it after a Herdr
 restart. A drag by hand is followed by reconcile through the terminal id (and

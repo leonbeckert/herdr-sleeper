@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.38"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.39"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -945,7 +945,7 @@ def stub_pid(pane: str, uuid: str) -> int | None:
 
 
 def stub_follows(pane: str, uuid: str) -> bool:
-    """Does the pane run a wake stub that finds its row after a move? A stub from v0.1.38 on writes
+    """Does the pane run a wake stub that finds its row after a move? A stub from v0.1.39 on writes
     its pid to STUBS/<uuid>.pid when it starts; an older one (still running the code it was started
     with: a deploy restarts only the watcher) looks its row up by the pane id in its argv alone, so
     moving its pane would leave its Enter without a row."""
