@@ -2405,12 +2405,20 @@ def stub_row(journal: dict, here: str, uuid: str, typed: str | None = None) -> t
     `move` or a followed drag re-keyed it), else the one under the pane id in its argv (`typed`: a
     drag the watcher has not followed yet). Never a row elsewhere found by session id alone: an older
     stub left waiting in an orphaned pane would take the row of the same session asleep in another
-    pane. None: no row of ours."""
+    pane. Else, for moves the watcher has not followed (a `move`, then a drag), the one row for its
+    session recorded in the terminal this pane has now: the same terminal is the same pane, which an
+    orphaned pane's stub never has. None: no row of ours."""
+    def ours(key: str, entry: object) -> bool:
+        return isinstance(entry, dict) and entry.get("uuid") == uuid and valid_entry(entry) and not is_orphan(key, entry)
     for key in dict.fromkeys(k for k in (here, typed) if k):
-        entry = journal.get(key)
-        if isinstance(entry, dict) and entry.get("uuid") == uuid and valid_entry(entry) and not is_orphan(key, entry):
-            return key, entry
-    return None
+        if ours(key, journal.get(key)):
+            return key, journal[key]
+    try:
+        terminal = (herdr("pane", "get", here, check=False).get("pane") or {}).get("terminal_id")
+    except SleeperError:
+        terminal = None
+    hits = [(k, e) for k, e in journal.items() if terminal and ours(k, e) and e.get("terminal_id") == terminal]
+    return hits[0] if len(hits) == 1 and stub_running(here, uuid) is True else None
 
 
 def mark_stub(uuid: str) -> None:

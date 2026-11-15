@@ -176,6 +176,14 @@ class FakeHerdr:
         self.stub_panes = {p for p, argv in self.resumes.items() if "stub" in argv}
         self.stub_typed_as = {p: argv[argv.index("stub") + 1] for p, argv in self.resumes.items() if "stub" in argv}
 
+    def _resolve(self, pane: str) -> str:
+        """An old pane id through every later move to the current one (until a restart)."""
+        seen = set()
+        while pane in self.aliases and pane not in seen:
+            seen.add(pane)
+            pane = self.aliases[pane]
+        return pane
+
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
         if pid in self.helpers:
@@ -242,7 +250,7 @@ class FakeHerdr:
             a = by_pane.get(args[2])
             return {"agent": a} if a else {}
         if args[:2] == ("pane", "get"):
-            a = by_pane.get(args[2]) or by_pane.get(self.aliases.get(args[2], ""))
+            a = by_pane.get(args[2]) or by_pane.get(self._resolve(args[2]))
             if a is None:
                 if check:
                     raise sleeper.SleeperError("no such pane")
@@ -259,7 +267,7 @@ class FakeHerdr:
             return {"pane": pane}
         if args[:2] == ("pane", "process-info"):
             pane = args[args.index("--pane") + 1]
-            pane = pane if pane in by_pane else self.aliases.get(pane, pane)   # Herdr resolves an old id too
+            pane = pane if pane in by_pane else self._resolve(pane)   # Herdr resolves an old id too
             if self.process_info_broken or (pane not in by_pane and self.strict_process_info):
                 return {}      # real Herdr answers a pane that is gone with an error envelope
             return {"process_info": {"foreground_processes": self._procs(pane, by_pane.get(pane))}}
@@ -7582,6 +7590,18 @@ def test_a_move_while_the_stub_waits_is_not_undone(fake: FakeHerdr, monkeypatch:
     monkeypatch.setattr("builtins.input", enter_after_a_move)
     assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps and calls["n"] == 1
     assert set(journal()) == {"w2:p8"} and journal()["w2:p8"]["phase"] == "waking"   # not moved back to w1:p1
+
+
+def test_enter_after_a_move_and_then_a_drag_the_watcher_has_not_followed(fake: FakeHerdr,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = _asleep_with_stub(fake)
+    assert _move(monkeypatch, "a", workspace="parked") == 0                    # w1:p1 -> w2:p8, row re-keyed
+    fake("pane", "move", "w2:p8", "--new-tab", "--workspace", "w2", "--label", "y", "--no-focus")  # -> w2:p9
+    fake.agents[0].pop("agent", None)
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    execvps = _enter_stub(monkeypatch, entry)
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execvps and execvps[0][1][-2:] == ["--resume", UUID]
+    assert set(journal()) == {"w2:p9"} and journal()["w2:p9"]["phase"] == "waking"
 
 
 def test_an_orphaned_stub_does_not_take_the_row_of_its_session_asleep_elsewhere(

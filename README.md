@@ -748,7 +748,9 @@ a restart, proven by our stub for that session in that pane's foreground;
 resolved again under the lock, since a `move` may run while it waits), else
 under its argv pane (a drag the watcher has not followed yet: re-keyed before it
 turns `waking`, only from the same terminal; otherwise the stub starts over and
-the next Enter finds the followed row). Never a row elsewhere by session id
+the next Enter finds the followed row), else the one row for its session
+recorded in the terminal its pane has now (a `move` and then a drag before a
+tick; the same terminal is the same pane). Never a row elsewhere by session id
 alone: an old stub left in an orphaned pane would take the row of the same
 session asleep in another pane. A stub writes its pid to
 `stubs/<uuid>.pid` when it starts; a stub started by v0.1.37 or older writes
