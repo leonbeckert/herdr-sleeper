@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.40"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.41"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7216,7 +7216,11 @@ def cmd_presence(args: argparse.Namespace) -> int:
     except SleeperError as exc:
         print(f"WARNING: {exc}", file=warn)
     every = getattr(args, "all", False)
-    if every:  # this machine first, then every enabled saved machine; an unreachable one is a warning
+    problems: list[str] = []
+    # this machine first, then every enabled saved machine; an unreachable one is named and the exit is 3,
+    # as for `ask --list --everywhere`: a count over the rows must not miss a machine silently (mini2
+    # automation, 2026-11-15: 36 rows without the MacBook's, exit 0)
+    if every:
         try:
             me = this_machine()
         except SleeperError as exc:
@@ -7228,7 +7232,7 @@ def cmd_presence(args: argparse.Namespace) -> int:
             print(f"WARNING: {problem}", file=warn)
     if args.json:
         print(json.dumps(rows, indent=2))
-        return 0
+        return 3 if problems else 0
     if not every:  # the place names the machine too: the owner's one Herdr view shows them all
         with contextlib.suppress(SleeperError):
             me = this_machine()
@@ -7245,7 +7249,7 @@ def cmd_presence(args: argparse.Namespace) -> int:
           "--from <you>  (wakes a sleeper)")
     print("to the owner, name a session by its place (machine › workspace › tab, as Herdr shows it), "
           "never by its pane id")
-    return 0
+    return 3 if problems else 0
 
 
 # ------------------------------------------------------------ other machines
@@ -10205,7 +10209,8 @@ def main(argv: list[str] | None = None) -> int:
     pp = sub.add_parser("presence", help="live and sleeping agents")
     pp.add_argument("--json", action="store_true")
     pp.add_argument("--machine", help="list a Herdr saved machine's agents instead of this one's")
-    pp.add_argument("--all", action="store_true", help="this machine and every enabled saved machine")
+    pp.add_argument("--all", action="store_true",
+                    help="this machine and every enabled saved machine (an unreachable one is named, exit 3)")
     pp.set_defaults(fn=cmd_presence)
     wp = sub.add_parser("whoami", help="the calling agent's name, machine, pane, place and session")
     wp.add_argument("--json", action="store_true")

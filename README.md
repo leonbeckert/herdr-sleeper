@@ -823,7 +823,7 @@ Herdr's saved SSH machines (`herdr machine list`) extend `deliver`, `wake`,
 ```sh
 echo "review MR !4" | herdr-sleeper deliver dev2/impl-1 --from orc   # or: deliver impl-1 --machine dev2
 herdr-sleeper wake dev2/impl-1
-herdr-sleeper presence --all                # this machine and every enabled saved one, as machine/name
+herdr-sleeper presence --all                # this machine and every enabled saved one, as machine/name (exit 3: one did not answer)
 herdr-sleeper presence --machine dev2 [--json]
 herdr-sleeper insomnia list --machine dev2
 echo "build B-17" | herdr-sleeper spawn --machine dev2 --cwd ~/development/app --name impl-1 [-- FLAGS]

@@ -4250,9 +4250,13 @@ def test_presence_all_merges_machines_and_warns_for_an_unreachable_one(
     rows = json.loads(capsys.readouterr().out)
     assert {(r["machine"], r["name"]) for r in rows} == {("dev1", "a"), ("dev2", "impl-1")}
     ssh.reply(stderr="Connection refused\n", rc=255)
-    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 0
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine=None, all=True)) == 3
     out = capsys.readouterr().out
     assert "WARNING: dev2: SSH to herdr-dev2 failed: Connection refused" in out and "dev1/a " in out
+    # --json: the rows that came, the missing machine on stderr, exit 3 (a count must not miss it silently)
+    assert sleeper.cmd_presence(types.SimpleNamespace(json=True, machine=None, all=True)) == 3
+    got = capsys.readouterr()
+    assert {r["machine"] for r in json.loads(got.out)} == {"dev1"} and "WARNING: dev2: SSH to herdr-dev2 failed" in got.err
     assert sleeper.cmd_presence(types.SimpleNamespace(json=False, machine="dev2", all=False)) == 1
 
 
