@@ -132,7 +132,7 @@ class FakeHerdr:
         self.stub_execs_on_enter = False    # Enter to a stub pane resumes the stub's session
         self.start_reports_session = True   # agent start answers with the session id (else it is learned later)
         self.start_session_appears = True   # ... and it then shows up in `pane get`
-        self.prompt_starts_session = False  # opencode: a fresh start has no session until its first prompt
+        self.prompt_starts_session = False  # opencode, codex: a fresh start has no session until its first prompt
         self.prompt_error: tuple[str | None] | None = None  # `agent prompt` fails with this code (after typing)
         self.taken_names: set[str] = set()  # agent names `agent start` rejects as taken
         self.empty_argv = False             # process-info lists the agent with no readable argv
@@ -349,7 +349,8 @@ class FakeHerdr:
             if "--resume" not in args:
                 a["name"] = args[2]
                 a["agent_status"] = "idle"
-            fresh_opencode = self.prompt_starts_session and kind == "opencode" and "-s" not in args
+            fresh_opencode = (self.prompt_starts_session and kind in ("opencode", "codex") and "-s" not in args
+                              and "resume" not in args)
             a.update(agent=kind, agent_session={"value": uuid} if self.start_session_appears else None)
             if not self.start_session_appears or fresh_opencode:
                 a.pop("agent_session")
@@ -404,8 +405,9 @@ class FakeHerdr:
                 by_pane[args[2]]["label"] = None if args[3] == "--clear" else args[3]
             typed_in = not (self.prompt_error and self.prompt_error[0] in sleeper.OPENCODE_NOT_SENT)
             if args[:2] == ("agent", "prompt") and self.prompt_starts_session and typed_in \
-                    and by_pane[args[2]].get("agent") == "opencode":
-                by_pane[args[2]].setdefault("agent_session", {"value": OC_SESSION})
+                    and by_pane[args[2]].get("agent") in ("opencode", "codex"):
+                by_pane[args[2]].setdefault("agent_session", {"value": OC_SESSION if by_pane[args[2]]["agent"]
+                                                              == "opencode" else CODEX_SESSION})
             if args[:2] == ("agent", "prompt") and self.prompt_error:
                 raise sleeper.HerdrError("herdr agent prompt failed", self.prompt_error[0])
             if args[:2] == ("pane", "send-keys") and args[2] in self.stub_panes and self.stub_execs_on_enter:
@@ -610,7 +612,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.parametrize(
     "text",
     ["idle_hours = = 3\n", "idle_hours = nan\n", "idle_hours = -1\n", "exclude = [1, 2]\n", "poll_seconds = 0\n",
-     "bogus = 1\n", "idle_hours = false\n", "poll_seconds = true\n", 'agents = ["codex"]\n', "notify = 1\n"],
+     "bogus = 1\n", "idle_hours = false\n", "poll_seconds = true\n", 'agents = ["gemini"]\n', "notify = 1\n"],
 )
 def test_load_config_rejects_bad_values(state: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
     cfg = state / "config.toml"
@@ -688,6 +690,13 @@ def test_assess_never_sleeps_opencode_yet(state: Path) -> None:
     assert not ok and reason == sleeper.OPENCODE_NO_SLEEP              # until a wake checks the shim marker
 
 
+def test_assess_never_sleeps_codex(state: Path) -> None:
+    a = agent(kind="codex", uuid=CODEX_SESSION)
+    ok, reason, _ = sleeper.assess(a, [a], 12, {}, idle_since=time.time() - 100 * 3600)
+    assert not ok and reason == sleeper.CODEX_NO_SLEEP
+    assert sleeper.sleep_agent(a, 12, set(), dry_run=False) == (False, sleeper.CODEX_NO_SLEEP)
+
+
 @pytest.mark.parametrize(
     "kw, needle",
     [
@@ -696,7 +705,7 @@ def test_assess_never_sleeps_opencode_yet(state: Path) -> None:
         ({"focused": True}, "focused"),
         ({"focused": None}, "focus unknown"),
         ({"uuid": None}, "no session uuid"),
-        ({"kind": "codex"}, "not supported"),
+        ({"kind": "gemini"}, "not supported"),
     ],
 )
 def test_assess_rejections(state: Path, kw: dict[str, Any], needle: str) -> None:
@@ -3362,8 +3371,8 @@ def test_insomnia_claim_needs_a_herdr_pane_and_a_session(fake: FakeHerdr, monkey
     assert "no HERDR_PANE_ID" in capsys.readouterr().err
     fake.agents[0].pop("agent_session")
     assert _claim(monkeypatch) == 1 and "no session id" in capsys.readouterr().err
-    fake.agents[0]["agent"] = "codex"
-    assert _claim(monkeypatch) == 1 and "never slept" in capsys.readouterr().err
+    fake.agents[0]["agent"] = "gemini"
+    assert _claim(monkeypatch) == 1 and "no profile for" in capsys.readouterr().err
     assert not sleeper.INSOMNIA.exists()
 
 
@@ -3561,9 +3570,11 @@ def test_spawn_starts_a_named_session_and_types_its_first_prompt(fake: FakeHerdr
 
 
 def test_spawn_codex_gets_no_session_name_flag(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.prompt_starts_session = True
+    fake.screen = cx_screen("01-home")
     assert _spawn(monkeypatch, checkout, kind="codex") == 0
     start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
-    assert start[start.index("--kind") + 1] == "codex" and start[-1] == "--"
+    assert start[start.index("--kind") + 1] == "codex" and list(start[start.index("--") + 1:]) == ["--no-daemon"]
 
 
 @pytest.mark.parametrize("kw, needle", [
@@ -4708,8 +4719,8 @@ def test_close_self_refusals(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, c
 
 def test_close_self_needs_a_checkable_session_with_an_id(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
                                                       capsys: pytest.CaptureFixture[str]) -> None:
-    fake.agents[0]["agent"] = "codex"                                   # no composer check (opencode has one)
-    assert _self_close(monkeypatch) == 1 and "runs codex" in capsys.readouterr().err
+    fake.agents[0]["agent"] = "gemini"                                  # no profile, no composer check
+    assert _self_close(monkeypatch) == 1 and "no profile for" in capsys.readouterr().err
     fake.agents[0]["agent"] = "claude"
     fake.agents[0].pop("agent_session")
     assert _self_close(monkeypatch) == 1 and "no session id" in capsys.readouterr().err
@@ -7259,7 +7270,7 @@ def test_move_leaves_a_session_already_there(fake: FakeHerdr, monkeypatch: pytes
     (lambda f: f.agents[0].update(agent_status="working"), "is busy (status working)"),
     (lambda f: setattr(f, "screen", CLAUDE_SCREEN.format(composer="half a thought")), "composer draft"),
     (lambda f: f.agents[0].update(focused=True), "keyboard focus"),
-    (lambda f: f.agents[0].update(agent="codex"), "composer cannot be checked"),
+    (lambda f: f.agents[0].update(agent="gemini"), "composer cannot be checked"),
     (lambda f: f.agents.append({"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_id": "t2"}),
      "shares its tab with 1 other pane"),
 ])
@@ -7493,7 +7504,8 @@ def test_opencode_dialog_cues_in_the_transcript_are_text() -> None:
 def test_composer_checks_go_by_profile() -> None:
     assert sleeper.composer_for("claude") is sleeper.composer_state
     assert sleeper.composer_for("opencode") is sleeper.opencode_composer_state
-    assert sleeper.composer_for("codex") is None and sleeper.composer_for(None) is None
+    assert sleeper.composer_for("codex") is sleeper.codex_composer_state
+    assert sleeper.composer_for("gemini") is None and sleeper.composer_for(None) is None
 
 
 def test_mail_into_opencode_waits_for_an_empty_composer_and_keeps_triggers_as_text(
@@ -7899,6 +7911,187 @@ def test_spawn_opencode_keeps_a_record_another_spawn_holds_by_the_end(oc_policy:
             rec = sleeper.spawned_records()["impl-1"]
             sleeper.record_spawned("impl-1", {**rec, "token": "someone-else"})
         return real(screen)
-    monkeypatch.setattr(sleeper, "opencode_composer_state", taken_while_typing)
+    monkeypatch.setitem(sleeper.COMPOSERS, "opencode", taken_while_typing)
     assert _spawn(monkeypatch, checkout, kind="opencode") == 0
     assert sleeper.spawned_records()["impl-1"]["token"] == "someone-else" and "spawn-record-kept" in events()
+
+
+# ------------------------------------------------- codex parity (plan.opencode-herdr.md Phase 5)
+
+CODEX_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "codex-0.163.0"
+CODEX_SESSION = "01a1dde0-83aa-71a2-8eb9-d065a2617b17"
+
+
+def cx_screen(name: str) -> str:
+    """A screen of Codex 0.163.0 as `herdr pane read --format ansi` gave it in the Phase 5 lab."""
+    return (CODEX_FIXTURES / f"screen-{name}.ansi").read_text()
+
+
+@pytest.mark.parametrize("name, state", [
+    ("01-home", "empty"),                  # the dim placeholder is no draft
+    ("04-cleared", "empty"),
+    ("06-done", "empty"),                  # the transcript's own `›` block (another shade) is not the composer
+    ("07-restart", "empty"),
+    ("02-draft", "draft"),
+    ("03-draft-multi", "draft"),
+    ("05-working", "unknown"),
+    ("00-trust", "unknown"),               # the folder-trust dialog's selected `›` row
+])
+def test_codex_composer_reads_the_lab_screens(name: str, state: str) -> None:
+    got, detail = sleeper.codex_composer_state(cx_screen(name))
+    assert got == state, detail
+    assert "draft one line" not in detail and "second line" not in detail   # never what the draft says
+
+
+def _cx_rows(name: str) -> tuple[list[str], int]:
+    """A lab screen's lines and the index of its composer's `›` row."""
+    lines = cx_screen(name).split("\n")
+    return lines, max(i for i, ln in enumerate(lines) if sleeper.strip_ansi(ln).startswith("›"))
+
+
+def test_codex_composer_fails_closed() -> None:
+    cs = sleeper.codex_composer_state
+    assert cs(None)[0] == "unknown"
+    assert cs(EMPTY_SCREEN)[0] == "unknown"                       # a Claude screen is no Codex composer
+    assert cs(oc_screen("09-idle-after"))[0] == "unknown"
+    assert cs(sleeper.strip_ansi(cx_screen("01-home")))[0] == "unknown"   # no styling: nothing to vouch for
+    lines, prompt = _cx_rows("01-home")
+    assert cs("\n".join(lines[:prompt + 2]))[0] == "unknown"      # no footer below the block
+    assert cs("\n".join(lines + ["  one", "  two"]))[0] == "unknown"   # a popup under the footer
+    shaded = lines[prompt - 1]
+    assert cs("\n".join(lines[:prompt - 1] + [shaded] + lines[prompt - 1:]))[0] == "unknown"  # runs into rows above
+
+
+def test_codex_composer_tells_the_dim_placeholder_from_typed_text() -> None:
+    lines, prompt = _cx_rows("01-home")
+    lines[prompt] = lines[prompt].replace("\x1b[2m", "")          # the same words, not dim: typed
+    assert sleeper.codex_composer_state("\n".join(lines)) == ("draft", "text on the prompt row, 24 chars")
+
+
+def test_codex_composer_counts_a_tall_blank_composer_as_a_draft() -> None:
+    lines, prompt = _cx_rows("03-draft-multi")
+    blank = lines[prompt - 1]
+    lines[prompt + 1] = blank                                     # the second row scrolled to a blank one
+    assert sleeper.codex_composer_state("\n".join(lines)) == ("draft", "the composer is 2 input rows tall")
+
+
+def test_codex_composer_reads_both_truecolour_forms() -> None:
+    assert sleeper.codex_composer_state(cx_screen("01-home").replace("48;2;65;69;76", "48:2::65:69:76"))[0] == "empty"
+    lines, prompt = _cx_rows("01-home")                           # one row in another shade: no spacer
+    lines[prompt + 1] = lines[prompt + 1].replace("48;2;65;69;76", "48;2;20;20;20")
+    assert sleeper.codex_composer_state("\n".join(lines))[0] == "unknown"
+
+
+def test_codex_has_a_profile_that_never_sleeps() -> None:
+    assert sleeper.PROFILES["codex"]["exit"] == "signal" and sleeper.no_sleep_reason("codex") == sleeper.CODEX_NO_SLEEP
+    assert sleeper.no_sleep_reason("claude") is None
+    assert sleeper.resume_argv("codex", CODEX_SESSION) == ["resume", "--no-daemon", CODEX_SESSION]
+
+
+def _as_codex(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, screen: str = "01-home") -> None:
+    fake.agents[0].update(agent="codex", agent_session={"value": CODEX_SESSION})
+    fake.screen = cx_screen(screen)
+    real = sleeper.agent_process
+    monkeypatch.setattr(sleeper, "agent_process", lambda pane, kind: (True, [], 101) if kind == "codex"
+                        else real(pane, kind))
+
+
+def test_codex_session_can_claim_insomnia_and_close_itself(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    _as_codex(fake, monkeypatch)
+    assert _claim(monkeypatch) == 0 and CODEX_SESSION in sleeper.read_json(sleeper.INSOMNIA)
+    assert sleeper.cmd_insomnia(types.SimpleNamespace(action="release", reason=None, duration=None, pane=None,
+                                                      force=False)) == 0
+    assert _self_close(monkeypatch, reason="done") == 0 and CODEX_SESSION in _closing()
+
+
+def test_close_and_close_self_work_for_codex(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    _as_codex(fake, monkeypatch, "02-draft")
+    assert _close(monkeypatch, "a") == 1 and "composer draft" in capsys.readouterr().err
+    assert _self_close(monkeypatch, reason="done") == 0 and CODEX_SESSION in _closing()
+    monkeypatch.delenv("HERDR_PANE_ID")
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.signals == [] and CODEX_SESSION in _closing()            # the draft keeps it open
+    fake.screen = cx_screen("06-done")
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert fake.signals and CODEX_SESSION not in _closing()
+
+
+def test_mail_into_codex_waits_for_an_empty_composer_and_is_not_reshaped(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    _as_codex(fake, monkeypatch, "02-draft")
+    assert deliver(monkeypatch, "a", body="see @README.md") == 3
+    assert prompts(fake) == [] and len(sleeper.pending_mail(CODEX_SESSION)) == 1   # the draft is the owner's
+    fake.screen = cx_screen("05-working")
+    sleeper.flush_mail(fake.agents)
+    assert prompts(fake) == []                                                    # a turn runs
+    fake.screen = cx_screen("06-done")
+    sleeper.flush_mail(fake.agents)
+    (call,) = prompts(fake)
+    assert call[3].endswith("see @README.md") and sleeper.pending_mail(CODEX_SESSION) == []
+
+
+def test_spawn_codex_types_the_first_prompt_and_learns_the_session(
+        fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_starts_session = True
+    fake.screen = cx_screen("01-home")
+    assert _spawn(monkeypatch, checkout, kind="codex", extra=["--", "-m", "gpt-6.1-sol"], json_out=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"name": "impl-1", "pane": "w1:p8", "tab": "w1:t8", "session": CODEX_SESSION, "prompt": "delivered"}
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert list(start[start.index("--") + 1:]) == ["--no-daemon", "-m", "gpt-6.1-sol"]
+    (typed,) = prompts(fake)
+    assert "via herdr-sleeper" in typed[3] and typed[3].endswith("build B-1")
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    assert rec["uuid"] == CODEX_SESSION and rec["kind"] == "codex"
+
+
+def test_spawn_codex_on_the_trust_dialog_types_nothing(fake: FakeHerdr, checkout: Path,
+                                                       monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_starts_session = True
+    fake.screen = cx_screen("00-trust")
+    monkeypatch.setattr(sleeper, "OPENCODE_FIRST_PROMPT_SECONDS", 1)
+    assert _spawn(monkeypatch, checkout, kind="codex") == 1
+    assert "folder-trust" in capsys.readouterr().err
+    assert prompts(fake) == [] and ("tab", "close", "w1:t8") in fake.calls
+
+
+@pytest.mark.parametrize("extra, needle", [
+    (["resume", "x"], "no positional"),
+    (["fix the bug"], "no positional"),
+    (["--remote", "ws://x"], "--remote is refused"),
+    (["-c", "features.hooks=false"], "-c is refused"),
+    (["--no-daemon"], "--no-daemon is refused"),               # it is always passed; not twice
+    (["-m"], "missing its value"),
+])
+def test_spawn_codex_takes_only_a_model(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str], extra: list[str], needle: str) -> None:
+    assert _spawn(monkeypatch, checkout, kind="codex", extra=extra) == 2
+    assert needle in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+
+
+def test_codex_composer_dimmed_by_transcript_navigation_is_not_empty() -> None:
+    # Codex dims the whole composer, a draft included, while the transcript is navigated (Codex review of v0.1.36)
+    lines, prompt = _cx_rows("02-draft")
+    lines[prompt] = lines[prompt].replace("\x1b[1m", "\x1b[1m\x1b[2m").replace(
+        "\x1b[48;2;65;69;76m draft", "\x1b[2m\x1b[48;2;65;69;76m draft")
+    assert sleeper.codex_composer_state("\n".join(lines))[0] != "empty"
+    hint = next(i for i, ln in enumerate(cx_screen("01-home").split("\n")) if "for shortcuts" in ln)
+    lines.append(cx_screen("01-home").split("\n")[hint])          # even with the empty-composer hint below it
+    assert sleeper.codex_composer_state("\n".join(lines))[0] != "empty"
+
+
+def test_codex_composer_that_scrolls_is_a_draft() -> None:
+    # a clipped multi-line draft can show one blank row and a dim scroll marker
+    lines, prompt = _cx_rows("01-home")
+    blank = lines[prompt - 1]
+    lines[prompt] = "\x1b[0m\x1b[1m\x1b[48;2;65;69;76m›\x1b[0m\x1b[2m\x1b[48;2;65;69;76m ↑" + blank[len("\x1b[0m\x1b[48;2;65;69;76m") + 2:]
+    assert sleeper.codex_composer_state("\n".join(lines)) == ("draft", "the composer scrolls (rows out of view)")
+
+
+def test_codex_composer_needs_the_empty_hint() -> None:
+    lines = [ln for ln in cx_screen("01-home").split("\n") if "for shortcuts" not in ln]
+    assert sleeper.codex_composer_state("\n".join(lines))[0] == "unknown"

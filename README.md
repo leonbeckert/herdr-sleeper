@@ -121,9 +121,10 @@ It also honours `dry_run`; `scan --dry-run` previews without it.
 
 Supported kinds: **claude** (original argv replayed on wake; a session
 started without flags resumes with none, and `wake --without-flags` resumes
-one whose flags are unknown) and
-**opencode** (`-s <session>`). Codex is deliberately absent — see the
-comment on `PROFILES` in the script.
+one whose flags are unknown), **opencode** (`-s <session>`) and **codex**
+(`resume --no-daemon <session>`). opencode and codex are never slept
+(`PROFILES[kind]["no_sleep"]`, the reason `scan` shows); mail, insomnia,
+`ask`, `close` and `close --self` work for all three.
 
 ### opencode panes (*v0.1.34*)
 
@@ -679,6 +680,35 @@ An orphaned, displaced or waking row is never closed, not even with
 `--force`. Either way the transcript stays on disk, and `close` prints
 the line that resumes it by hand.
 
+### Codex sessions (`--kind codex`, *v0.1.36*)
+
+Codex 0.163 has its own composer check, `codex_composer_state`, from a lab
+run (`tests/fixtures/codex-0.163.0`, from ansible-orchestration
+`docs/macos/captures/`): the composer is the block in one background around
+the last `›` row (a spacer, its rows, a spacer), with only the status line and
+hint below it. Empty takes positive evidence: one input row with nothing
+but the dim placeholder (its words change from session to session), a `›`
+that isn't dim, no `↑`/`↓` scroll marker, and the `? for shortcuts` hint,
+which Codex shows only for an empty composer. A taller block or a scroll
+marker is a draft; a dimmed composer (transcript navigation dims a draft
+too) or a missing hint is unknown. A
+transcript message is a block in another shade with a dim `›`, a dialog's
+selected row has its own shade, and `• Working (… esc to interrupt)` above the
+composer is a running turn: all unknown or not the composer, so nothing is
+typed.
+
+A Codex TUI runs its session in a shared app-server daemon unless started
+with `--no-daemon`, and the daemon hands every session's hooks the
+environment of the pane that started it: Herdr's hook then reports the
+session to that pane (LESSONS 4.10). So `spawn --kind codex` always passes
+`--no-daemon`, takes only `-m/--model` after `--` (a positional is the first
+prompt or a subcommand; `-c`, `--remote` and the rest are refused), and types
+the first prompt like an opencode lane: Codex reports its session only once a
+prompt made it write its rollout. A folder-trust dialog never shows an empty
+composer, so such a spawn closes its tab without typing (`agent_not_ready`).
+A close sends SIGTERM (Codex exits within a second); the pane closes right
+after, so the keyboard protocol Codex leaves on doesn't matter there.
+
 ### Moving a session (`move`, *v0.1.33*)
 
 `herdr-sleeper move NAME --workspace W [--label T] [--create] [--from SENDER]`
@@ -1067,7 +1097,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 696 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 724 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

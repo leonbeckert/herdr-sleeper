@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.35"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.36"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -307,16 +307,31 @@ def server_down(exc: BaseException) -> bool:
 # would discard it) and no background work (footer counts, shell children; for claude also
 # scheduled wakeups or session crons in the transcript).
 # composer: the kind's composer check (COMPOSERS); mail, close, close --self and move need one.
+# no_sleep: why the kind is never slept (assess, the stub and wake refuse with it); mail, insomnia,
+# ask, close and close --self work for it all the same.
+OPENCODE_NO_SLEEP = ("opencode lanes don't sleep yet: a wake must first prove the guardrail shim loaded "
+                     "(ansible-orchestration plan.opencode-herdr.md Phase 6)")
+CODEX_NO_SLEEP = ("codex sessions don't sleep: its TUI leaves the terminal's keyboard protocol on after a "
+                  "signal, so a pane that lives on (the wake stub) would need a typed exit")
 PROFILES: dict[str, dict] = {
     "claude": {"exit": "signal", "argv_after_binary": True, "idle_guards": True, "composer": "claude"},
-    # sleeping it waits for the Phase 6 proof (ansible-orchestration plan.opencode-herdr.md D7):
-    # the host's `agents` list leaves it out until then
-    "opencode": {"exit": "signal", "argv_after_binary": False, "idle_guards": True, "composer": "opencode"},
-    # codex is deliberately absent: its TUI does not restore the terminal's keyboard protocol on
-    # any signal, so it would need the typed-command exit, and our composer-empty check is
-    # claude-shaped (prompt glyphs) — an unknown composer must refuse, which would make a codex
-    # profile refuse always. Add it only with its own composer check.
+    # sleeping it waits for the Phase 6 proof (ansible-orchestration plan.opencode-herdr.md D7)
+    "opencode": {"exit": "signal", "argv_after_binary": False, "idle_guards": True, "composer": "opencode",
+                 "no_sleep": OPENCODE_NO_SLEEP},
+    # the signal is fine for close: the pane closes right after it (Codex 0.163 exits within a second)
+    "codex": {"exit": "signal", "argv_after_binary": False, "idle_guards": True, "composer": "codex",
+              "no_sleep": CODEX_NO_SLEEP},
 }
+# Codex 0.163 runs a TUI's session in a shared app-server daemon unless told not to, and the daemon runs
+# the session's hooks with its own environment: the HERDR_PANE_ID of whichever pane started it first. The
+# Herdr hook then reports the session to that pane, and the pane it runs in gets none (ansible-orchestration
+# docs/macos/report.2026-11-15-opencode-phase0-lab.md, "Codex sessions report to the wrong pane").
+CODEX_NO_DAEMON = "--no-daemon"
+
+
+def no_sleep_reason(kind: object) -> str | None:
+    """Why this kind is never slept, or None when its profile allows it."""
+    return PROFILES.get(str(kind), {}).get("no_sleep")
 
 
 def resume_argv(kind: str, uuid: str, extra: list[str] | None = None) -> list[str] | None:
@@ -326,7 +341,7 @@ def resume_argv(kind: str, uuid: str, extra: list[str] | None = None) -> list[st
     if kind == "opencode":
         return ["-s", uuid]
     if kind == "codex":
-        return ["resume", uuid]
+        return ["resume", CODEX_NO_DAEMON, uuid]
     return None
 
 
@@ -909,7 +924,7 @@ def rss_mb(pane: str) -> int:
 SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "login"}
 # Executable names (ps `comm`) an agent of each kind may run as: the binary itself, or the runtime of
 # an npm/bun install. SIGTERM goes only to a pid whose name is on this list.
-AGENT_COMMS = {"claude": {"claude", "node"}, "opencode": {"opencode", "node", "bun"}}
+AGENT_COMMS = {"claude": {"claude", "node"}, "opencode": {"opencode", "node", "bun"}, "codex": {"codex", "node"}}
 
 
 def process_table() -> dict[int, tuple[int, str]]:
@@ -1201,10 +1216,10 @@ def sgr_color(codes: list[str], j: int) -> tuple[str, tuple[str, ...], int]:
     return which, tuple(str(int(x or 0)) for x in args) if n else ("?",), 1 + (1 + n if n else 0)
 
 
-def colors_after(line: str, glyph: str, text: bool = False) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+def colors_after(line: str, glyph: str | None, text: bool = False) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """(foreground, background) in force on the first visible character after glyph (with text=True:
     the first one that isn't a space), each normalised by sgr_color, () for the default; None when
-    glyph (or such a character) isn't on the line."""
+    glyph (or such a character) isn't on the line. glyph None: the line's first visible character."""
     fg: tuple[str, ...] = ()
     bg: tuple[str, ...] = ()
     seen, i = False, 0
@@ -1238,7 +1253,7 @@ def colors_after(line: str, glyph: str, text: bool = False) -> tuple[tuple[str, 
         if m:
             i = m.end()
             continue
-        if seen and (not text or line[i] != " "):
+        if (seen or glyph is None) and (not text or line[i] != " "):
             return fg, bg
         if line[i] == glyph:
             seen = True
@@ -1310,7 +1325,79 @@ def opencode_composer_state(screen: str | None) -> tuple[str, str]:
     return "empty", ""
 
 
-COMPOSERS = {"claude": composer_state, "opencode": opencode_composer_state}
+# Codex 0.163's TUI (captures in tests/fixtures/codex-0.163.0, from ansible-orchestration docs/macos/captures):
+# the composer is a block of rows in one background, a spacer, the `›` row, the draft's further rows and a
+# spacer; below it the status line (model · cwd) and, while the composer is empty, the `? for shortcuts`
+# hint. An empty composer shows a dim placeholder that differs from session to session. The transcript's
+# user messages are such blocks too, in another shade and with a dim `›`; a dialog's selected `›` row has
+# a shade of its own and the dialog's rows run into it.
+CODEX_GLYPH = "›"
+CODEX_BUSY = ("esc to interrupt",)  # `• Working (12s • esc to interrupt)` above the composer
+CODEX_FOOTER_MAX = 3                # status line and hint (2 in the captures), with a line to spare
+CODEX_EMPTY_HINT = "? for shortcuts"  # the footer shows it only while the composer is empty
+CODEX_SCROLL = ("↑", "↓")             # a clipped textarea marks its hidden rows with these (dim)
+
+
+def codex_composer_state(screen: str | None) -> tuple[str, str]:
+    """composer_state for Codex panes: ('empty' | 'draft' | 'unknown', detail), failing closed.
+
+    The composer is the block in one background around the last line that starts with `›`: one spacer
+    row above it, its rows, one spacer row below, then only a short footer that isn't in that shade.
+    Empty needs positive evidence: that block at its minimum (one input row), a glyph that isn't dim,
+    nothing but dim text after it, no scroll marker, and the footer's `? for shortcuts` hint, which Codex
+    shows only for an empty composer. A taller block or a scroll marker holds a draft even when its rows
+    look blank; a dimmed composer (transcript navigation dims a draft too), a missing hint, a block that
+    runs into other shaded rows, a footer we don't know, or a running turn is unknown (Codex review of
+    v0.1.36)."""
+    if screen is None:
+        return "unknown", "screen unreadable"
+    raw = screen.splitlines()
+    lines = [strip_ansi(ln) for ln in raw]
+
+    def shade(i: int) -> tuple[str, ...] | None:
+        got = colors_after(raw[i], None)
+        return None if got is None else got[1]
+
+    prompt = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith(CODEX_GLYPH)), None)
+    if prompt is None or prompt == 0:
+        return "unknown", "no codex composer on screen"
+    bg = background_after(raw[prompt], CODEX_GLYPH)
+    if not bg:
+        return "unknown", "the prompt row has no background"
+    top = prompt - 1
+    if shade(top) != bg or lines[top].strip():
+        return "unknown", "no spacer row above the prompt row (a dialog?)"
+    if top > 0 and shade(top - 1) == bg:
+        return "unknown", "the composer block runs into other rows above it"
+    end = prompt
+    while end + 1 < len(raw) and shade(end + 1) == bg:
+        end += 1
+    if end == prompt or lines[end].strip():
+        return "unknown", "no spacer row below the composer"
+    footer = [i for i in range(end + 1, len(lines)) if lines[i].strip()]
+    if not footer or len(footer) > CODEX_FOOTER_MAX or any(lines[i].startswith(CODEX_GLYPH) for i in footer):
+        return "unknown", "something other than the status line below the composer (a popup or a dialog)"
+    if any(cue in ln for ln in lines[max(0, top - 3):top] for cue in CODEX_BUSY):
+        return "unknown", "a turn runs (`esc to interrupt` above the composer)"
+    rows = end - prompt
+    if rows > 1:
+        return "draft", f"the composer is {rows} input rows tall"
+    if any(mark in ln for ln in lines[prompt:end] for mark in CODEX_SCROLL):
+        return "draft", "the composer scrolls (rows out of view)"
+    glyph = next((dim for c, dim, _rev in styled_chars(raw[prompt]) if c == CODEX_GLYPH), True)
+    if glyph:
+        return "unknown", "the composer is dimmed (transcript navigation?)"
+    typed = typed_text(raw[prompt]).strip()
+    if typed.startswith(CODEX_GLYPH):
+        typed = typed[1:].strip()
+    if typed:
+        return "draft", f"text on the prompt row, {len(typed)} chars"
+    if not any(CODEX_EMPTY_HINT in lines[i] for i in footer):
+        return "unknown", "no `? for shortcuts` hint below the composer (it may hold text)"
+    return "empty", ""
+
+
+COMPOSERS = {"claude": composer_state, "opencode": opencode_composer_state, "codex": codex_composer_state}
 
 
 def composer_for(kind: object) -> Callable[[str | None], tuple[str, str]] | None:
@@ -1841,8 +1928,9 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, f"already in sleep journal ({journal[pane].get('phase', 'asleep')})", None
     if kind not in PROFILES:
         return False, f"agent kind {kind!r} not supported", None
-    if kind == "opencode":
-        return False, OPENCODE_NO_SLEEP, None
+    why = no_sleep_reason(kind)
+    if why:
+        return False, why, None
     uuid = (agent.get("agent_session") or {}).get("value")
     if not uuid:
         return False, "no session uuid (cannot resume)", None
@@ -2010,6 +2098,8 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
     profile = PROFILES.get(kind)
     if profile is None:
         return False, f"agent kind {kind!r} not supported"
+    if no_sleep_reason(kind):  # assess refuses it too, but only at the last recheck
+        return False, str(no_sleep_reason(kind))
     uuid = (agent.get("agent_session") or {}).get("value")
     if not uuid:
         return False, "no session uuid (cannot resume)"
@@ -2290,8 +2380,8 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         print(f"herdr-sleeper: {why}; left asleep.\n  manual: {manual_command(entry)}")
         return 0
 
-    if kind == "opencode":  # never slept by us (assess): no stub exec without a shim marker check
-        return refuse(OPENCODE_NO_SLEEP)
+    if no_sleep_reason(kind):  # never slept by us (assess): e.g. no opencode stub exec without a shim marker check
+        return refuse(str(no_sleep_reason(kind)))
     binary = shutil.which(kind)
     if not binary:
         return refuse(f"`{kind}` is not on this shell's PATH (focus the pane or use `wake`: "
@@ -2397,9 +2487,9 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
     if argv is None:
         say(f"cannot wake {name}: no resume recipe for {kind}; entry kept. Manual: {manual_command(entry)}")
         return False
-    if kind == "opencode":  # never slept by us (assess); a row from elsewhere is resumed by hand
-        say(f"cannot wake {name}: {OPENCODE_NO_SLEEP}; entry kept. Manual: {manual_command(entry)}")
-        event("wake-refused", pane=pane, name=name, uuid=uuid, reason="opencode")
+    if no_sleep_reason(kind):  # never slept by us (assess); a row from elsewhere is resumed by hand
+        say(f"cannot wake {name}: {no_sleep_reason(kind)}; entry kept. Manual: {manual_command(entry)}")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason=kind)
         return False
     pane_info = herdr("pane", "get", pane, check=False).get("pane")
     if not pane_info:
@@ -3636,7 +3726,7 @@ def calling_agent(agents: list[dict]) -> tuple[dict | None, str | None]:
     if hit is None:
         return None, f"{pane} runs no agent"
     if hit.get("agent") not in PROFILES:
-        return None, f"{pane} runs {hit.get('agent')}, which is never slept; no claim needed"
+        return None, f"{pane} runs {hit.get('agent')}, which herdr-sleeper has no profile for"
     if not valid_session_id((hit.get("agent_session") or {}).get("value")):
         return None, f"{pane} reports no session id yet; try again in a moment"
     present, _argv, pid = agent_process(pane, hit["agent"])
@@ -3905,8 +3995,6 @@ OPENCODE_NOT_SENT = {"agent_blocked"}  # `agent prompt` codes that refuse before
 OPENCODE_RESERVE_SECONDS = (SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + SPAWN_BUSY_RETRIES * SPAWN_BUSY_PAUSE_SECONDS
                             + OPENCODE_MARKER_SECONDS + 2 * OPENCODE_FIRST_PROMPT_SECONDS + 15
                             + OPENCODE_SESSION_SECONDS + 60)
-OPENCODE_NO_SLEEP = ("opencode lanes don't sleep yet: a wake must first prove the guardrail shim loaded "
-                     "(ansible-orchestration plan.opencode-herdr.md Phase 6)")
 
 
 def spawn_cwd_problem(raw: str) -> tuple[Path | None, str | None]:
@@ -3931,6 +4019,8 @@ def spawn_args_problem(kind: str, extra: list[str]) -> str | None:
         return "agent arguments contain control characters"
     if kind == "opencode":
         return opencode_args_problem(extra)
+    if kind == "codex":
+        return codex_args_problem(extra)
     if kind != "claude":
         return None
     if any(a.startswith("-n") or a.startswith("--name") for a in extra):
@@ -3962,6 +4052,28 @@ def opencode_args_problem(extra: list[str]) -> str | None:
         if a.startswith("-"):
             return f"opencode lanes take only -m/--model; {base} is refused"
         return "opencode lanes take no positional arguments (a path or a subcommand)"
+    return None
+
+
+def codex_args_problem(extra: list[str]) -> str | None:
+    """Only `-m/--model <model>` may go to a spawned Codex session (it always gets --no-daemon). Everything
+    else is refused: a positional is the first prompt (readable with `ps`) or a subcommand (`resume`, `exec`),
+    --remote and -c could put it back on the shared daemon or change its hooks, and the rest picks
+    permissions the host's system config already sets."""
+    i = 0
+    while i < len(extra):
+        a = extra[i]
+        base = a.split("=", 1)[0]
+        if base in ("-m", "--model"):
+            if "=" not in a:
+                if i + 1 >= len(extra) or extra[i + 1].startswith("-"):
+                    return f"{a} is missing its value"
+                i += 1
+            i += 1
+            continue
+        if a.startswith("-"):
+            return f"codex sessions take only -m/--model; {base} is refused"
+        return "codex sessions take no positional arguments (a prompt or a subcommand)"
     return None
 
 
@@ -4351,7 +4463,7 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
         print(f"spawn: the new pane never showed a bare shell within {SPAWN_SHELL_SECONDS}s; tab {tab} closed",
               file=sys.stderr)
         return 1
-    argv = (["-n", args.name] if args.kind == "claude" else []) + extra
+    argv = (["-n", args.name] if args.kind == "claude" else [CODEX_NO_DAEMON] if args.kind == "codex" else []) + extra
     lost = renew_reservation(args.name, token) if token else None  # the shell may have taken long
     if lost:
         with contextlib.suppress(SleeperError):
@@ -4383,7 +4495,7 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
         event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code=code)
         print(f"spawn: {args.name} did not start ({code or exc}){hint}; tab {tab} closed", file=sys.stderr)
         return 1
-    if args.kind == "opencode":
+    if args.kind in ("opencode", "codex"):
         return spawn_first_prompt(args, pane, tab, made["tab"].get("workspace_id"), cwd, body, sender, started_at,
                                   token)
     uuid = ((started.get("agent") or {}).get("agent_session") or {}).get("value")
@@ -4417,12 +4529,15 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
 
 def spawn_first_prompt(args: argparse.Namespace, pane: str, tab: str, workspace: str | None, cwd: Path,
                        body: str, sender: str, started_at: float, token: str | None = None) -> int:
-    """An opencode lane has no session until its first prompt: prove the guardrail shim loaded, wait
-    for the home screen's empty composer, type the envelope (pasted, so `@`/`!` stay text, and never
-    in argv where `ps` shows it), then wait for the `ses_…` id. Exit 0 typed and session known, 3 typed
-    (or perhaps typed) but no session yet, 1 failed."""
-    policy, why = opencode_policy()
-    why = why or opencode_shim_problem(pane, policy or {}, started_at)
+    """An opencode lane or a Codex session has no session id until its first prompt (Codex writes its
+    rollout, and its hook reports it, only then): for opencode prove the guardrail shim loaded; wait
+    for the home screen's empty composer, type the envelope (pasted, for opencode with `@`/`!` kept as
+    text, and never in argv where `ps` shows it), then wait for the session id. Exit 0 typed and
+    session known, 3 typed (or perhaps typed) but no session yet, 1 failed."""
+    why = None
+    if args.kind == "opencode":
+        policy, why = opencode_policy()
+        why = why or opencode_shim_problem(pane, policy or {}, started_at)
     if why:  # nothing typed yet: an unguarded opencode is closed, not handed work
         with contextlib.suppress(SleeperError):
             close_tab_or_pane(pane, tab)
@@ -4430,10 +4545,11 @@ def spawn_first_prompt(args: argparse.Namespace, pane: str, tab: str, workspace:
         print(f"spawn: {args.name}: {why}; tab {tab} closed", file=sys.stderr)
         return 1
     ready = False
+    check = composer_for(args.kind)
     for _ in range(OPENCODE_FIRST_PROMPT_SECONDS * 2):
         agent = next((a for a in list_agents() if a["pane_id"] == pane), None)
-        if agent and agent.get("agent") == "opencode" and agent.get("agent_status") in ("idle", "done") \
-                and opencode_composer_state(herdr_screen(pane))[0] == "empty":
+        if agent and agent.get("agent") == args.kind and agent.get("agent_status") in ("idle", "done") \
+                and check is not None and check(herdr_screen(pane))[0] == "empty":
             ready = True
             break
         time.sleep(0.5)
@@ -4441,15 +4557,17 @@ def spawn_first_prompt(args: argparse.Namespace, pane: str, tab: str, workspace:
         with contextlib.suppress(SleeperError):
             close_tab_or_pane(pane, tab)
         event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="agent_not_ready")
+        hint = " (a folder-trust prompt? Start codex once by hand in that checkout)" if args.kind == "codex" else ""
         print(f"spawn: {args.name} never showed an empty composer within {OPENCODE_FIRST_PROMPT_SECONDS}s "
-              f"(agent_not_ready); tab {tab} closed", file=sys.stderr)
+              f"(agent_not_ready){hint}; tab {tab} closed", file=sys.stderr)
         return 1
     from_pane = own_pane()
     msg = {"id": hashlib.sha256(f"{sender}\0{pane}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16],
            "from": sender, "to": None, "at": dt.datetime.now().isoformat(timespec="seconds"), "body": body}
     typed, failed = True, None
     try:
-        herdr("agent", "prompt", pane, opencode_safe(envelope(msg)), "--wait", "--until", "working",
+        text = opencode_safe(envelope(msg)) if args.kind == "opencode" else envelope(msg)
+        herdr("agent", "prompt", pane, text, "--wait", "--until", "working",
               "--timeout", str(OPENCODE_FIRST_PROMPT_SECONDS * 1000), timeout=OPENCODE_FIRST_PROMPT_SECONDS + 15)
     except SleeperError as exc:
         # Herdr's detail may quote the text; only the code is kept. Only a refusal before input is sure

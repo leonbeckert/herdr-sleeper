@@ -286,7 +286,19 @@ observed]*
   every local account reads it with `ps`, and with `-s` it neither submits nor pre-fills.
 - *Instead:* wait for the home screen's empty composer, paste the envelope with `herdr agent prompt --wait --until
   working`, then poll `pane get` for the id and archive the message under it. A lane that is starting has no
-  session yet, so the lane cap counts a reservation made under the lock, keyed by the spawn name.
+  session yet, so the lane cap counts a reservation made under the lock, keyed by the spawn name. Codex 0.163 writes
+  its rollout, and its Herdr hook reports the session, only at the first prompt too: it takes the same path.
+
+**4.10 A shared agent daemon runs every session's hooks in the environment it started with.** *[version-specific:
+Codex 0.163 TUI, app-server daemon 0.169, Herdr integration v10]*
+- *Trap:* by default a Codex TUI runs its session in a shared background app-server, which keeps the environment of
+  whichever pane auto-started it and hands that to every session's hooks. Herdr's hook reads `HERDR_PANE_ID` from
+  it, so every later Codex session reported its id to that one pane (an unrelated pane on mini2 got two lab
+  sessions within an hour), and the pane it really ran in had none: no ask, insomnia or `close --self`, and mail
+  addressed to such an id would be typed into the wrong pane.
+- *Instead:* start every Codex this plugin launches with `--no-daemon` (spawn, and the resume line it prints); the
+  session then runs in the TUI, and its hooks get the pane's own environment (lab: the id reached its own pane and
+  no other). A host can turn the daemon's auto-start off, but a daemon already running is still used.
 
 ## 5. Unknown is not absent
 
