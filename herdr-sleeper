@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.34"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.35"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -1550,16 +1550,20 @@ def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | No
         selects = any(p == uuid or p.endswith("=" + uuid) for p in parts[2:])
         if selects:
             return f"pid {parts[0]}"
-        if not any(os.path.basename(p) == "claude" or p.endswith("claude-code/cli.js") for p in parts[1:3]):
+        if any(os.path.basename(p) == "claude" or p.endswith("claude-code/cli.js") for p in parts[1:3]):
+            binary = "claude"
+        elif any(os.path.basename(p) == "opencode" for p in parts[1:3]):
+            binary = "opencode"
+        else:
             continue
-        # `claude --continue` picks up the newest session in its cwd, which may be this one
+        # `claude --continue` and `opencode -c` pick up the newest session in their cwd, which may be this one
         if cwd and any(p in ("--continue", "-c") for p in parts[2:]):
             where = process_cwd(parts[0])
             if where is None:
-                raise SleeperError(f"cannot verify session liveness: pid {parts[0]} runs `claude --continue` "
+                raise SleeperError(f"cannot verify session liveness: pid {parts[0]} runs `{binary} --continue` "
                                    "and its cwd could not be inspected (lsof)")
             if where == cwd:
-                return f"pid {parts[0]} (claude --continue in {cwd})"
+                return f"pid {parts[0]} ({binary} --continue in {cwd})"
     return None
 
 
@@ -1837,6 +1841,8 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, f"already in sleep journal ({journal[pane].get('phase', 'asleep')})", None
     if kind not in PROFILES:
         return False, f"agent kind {kind!r} not supported", None
+    if kind == "opencode":
+        return False, OPENCODE_NO_SLEEP, None
     uuid = (agent.get("agent_session") or {}).get("value")
     if not uuid:
         return False, "no session uuid (cannot resume)", None
@@ -2284,6 +2290,8 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         print(f"herdr-sleeper: {why}; left asleep.\n  manual: {manual_command(entry)}")
         return 0
 
+    if kind == "opencode":  # never slept by us (assess): no stub exec without a shim marker check
+        return refuse(OPENCODE_NO_SLEEP)
     binary = shutil.which(kind)
     if not binary:
         return refuse(f"`{kind}` is not on this shell's PATH (focus the pane or use `wake`: "
@@ -2388,6 +2396,10 @@ def wake_entry(entry: dict, via: str = "command", key: str | None = None) -> boo
     argv = resume_argv(kind, uuid, extra or None)
     if argv is None:
         say(f"cannot wake {name}: no resume recipe for {kind}; entry kept. Manual: {manual_command(entry)}")
+        return False
+    if kind == "opencode":  # never slept by us (assess); a row from elsewhere is resumed by hand
+        say(f"cannot wake {name}: {OPENCODE_NO_SLEEP}; entry kept. Manual: {manual_command(entry)}")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason="opencode")
         return False
     pane_info = herdr("pane", "get", pane, check=False).get("pane")
     if not pane_info:
@@ -3264,6 +3276,13 @@ def resolve_target(target: str, agents: list[dict], journal: dict) -> tuple[str,
             raise SleeperError(f"{target!r} matches live agent {named[0]['pane_id']} by Claude name and sleeping "
                                f"agents ({', '.join(others)}); name the pane id instead")
         return "live", named[0], None
+    if not hits:
+        # Herdr can drop any kind's name after a restart; spawned.json still ties it to the session
+        uuid = (spawned_records().get(target) or {}).get("uuid")
+        by_spawn = [a for a in agents if uuid and (a.get("agent_session") or {}).get("value") == uuid]
+        if len(by_spawn) == 1:
+            return "live", by_spawn[0], None
+        hits = [(k, e) for k, e in journal.items() if uuid and valid_entry(e) and e["uuid"] == uuid]
     if len(hits) > 1:
         raise SleeperError(f"{target!r} matches {len(hits)} sleeping agents ({', '.join(k for k, _ in hits)}); "
                            "name the pane id instead")
@@ -3312,7 +3331,37 @@ def context_sender(agents: list[dict]) -> str | None:
     pane, hit = followed_agent(agents)
     if not pane:
         return None
-    return (hit or {}).get("name") or pane
+    return (hit or {}).get("name") or spawned_name(((hit or {}).get("agent_session") or {}).get("value")) or pane
+
+
+def spawned_name(uuid: object) -> str | None:
+    """The name a session was spawned under, for when Herdr has lost the agent's name."""
+    if not valid_session_id(uuid):
+        return None
+    return next((n for n, r in spawned_records().items() if r.get("uuid") == uuid), None)
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    """The calling agent as others address it: the name `deliver --from` defaults to, its machine,
+    pane, place, kind and session. Exit 1 outside an agent pane."""
+    agents = list_agents()
+    pane, hit = followed_agent(agents)
+    if not pane or not hit or not hit.get("agent"):
+        print("whoami: not run inside a Herdr agent pane", file=sys.stderr)
+        return 1
+    machine = None
+    with contextlib.suppress(ConfigError):
+        machine = this_machine()
+    name = context_sender(agents)
+    uuid = (hit.get("agent_session") or {}).get("value")
+    out = {"name": name, "machine": machine, "address": f"{machine}/{name}" if machine else name, "pane": pane,
+           "place": ui_places(agents).get(pane), "kind": hit.get("agent"),
+           "session": uuid if valid_session_id(uuid) else None}
+    if args.json:
+        print(json.dumps(out))
+    else:
+        print("\n".join(f"{k:8} {v}" for k, v in out.items() if v is not None))
+    return 0
 
 
 def calling_session() -> str | None:
@@ -3826,13 +3875,38 @@ def tend_insomnia(agents: list[dict], clocks: dict[str, dict], now: float) -> No
 # once the work is done. Spawned claude sessions get `-n <name>`, so they can sleep, are found again by
 # that name after a Herdr restart, and their extra flags must pass the same replay filter a wake uses.
 SPAWN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-SPAWN_KINDS = ("claude", "codex")
+SPAWN_KINDS = ("claude", "codex", "opencode")
 SPAWN_ROOT = Path(os.path.expanduser("~/development"))  # spawned sessions work in checkouts below this
 SPAWN_READY_MS = 120_000
 SPAWN_SHELL_SECONDS = 20         # how long a new tab may take to show its shell prompt
 SPAWN_BUSY_RETRIES = 3           # more `agent start` tries when a fresh pane answers agent_pane_busy
 SPAWN_BUSY_PAUSE_SECONDS = 2
 SPAWNED = STATE_DIR / "spawned.json"  # session name -> who spawned it and where (close, presence)
+
+# opencode lanes (ansible-orchestration docs/macos/plan.opencode-herdr.md, Phase 4b). The policy file is
+# what Ansible installs next to the guardrail shim: without it the machine has no shim (D10, the MacBook)
+# and no lane may start. opencode reports its `ses_…` id only once the first prompt made the route a
+# session, so the first prompt is typed before the session is known (Phase 0 report, item 7).
+OPENCODE_POLICY = Path("/usr/local/libexec/opencode-ao/policy.json")
+OPENCODE_POLICY_UID = 0  # Ansible installs it as root
+OPENCODE_SPAWN_VALUE_OPTIONS = {"-m", "--model"}  # the session keeps its model on `-s <id>`: nothing to replay
+OPENCODE_PROJECT_CONFIGS = ("opencode.json", "opencode.jsonc")
+# the only keys a project opencode.json(c) may set: everything else can load code (plugin, mcp, lsp,
+# formatter, experimental hooks) or widen what the agent may do (agent, permission, instructions, …)
+OPENCODE_HARMLESS_KEYS = {"$schema", "theme", "keybinds", "username", "share", "tui", "layout"}
+OPENCODE_PROJECT_SKILL_DIRS = (".claude/skills", ".agents/skills")
+OPENCODE_TUI_CONFIGS = ("tui.json", "tui.jsonc")  # their plugins load in the TUI, outside the shim
+OPENCODE_INSTRUCTIONS = ("AGENTS.md", "CLAUDE.md", "CONTEXT.md")  # read directly at start, no tool hook
+OPENCODE_MARKER_SECONDS = 10        # how long after start the shim's load marker may take (about 1 s in Phase 0)
+OPENCODE_FIRST_PROMPT_SECONDS = 30  # how long a fresh TUI may take to show its empty composer
+OPENCODE_SESSION_SECONDS = 60       # how long after the first prompt the `ses_…` id may take to appear
+OPENCODE_NOT_SENT = {"agent_blocked"}  # `agent prompt` codes that refuse before typing; any other failure may have typed
+# a lane being started counts (and holds its name) this long without a session: the whole spawn path and a margin
+OPENCODE_RESERVE_SECONDS = (SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + SPAWN_BUSY_RETRIES * SPAWN_BUSY_PAUSE_SECONDS
+                            + OPENCODE_MARKER_SECONDS + 2 * OPENCODE_FIRST_PROMPT_SECONDS + 15
+                            + OPENCODE_SESSION_SECONDS + 60)
+OPENCODE_NO_SLEEP = ("opencode lanes don't sleep yet: a wake must first prove the guardrail shim loaded "
+                     "(ansible-orchestration plan.opencode-herdr.md Phase 6)")
 
 
 def spawn_cwd_problem(raw: str) -> tuple[Path | None, str | None]:
@@ -3855,6 +3929,8 @@ def spawn_args_problem(kind: str, extra: list[str]) -> str | None:
     """Why these agent flags may not go to a spawned session, or None. Values are never echoed."""
     if any(RESUME_CONTROL.search(a) for a in extra):
         return "agent arguments contain control characters"
+    if kind == "opencode":
+        return opencode_args_problem(extra)
     if kind != "claude":
         return None
     if any(a.startswith("-n") or a.startswith("--name") for a in extra):
@@ -3867,6 +3943,211 @@ def spawn_args_problem(kind: str, extra: list[str]) -> str | None:
     return None
 
 
+def opencode_args_problem(extra: list[str]) -> str | None:
+    """Only `-m/--model <provider/model>` may go to a spawned opencode lane. Everything else is refused:
+    -s/-c/--fork select a session, --prompt puts text into argv (readable with `ps`), --pure drops the
+    guardrail plugin, --port/--hostname open a server, --agent picks a mode the policy did not vet, and a
+    positional is a path or a subcommand (`serve`, `run`, `auth`)."""
+    i = 0
+    while i < len(extra):
+        a = extra[i]
+        base = a.split("=", 1)[0]
+        if base in OPENCODE_SPAWN_VALUE_OPTIONS:
+            if "=" not in a:
+                if i + 1 >= len(extra) or extra[i + 1].startswith("-"):
+                    return f"{a} is missing its value"
+                i += 1
+            i += 1
+            continue
+        if a.startswith("-"):
+            return f"opencode lanes take only -m/--model; {base} is refused"
+        return "opencode lanes take no positional arguments (a path or a subcommand)"
+    return None
+
+
+def opencode_policy() -> tuple[dict | None, str | None]:
+    """(the installed opencode-ao policy, None) or (None, why no lane may start on this machine). The
+    file is root-owned (Ansible): one this account could write is no proof the shim was installed."""
+    try:
+        st = OPENCODE_POLICY.stat()
+        policy = json.loads(OPENCODE_POLICY.read_text())
+    except FileNotFoundError:
+        return None, f"no opencode guardrail on this machine ({OPENCODE_POLICY} missing)"
+    except (OSError, ValueError) as exc:
+        return None, f"the opencode policy {OPENCODE_POLICY} is unreadable ({type(exc).__name__})"
+    if st.st_uid != OPENCODE_POLICY_UID or st.st_mode & 0o022:
+        return None, f"the opencode policy {OPENCODE_POLICY} is not root-owned and write-protected"
+    if not isinstance(policy, dict) or not isinstance(policy.get("klinikon_roots"), list):
+        return None, f"the opencode policy {OPENCODE_POLICY} has no klinikon_roots"
+    try:
+        lanes = int(policy.get("max_lanes"))
+    except (TypeError, ValueError):
+        return None, f"the opencode policy {OPENCODE_POLICY} has no max_lanes"
+    return {**policy, "max_lanes": lanes}, None
+
+
+def opencode_cwd_problem(cwd: Path, policy: dict) -> str | None:
+    """Why an opencode lane may not run in cwd, or None. Checked at spawn and again at every wake: a
+    `git pull` while a lane sleeps can bring project config in, and `.opencode/plugins/*.js` runs at
+    startup with no config entry (Phase 0, B3)."""
+    real = Path(os.path.realpath(cwd))
+    for root in policy.get("klinikon_roots") or []:
+        r = Path(os.path.realpath(os.path.expanduser(str(root))))
+        if real == r or r in real.parents:
+            return f"{cwd} is in the Klinikon tree {root}; no opencode there (D12)"
+    home = Path(str(policy.get("home") or os.path.expanduser("~")))
+    if (home / ".opencode").exists():
+        return f"{home / '.opencode'} exists; opencode would load it"
+    top = next((d for d in (real, *real.parents) if (d / ".git").exists()), real)
+    dirs = [real, *[d for d in real.parents if top in (d, *d.parents)]]
+    global_skills = {str(s) for s in policy.get("builtin_skills") or []}
+    for d in policy.get("skill_dirs") or []:
+        global_skills |= skill_names(Path(str(d)))
+    for d in dirs:
+        if (d / ".opencode").exists():
+            return f"{d / '.opencode'} exists (project plugins, agents or config)"
+        for name in OPENCODE_TUI_CONFIGS:
+            if (d / name).exists():
+                return f"{d / name} exists (TUI plugins load outside the guardrail)"
+        for name in OPENCODE_INSTRUCTIONS:
+            path = d / name
+            if path.is_symlink() and top not in Path(os.path.realpath(path)).parents:
+                return f"{path} links out of the checkout (opencode reads it at start, with no guardrail)"
+        for name in OPENCODE_PROJECT_CONFIGS:
+            path = d / name
+            if not path.exists():
+                continue
+            try:
+                config = jsonc_loads(path.read_text())
+            except (OSError, ValueError):
+                return f"{path} is unreadable or not valid JSON(C)"
+            keys = sorted(set(config) - OPENCODE_HARMLESS_KEYS) if isinstance(config, dict) else ["(not an object)"]
+            if keys:
+                return f"{path} sets {', '.join(keys)} (only {', '.join(sorted(OPENCODE_HARMLESS_KEYS))} may be set)"
+        for sub in OPENCODE_PROJECT_SKILL_DIRS:
+            shadow = sorted(skill_names(d / sub) & global_skills)
+            if shadow:
+                return f"{d / sub} shadows global skill(s) {', '.join(shadow)}"
+    return None
+
+
+def jsonc_loads(text: str) -> object:
+    """JSON with // and /* */ comments and trailing commas, as opencode reads its config; ValueError if not."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise ValueError("unterminated comment")
+            out.append(" ")
+            i = end + 2
+        else:
+            out.append(c)
+            i += 1
+    return json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+
+
+def skill_names(root: Path, depth: int = 0) -> set[str]:
+    """The skill names below root as the guardrail shim finds them (opencode-ao-hooks.js skillFiles,
+    skillName): every SKILL.md up to five levels down, named by its front matter, else by its folder."""
+    names: set[str] = set()
+    if depth > 5:
+        return names
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return names
+    for e in entries:
+        if e.name == "SKILL.md":
+            try:
+                head = Path(e.path).read_text(errors="replace")[:4000]
+            except OSError:
+                head = ""
+            front = re.split(r"^---\s*$", head, flags=re.M)[1] if head.startswith("---") and head.count("---") > 1 else ""
+            m = re.search(r"""^name:\s*["']?([^"'\n]+?)["']?\s*$""", front, re.M)
+            names.add(m.group(1).strip() if m else root.name)
+        elif e.is_dir():  # follows symlinks, as the shim does
+            names |= skill_names(Path(e.path), depth + 1)
+    return names
+
+
+def opencode_shim_problem(pane: str, policy: dict, since: float) -> str | None:
+    """Why the lane's opencode can't be shown to run the guardrail shim, or None. A plugin that fails
+    to load fails silently (Phase 0), so the shim writes `<marker_dir>/shim-<pid>.json` after its
+    self-test passed; it must name the pane's opencode pid, carry the installed shim's sha256, and be
+    written after `since` (a marker of an earlier process with the same pid doesn't count)."""
+    shim = OPENCODE_POLICY.parent / "opencode-ao-hooks.js"
+    try:
+        want = hashlib.sha256(shim.read_bytes()).hexdigest()
+    except OSError:
+        return f"the guardrail shim {shim} is unreadable"
+    if not policy.get("marker_dir"):
+        return "the opencode policy names no marker_dir"
+    marker_dir = Path(str(policy["marker_dir"]))
+    for _ in range(OPENCODE_MARKER_SECONDS * 2):
+        present, _argv, pid = agent_process(pane, "opencode")
+        if present is True and isinstance(pid, int) and pid > 1:
+            try:
+                mark = json.loads((marker_dir / f"shim-{pid}.json").read_text())
+            except (OSError, ValueError):
+                mark = None
+            if isinstance(mark, dict) and mark.get("pid") == pid and mark.get("sha256") == want \
+                    and isinstance(mark.get("at"), (int, float)) and mark["at"] / 1000 >= since - 2:
+                return None
+        time.sleep(0.5)
+    return (f"the lane's opencode showed no guardrail load marker within {OPENCODE_MARKER_SECONDS}s "
+            "(the shim did not load, or its self-test failed)")
+
+
+def opencode_lanes(agents: list[dict], exclude: str | None = None) -> int:
+    """opencode lanes on this machine: live opencode panes plus spawns still waiting for their session
+    (reserved under the lock by cmd_spawn). Caller holds the global lock."""
+    live = {a["pane_id"] for a in agents if a.get("agent") == "opencode"}
+    pending = sum(1 for name, rec in spawned_records().items()
+                  if name != exclude and opencode_reserved(rec) and rec.get("pane") not in live)
+    return len(live) + pending
+
+
+def renew_reservation(name: str, token: str, **fields: object) -> str | None:
+    """Under the lock: refresh our reservation's clock (and add fields), after checking it is still
+    ours and the machine still has room for it; why not, or None. A slow step (a shell that takes long,
+    a slow `agent start`) must not let the reservation run out and its lane go to another spawn."""
+    policy, why = opencode_policy()
+    if why:
+        return why
+    with locked():
+        rec = spawned_records().get(name)
+        if rec is None or rec.get("token") != token:
+            return f"the reservation for {name} was lost (it ran out, or another spawn took the name)"
+        lanes = opencode_lanes(list_agents(), exclude=name)
+        if lanes >= (policy or {})["max_lanes"]:
+            return f"this machine runs {lanes} opencode lane(s) now, the most it allows"
+        record_spawned(name, {**rec, **fields, "at": dt.datetime.now().isoformat(timespec="seconds")})
+    return None
+
+
+def opencode_reserved(rec: dict | None) -> bool:
+    """Is this spawn record an opencode lane still starting (no session yet, within OPENCODE_RESERVE_SECONDS)?"""
+    if not rec or rec.get("kind") != "opencode" or rec.get("uuid"):
+        return False
+    try:
+        age = time.time() - dt.datetime.fromisoformat(str(rec.get("at"))).timestamp()
+    except ValueError:
+        return False
+    return 0 <= age < OPENCODE_RESERVE_SECONDS
+
+
 def name_taken(name: str, agents: list[dict]) -> str | None:
     """Where a session or agent called name already is, or None."""
     for a in agents:
@@ -3875,6 +4156,12 @@ def name_taken(name: str, agents: list[dict]) -> str | None:
     for key, e in read_json(JOURNAL).items():
         if valid_entry(e) and name in (e.get("name"), e.get("claude_name"), wake_name(e)):
             return f"asleep in {key}"
+    rec = spawned_records().get(name)
+    if rec is not None:
+        live = {(a.get("agent_session") or {}).get("value") for a in agents if a.get("agent")} - {None}
+        if (rec.get("uuid") and rec["uuid"] in live) or (rec.get("pane") and not rec.get("uuid")
+                                                         and any(a["pane_id"] == rec["pane"] for a in agents)):
+            return f"spawned in {rec.get('pane')}"
     return None
 
 
@@ -3996,6 +4283,48 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     if taken:
         print(f"spawn: a session named {args.name} is {taken}; pick another name", file=sys.stderr)
         return 1
+    token: str | None = None  # an opencode lane's reservation in spawned.json, ours until the lane runs
+    if args.kind == "opencode":
+        policy, why = opencode_policy()
+        why = why or opencode_cwd_problem(cwd, policy or {})
+        if not why:
+            # counted and reserved under the lock: two spawns at once must not both see a free lane
+            # the name is checked again from fresh state: another spawn may have taken it meanwhile
+            with locked():
+                fresh = list_agents()
+                lanes = opencode_lanes(fresh)
+                taken = name_taken(args.name, fresh)
+                if opencode_reserved(spawned_records().get(args.name)):
+                    why = f"a spawn named {args.name} is starting already"
+                elif taken:
+                    why = f"a session named {args.name} is {taken}; pick another name"
+                elif lanes >= (policy or {})["max_lanes"]:
+                    why = f"this machine already runs {lanes} opencode lane(s), the most it allows"
+                else:
+                    token = os.urandom(8).hex()
+                    record_spawned(args.name, {"pane": None, "kind": "opencode", "cwd": str(cwd), "by": sender,
+                                               "uuid": None, "token": token,
+                                               "at": dt.datetime.now().isoformat(timespec="seconds")})
+        if why:
+            event("spawn-refused", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, reason=why)
+            print(f"spawn: {why}", file=sys.stderr)
+            return 1
+    try:
+        return spawn_started(args, cwd, body, extra, sender, agents, token)
+    finally:
+        if token:
+            # our reservation, if it never became a lane, must not hold one; a list that fails leaves it
+            # to run out (OPENCODE_RESERVE_SECONDS) and prune_spawned
+            with contextlib.suppress(SleeperError), locked():
+                rec = spawned_records().get(args.name)
+                live = {a["pane_id"] for a in list_agents() if a.get("agent") == "opencode"}
+                if rec is not None and rec.get("token") == token and rec.get("pane") not in live:
+                    record_spawned(args.name, None)
+
+
+def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[str], sender: str,
+                  agents: list[dict], token: str | None = None) -> int:
+    """cmd_spawn past its checks: the tab, the agent and its first prompt."""
     workspace = args.workspace or caller_workspace(agents)
     try:
         made = herdr("tab", "create", "--cwd", str(cwd), "--label", args.name, "--no-focus",
@@ -4004,6 +4333,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     except (SleeperError, KeyError, TypeError) as exc:
         print(f"spawn: could not create a tab: {exc}", file=sys.stderr)
         return 1
+    if token:  # the reservation now names its pane (cmd_spawn drops it if no lane runs there)
+        lost = renew_reservation(args.name, token, pane=pane, tab=tab)
+        if lost:
+            with contextlib.suppress(SleeperError):
+                close_tab_or_pane(pane, tab)
+            print(f"spawn: {lost}; tab {tab} closed", file=sys.stderr)
+            return 1
     for _ in range(SPAWN_SHELL_SECONDS * 2):
         if pane_at_shell(pane) is True:
             break
@@ -4016,6 +4352,14 @@ def cmd_spawn(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     argv = (["-n", args.name] if args.kind == "claude" else []) + extra
+    lost = renew_reservation(args.name, token) if token else None  # the shell may have taken long
+    if lost:
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="reservation-lost")
+        print(f"spawn: {lost}; tab {tab} closed", file=sys.stderr)
+        return 1
+    started_at = time.time()
     try:
         # agent_pane_busy is a refusal before anything is typed: a fresh shell still busy with its
         # startup (prompt hooks, a slow `git status` in a big checkout) answers it for a moment, and
@@ -4039,6 +4383,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code=code)
         print(f"spawn: {args.name} did not start ({code or exc}){hint}; tab {tab} closed", file=sys.stderr)
         return 1
+    if args.kind == "opencode":
+        return spawn_first_prompt(args, pane, tab, made["tab"].get("workspace_id"), cwd, body, sender, started_at,
+                                  token)
     uuid = ((started.get("agent") or {}).get("agent_session") or {}).get("value")
     for _ in range(WAKE_CONFIRM_SECONDS):
         if valid_session_id(uuid):
@@ -4066,6 +4413,87 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     out = {"name": args.name, "pane": pane, "tab": tab, "session": uuid, "prompt": "delivered" if code == 0 else "queued"}
     print(json.dumps(out) if args.json else f"spawned {args.name} in {pane} (tab {tab}, session {uuid}); {text}")
     return code
+
+
+def spawn_first_prompt(args: argparse.Namespace, pane: str, tab: str, workspace: str | None, cwd: Path,
+                       body: str, sender: str, started_at: float, token: str | None = None) -> int:
+    """An opencode lane has no session until its first prompt: prove the guardrail shim loaded, wait
+    for the home screen's empty composer, type the envelope (pasted, so `@`/`!` stay text, and never
+    in argv where `ps` shows it), then wait for the `ses_…` id. Exit 0 typed and session known, 3 typed
+    (or perhaps typed) but no session yet, 1 failed."""
+    policy, why = opencode_policy()
+    why = why or opencode_shim_problem(pane, policy or {}, started_at)
+    if why:  # nothing typed yet: an unguarded opencode is closed, not handed work
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="no-shim-marker")
+        print(f"spawn: {args.name}: {why}; tab {tab} closed", file=sys.stderr)
+        return 1
+    ready = False
+    for _ in range(OPENCODE_FIRST_PROMPT_SECONDS * 2):
+        agent = next((a for a in list_agents() if a["pane_id"] == pane), None)
+        if agent and agent.get("agent") == "opencode" and agent.get("agent_status") in ("idle", "done") \
+                and opencode_composer_state(herdr_screen(pane))[0] == "empty":
+            ready = True
+            break
+        time.sleep(0.5)
+    if not ready:  # nothing typed yet: an onboarding, provider or error screen is no lane worth keeping
+        with contextlib.suppress(SleeperError):
+            close_tab_or_pane(pane, tab)
+        event("spawn-failed", name=args.name, by=sender, cwd=str(cwd), kind=args.kind, code="agent_not_ready")
+        print(f"spawn: {args.name} never showed an empty composer within {OPENCODE_FIRST_PROMPT_SECONDS}s "
+              f"(agent_not_ready); tab {tab} closed", file=sys.stderr)
+        return 1
+    from_pane = own_pane()
+    msg = {"id": hashlib.sha256(f"{sender}\0{pane}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16],
+           "from": sender, "to": None, "at": dt.datetime.now().isoformat(timespec="seconds"), "body": body}
+    typed, failed = True, None
+    try:
+        herdr("agent", "prompt", pane, opencode_safe(envelope(msg)), "--wait", "--until", "working",
+              "--timeout", str(OPENCODE_FIRST_PROMPT_SECONDS * 1000), timeout=OPENCODE_FIRST_PROMPT_SECONDS + 15)
+    except SleeperError as exc:
+        # Herdr's detail may quote the text; only the code is kept. Only a refusal before input is sure
+        # to have typed nothing; a stall, a timeout (ours or Herdr's) may have submitted it, so the
+        # session poll below decides.
+        failed = getattr(exc, "code", None) or "no answer"
+        typed = failed not in OPENCODE_NOT_SENT
+    uuid = None
+    for _ in range(OPENCODE_SESSION_SECONDS if typed else 0):
+        uuid = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session") or {}).get("value")
+        if valid_session_id(uuid):
+            break
+        time.sleep(1)
+    uuid = uuid if valid_session_id(uuid) else None
+    rec = {"pane": pane, "tab": tab, "workspace": workspace, "kind": args.kind, "cwd": str(cwd), "by": sender,
+           "from_pane": from_pane, "uuid": uuid, "at": dt.datetime.now().isoformat(timespec="seconds")}
+    with locked():  # only over our own reservation: a record another spawn holds by now stays
+        held = spawned_records().get(args.name)
+        if token is None or held is None or held.get("token") == token:
+            record_spawned(args.name, rec)
+        else:
+            event("spawn-record-kept", name=args.name, pane=pane, reason="the name went to another spawn")
+    event("spawned", name=args.name, pane=pane, tab=tab, uuid=uuid, kind=args.kind, cwd=str(cwd),
+          by=sender, from_pane=from_pane)
+    if not typed:
+        print(f"spawned {args.name} in {pane} (tab {tab}), but its first prompt could not be typed "
+              f"(type it with `herdr agent prompt {pane} …`)", file=sys.stderr)
+        return 1
+    if uuid is None:
+        event("deliver-unconfirmed", id=msg["id"], sender=sender, from_pane=from_pane, to=args.name, pane=pane,
+              bytes=len(body.encode()), error=failed)
+        what = (f"may have been typed (`agent prompt`: {failed}); look at the pane before sending it again"
+                if failed else "was typed")
+        print(f"spawned {args.name} in {pane} (tab {tab}); the first prompt (msg {msg['id']}) {what}, but no "
+              f"session id appeared within {OPENCODE_SESSION_SECONDS}s", file=sys.stderr)
+        return 3
+    msg["to"] = uuid
+    archive_message(msg)
+    mark_delivered(msg["id"])
+    event("delivered", id=msg["id"], sender=sender, to=args.name, pane=pane, uuid=uuid, bytes=len(body.encode()))
+    out = {"name": args.name, "pane": pane, "tab": tab, "session": uuid, "prompt": "delivered"}
+    print(json.dumps(out) if args.json else
+          f"spawned {args.name} in {pane} (tab {tab}, session {uuid}); delivered msg {msg['id']}")
+    return 0
 
 
 def close_refusals(state: str, hit: dict, uuid: str) -> list[str]:
@@ -6298,16 +6726,20 @@ def presence_rows() -> list[dict]:
         claims = insomnia_claims()
     except SleeperError:
         claims = {}  # cmd_presence prints the warning
-    spawners = {r.get("uuid"): r.get("by") for r in spawned_records().values() if r.get("uuid")}
+    records = spawned_records()
+    spawners = {r.get("uuid"): r.get("by") for r in records.values() if r.get("uuid")}
+    spawned_names = {r.get("uuid"): n for n, r in records.items() if r.get("uuid")}
     closing = read_self_closes()
     agents = list_agents()
     places = ui_places(agents)
     for a in agents:
         if not a.get("agent") or a.get("agent") in (CLAIM_AGENT, ASK_AGENT):
             continue
-        rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name"), "pane": a["pane_id"],
+        session = (a.get("agent_session") or {}).get("value")
+        rows.append({"state": a.get("agent_status") or "unknown", "name": a.get("name") or spawned_names.get(session),
+                     "pane": a["pane_id"],
                      "place": places.get(a["pane_id"]), "kind": a.get("agent"), "cwd": a.get("cwd"),
-                     "session": (a.get("agent_session") or {}).get("value"), "slept_at": None})
+                     "session": session, "slept_at": None})
         rows[-1]["insomnia"] = insomnia_label(claims[rows[-1]["session"]]) if rows[-1]["session"] in claims else None
     for key, e in sorted(read_json(JOURNAL).items()):
         if not valid_entry(e):
@@ -6389,6 +6821,7 @@ SSH_BIN = "/usr/bin/ssh"
 REMOTE_SECONDS = 20                 # presence, insomnia list, close: one round trip
 REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for all machines together
 REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
+# also covers an opencode lane's composer wait, first prompt and session poll (about 135 s) in place of the delivery
 REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
 PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "place", "kind", "cwd", "session", "slept_at",
                    "insomnia", "spawned_by", "mail_queued", "mail_oldest_s", "mail_held",
@@ -9314,6 +9747,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--machine", help="list a Herdr saved machine's agents instead of this one's")
     pp.add_argument("--all", action="store_true", help="this machine and every enabled saved machine")
     pp.set_defaults(fn=cmd_presence)
+    wp = sub.add_parser("whoami", help="the calling agent's name, machine, pane, place and session")
+    wp.add_argument("--json", action="store_true")
+    wp.set_defaults(fn=cmd_whoami)
     spp = sub.add_parser("spawn", help="new tab + named agent, first prompt on stdin")
     spp.add_argument("--cwd", required=True, help=f"a checkout below {SPAWN_ROOT}")
     spp.add_argument("--name", required=True, help="the session name (claude -n), also the Herdr agent name")

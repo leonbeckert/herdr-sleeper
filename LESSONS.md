@@ -257,7 +257,8 @@ observed]*
   `deliver mini2/taxi-orch` failed with "no live or sleeping agent matches" in the middle of a prod-deploy
   hand-off. Resolution looked only at pane id, Herdr name and session id for live agents.
 - *Instead:* when nothing matches, fall back to the Claude session name in the transcript (`agent-name`
-  records), refusing on more than one match, live or sleeping, as everywhere else.
+  records), refusing on more than one match, live or sleeping, as everywhere else. opencode keeps no session name,
+  so a spawned session also answers to its name in `spawned.json` (by session id), for every kind.
 
 **4.8 A turn that died on an API error looks idle.** *[version-specific: Claude Code 2.1.x]*
 - *Trap:* when the network drops, Claude Code retries for about three minutes, then ends the turn on
@@ -277,6 +278,15 @@ observed]*
   shared record of it outlives the probe whenever it cannot be replaced. Count the notes in the transcript over a
   fixed window, not since the last output: a flapping link produces partial output before each new error, so a counter
   that resets on output never stops.
+
+**4.9 An agent whose session exists only after its first prompt.** *[version-specific: opencode 1.19.x, Herdr
+0.9.5]*
+- *Trap:* opencode reports its `ses_…` id only once the first prompt made the route a session, so the mailbox
+  (keyed by session) has nowhere to queue a spawn's first prompt. `--prompt` would put the text into argv, where
+  every local account reads it with `ps`, and with `-s` it neither submits nor pre-fills.
+- *Instead:* wait for the home screen's empty composer, paste the envelope with `herdr agent prompt --wait --until
+  working`, then poll `pane get` for the id and archive the message under it. A lane that is starting has no
+  session yet, so the lane cap counts a reservation made under the lock, keyed by the spawn name.
 
 ## 5. Unknown is not absent
 
@@ -613,7 +623,8 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
 - *Server down:* the external watcher, running across a `server stop` with a 4–10 s gap, logged "herdr server
   not reachable … retrying every 3s" once and "reachable again after 2 tick(s)", then re-claimed A in the same
   tick. Pass (after counting `server_unavailable`).
-- *Not covered:* a real macOS reboot or loginwindow restart; an awake session busy at the restart; opencode;
+- *Not covered:* a real macOS reboot or loginwindow restart; an awake session busy at the restart; opencode
+  (ansible-orchestration plan.opencode-herdr.md Phase 6);
   Python 3.12 for the in-pane stub. A best-effort `agent rename` back to the slept name failed once right after a
   stub wake (`agent_not_found`, the agent was not registered yet); logged, not retried. Live on 2026-11-06 it
   failed for both agents woken by `deliver`, so they could no longer be addressed by name. Since v0.1.4 the

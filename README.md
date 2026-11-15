@@ -151,9 +151,8 @@ Mail into an opencode pane gets a word joiner (U+2060) in front of every
 `@` and `!` that starts a token: a typed `@path` becomes an attachment opencode
 reads itself and a leading `!` a shell command, both past its guardrail plugin.
 `agent prompt` pastes, which kept them as text in the lab; the joiner keeps
-them text regardless. Sleeping opencode panes needs `opencode` in `agents`
-(the host config); its sleep guards are the same as claude's, without the
-transcript checks.
+them text regardless. opencode panes are never slept for now, whatever
+`agents` says (v0.1.35, "opencode lanes" below).
 
 ### Restarts and reboots
 
@@ -580,7 +579,7 @@ An orchestrator starts named sessions and closes them again:
 
 ```sh
 echo "build B-17 in this worktree" | herdr-sleeper spawn --cwd ~/development/app-b17 \
-    --name app-b17 [--kind claude|codex] [--from orc] [--workspace w3] [--json] \
+    --name app-b17 [--kind claude|codex|opencode] [--from orc] [--workspace w3] [--json] \
     [-- --dangerously-skip-permissions --model opus]
 herdr-sleeper close app-b17 [--force]
 herdr-sleeper close --self [--reason "B-17 done"]   # from inside the session: close me once this turn ends
@@ -610,6 +609,60 @@ An agent that does not get ready (`agent_not_ready`: a folder-trust or login
 prompt; spawn never answers one) has its tab closed again, since nothing was
 typed into it, and logs `spawn-failed`. Exit codes: 0 started and prompted,
 3 started with the prompt queued, 1 refused or failed, 2 bad input.
+
+### opencode lanes (`--kind opencode`, *v0.1.35*)
+
+An opencode lane is spawned only on a machine with the opencode-ao guardrail
+installed: `/usr/local/libexec/opencode-ao/policy.json`, root-owned and not
+group- or world-writable (ansible-orchestration `docs/macos/plan.opencode-herdr.md`).
+Without it (the MacBook) the spawn is refused. It is refused as well:
+
+- for a cwd in the policy's Klinikon roots;
+- for a checkout (from the cwd up to its git root) with a `.opencode/`
+  directory, a `tui.json(c)` (its plugins load in the TUI, outside the
+  guardrail), an `opencode.json(c)` that is not valid JSON(C) or sets any key
+  but `$schema`, `theme`, `keybinds`, `username`, `share`, `tui` and `layout`,
+  an `AGENTS.md`, `CLAUDE.md` or `CONTEXT.md` that links out of the checkout
+  (opencode reads them at start, with no hook), or a project skill in
+  `.claude/skills` or `.agents/skills` that has the name of a global or
+  built-in one (found as the shim finds skills: every `SKILL.md` up to five
+  levels down, named by its front matter);
+- when `~/.opencode` exists;
+- on a machine already at the policy's `max_lanes`.
+
+The lanes are counted, the name re-checked and the new lane reserved under the
+global lock, so two spawns at once can't both take the last lane or the same
+name. The reservation carries a token; it is renewed (ownership and room
+checked again) once the tab exists and again right before `agent start`, and
+only its owner updates or drops it.
+
+After `--` only `-m/--model <provider/model>` is accepted; the session keeps
+its model when resumed with `-s <id>`, so nothing has to be replayed. Then:
+
+1. the shim must prove it loaded: within 10 s a load marker
+   `<marker_dir>/shim-<pid>.json` for the pane's opencode pid, with the
+   installed shim's sha256, written after the start. Otherwise the tab is
+   closed (a plugin that fails to load is silent in opencode);
+2. the home screen's empty composer, within 30 s (anything else is
+   `agent_not_ready`, and the tab is closed);
+3. the envelope is pasted with `herdr agent prompt --wait --until working`
+   (never `--prompt`: argv is readable with `ps`);
+4. opencode reports its session id only with the first prompt, so `spawn`
+   waits up to 60 s for the `ses_…` id.
+
+Only `agent_blocked` means the prompt was not typed (exit 1, the lane stays).
+Any other failure, a timeout included, may have typed it, so the session poll
+decides; with no session the exit is 3 and the message says to look at the
+pane before sending it again. The lane stays open and keeps its name.
+
+opencode lanes don't sleep yet: `assess` refuses them, and `wake` and the
+in-pane stub refuse an opencode row, until a wake checks the shim's marker too
+(the plan's Phase 6).
+
+A spawned session answers to its spawn name even when Herdr has dropped the
+agent's name (`deliver`, `close`, `presence`, the default `--from`), for every
+kind. `herdr-sleeper whoami [--json]` prints the calling agent's name, its
+`<machine>/<name>` address, pane, place, kind and session.
 
 `close` takes a spawn name, pane id, agent name, wake name or session id.
 Under the global lock and the session's mailbox lock, from fresh state, it
@@ -1014,13 +1067,13 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 643 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 696 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
 (the fake `herdr` has a `restart()`), the 3.9 TOML subset parser, and legacy
 migration, insomnia claims and their expiry, staleness and damage, spawn
-and close (and `close --self`), the opencode composer (fixtures of the 1.19.4 screens), the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), auto-resume (its
+and close (and `close --self`), the opencode composer (fixtures of the 1.19.4 screens) and opencode lanes, the limit menu and one-time dialogs (fixtures of the 2.1.306 screens), auto-resume (its
 classifier rows on 2.1.231–2.1.322 record shapes, the gate on a fake clock with a 60 s poll; an autouse fixture keeps
 every test off the network), against a fake `herdr`; the other-machine paths against a fake `ssh`; and the CLI's real output shapes (the
 "ok" calls answer success with nothing). v0.1.3 was run on Python 3.9 (Apple's

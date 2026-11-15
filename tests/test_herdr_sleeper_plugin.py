@@ -4,6 +4,7 @@ machine, the watcher tick, the focus hook, and the in-pane stub — against a fa
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import os
@@ -131,6 +132,8 @@ class FakeHerdr:
         self.stub_execs_on_enter = False    # Enter to a stub pane resumes the stub's session
         self.start_reports_session = True   # agent start answers with the session id (else it is learned later)
         self.start_session_appears = True   # ... and it then shows up in `pane get`
+        self.prompt_starts_session = False  # opencode: a fresh start has no session until its first prompt
+        self.prompt_error: tuple[str | None] | None = None  # `agent prompt` fails with this code (after typing)
         self.taken_names: set[str] = set()  # agent names `agent start` rejects as taken
         self.empty_argv = False             # process-info lists the agent with no readable argv
         self.empty_foreground = False       # process-info answers with [] (Herdr could not see the job)
@@ -339,15 +342,19 @@ class FakeHerdr:
                 raise sleeper.HerdrError(f"herdr agent start failed: {{'code': '{code}'}}", code)
             if self.start_error:
                 raise sleeper.HerdrError(f"herdr agent start failed: {{'code': '{self.start_error}'}}", self.start_error)
-            uuid = self.start_uuid or (args[args.index("--resume") + 1] if "--resume" in args else self.spawn_uuid)
+            uuid = self.start_uuid or (args[args.index("--resume") + 1] if "--resume" in args
+                                       else args[args.index("-s") + 1] if "-s" in args else self.spawn_uuid)
             kind = args[args.index("--kind") + 1]
             a = by_pane[pane]
             if "--resume" not in args:
                 a["name"] = args[2]
                 a["agent_status"] = "idle"
+            fresh_opencode = self.prompt_starts_session and kind == "opencode" and "-s" not in args
             a.update(agent=kind, agent_session={"value": uuid} if self.start_session_appears else None)
-            if not self.start_session_appears:
+            if not self.start_session_appears or fresh_opencode:
                 a.pop("agent_session")
+            if fresh_opencode:
+                return {"agent": {}}
             a["started_name"] = args[2]
             self.stub_panes.discard(pane)
             return {"agent": {"agent_session": {"value": uuid}}} if self.start_reports_session else {"agent": {}}
@@ -395,6 +402,12 @@ class FakeHerdr:
             if args[:2] == ("pane", "rename"):
                 assert len(args) > 3, "bare `pane rename <pane>` is a usage error in real herdr"
                 by_pane[args[2]]["label"] = None if args[3] == "--clear" else args[3]
+            typed_in = not (self.prompt_error and self.prompt_error[0] in sleeper.OPENCODE_NOT_SENT)
+            if args[:2] == ("agent", "prompt") and self.prompt_starts_session and typed_in \
+                    and by_pane[args[2]].get("agent") == "opencode":
+                by_pane[args[2]].setdefault("agent_session", {"value": OC_SESSION})
+            if args[:2] == ("agent", "prompt") and self.prompt_error:
+                raise sleeper.HerdrError("herdr agent prompt failed", self.prompt_error[0])
             if args[:2] == ("pane", "send-keys") and args[2] in self.stub_panes and self.stub_execs_on_enter:
                 by_pane[args[2]].update(agent="claude", agent_session={"value": self.stub_uuid})
                 self.stub_panes.discard(args[2])
@@ -668,11 +681,11 @@ def test_assess_requires_transcript_for_claude(state: Path) -> None:
     assert not ok and "no transcript" in reason
 
 
-def test_assess_opencode_needs_no_transcript(state: Path) -> None:
+def test_assess_never_sleeps_opencode_yet(state: Path) -> None:
     since = time.time() - 13 * 3600
     a = agent(kind="opencode", uuid="sess-1")
-    ok, _reason, _ = sleeper.assess(a, [a], 12, {}, idle_since=since)
-    assert ok
+    ok, reason, _ = sleeper.assess(a, [a], 12, {}, idle_since=since)
+    assert not ok and reason == sleeper.OPENCODE_NO_SLEEP              # until a wake checks the shim marker
 
 
 @pytest.mark.parametrize(
@@ -1888,6 +1901,10 @@ def test_uuid_live_elsewhere_continue_cwd_and_ps_failure(fake: FakeHerdr, monkey
     monkeypatch.setattr(sleeper.subprocess, "run", Ps(["7 claude --continue"]))
     monkeypatch.setattr(sleeper, "process_cwd", lambda pid: "/tmp/proj")
     assert "--continue" in REAL_UUID_LIVE(UUID, cwd="/tmp/proj")
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps(["8 /usr/local/libexec/opencode/1.19.4/opencode -c"]))
+    assert "opencode --continue in /tmp/proj" in REAL_UUID_LIVE(UUID, cwd="/tmp/proj")
+    assert REAL_UUID_LIVE(UUID, cwd="/tmp/other") is None
+    monkeypatch.setattr(sleeper.subprocess, "run", Ps(["7 claude --continue"]))
     monkeypatch.setattr(sleeper, "process_cwd", lambda pid: None)
     with pytest.raises(sleeper.SleeperError):
         REAL_UUID_LIVE(UUID, cwd="/tmp/proj")
@@ -7513,3 +7530,375 @@ def test_close_and_close_self_work_for_opencode(fake: FakeHerdr, monkeypatch: py
     fake.screen = oc_screen("09-idle-after")
     sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
     assert fake.signals and UUID not in _closing()
+
+
+# ------------------------------------------- opencode lanes: spawn, refusals, names (Phase 4b)
+
+OC_SESSION = "ses_1a2b3c4d5e6fAbCdEfGhIjKl"
+
+
+@pytest.fixture
+def oc_policy(state: Path, checkout: Path, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """An installed opencode-ao policy (as this test's user: the root-owner check is pointed at it)."""
+    home = state / "home"
+    (home / ".claude" / "skills" / "glab").mkdir(parents=True)
+    (home / ".claude" / "skills" / "glab" / "SKILL.md").write_text("---\nname: glab\n---\nGitLab\n")
+    policy = {"home": str(home), "klinikon_roots": [str(state / "development" / "klinikon")], "max_lanes": 2,
+              "skill_dirs": [str(home / ".claude" / "skills")], "builtin_skills": ["customize-opencode"]}
+    policy["marker_dir"] = str(state / "markers")
+    path = state / "policy.json"
+    path.write_text(json.dumps(policy))
+    path.chmod(0o644)
+    (state / "opencode-ao-hooks.js").write_text("// the shim\n")
+    monkeypatch.setattr(sleeper, "OPENCODE_POLICY", path)
+    monkeypatch.setattr(sleeper, "OPENCODE_POLICY_UID", os.getuid())
+    real = sleeper.agent_process
+    monkeypatch.setattr(sleeper, "agent_process", lambda pane, kind: (True, [], OC_PID) if kind == "opencode"
+                        else real(pane, kind))
+    _marker(policy)
+    fake.prompt_starts_session = True
+    fake.screen = oc_screen("01-firstrun")
+    return policy
+
+
+OC_PID = 4242
+
+
+def _marker(policy: dict[str, Any], at: float | None = None, sha256: str | None = None) -> Path:
+    """The load marker the shim writes once its self-test passed (opencode-ao-hooks.js writeMarker)."""
+    digest = sha256 or hashlib.sha256((sleeper.OPENCODE_POLICY.parent / "opencode-ao-hooks.js").read_bytes()).hexdigest()
+    path = Path(policy["marker_dir"]) / f"shim-{OC_PID}.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"pid": OC_PID, "ppid": 1, "at": int((at or time.time()) * 1000), "sha256": digest}))
+    return path
+
+
+def _write_policy(policy: dict[str, Any]) -> None:
+    sleeper.OPENCODE_POLICY.write_text(json.dumps(policy))
+
+
+def test_spawn_opencode_types_the_first_prompt_and_learns_the_session(
+        oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout, kind="opencode", prompt="read @README.md first",
+                  extra=["--", "-m", "privatemode/glm-5.3"], json_out=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"name": "impl-1", "pane": "w1:p8", "tab": "w1:t8", "session": OC_SESSION, "prompt": "delivered"}
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert list(start[start.index("--") + 1:]) == ["-m", "privatemode/glm-5.3"]       # no -n, no --prompt
+    (typed,) = prompts(fake)
+    assert typed[2] == "w1:p8" and "via herdr-sleeper" in typed[3] and typed[3].endswith("read ⁠@README.md first")
+    assert typed[4:] == ("--wait", "--until", "working", "--timeout", str(sleeper.OPENCODE_FIRST_PROMPT_SECONDS * 1000))
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    assert rec["uuid"] == OC_SESSION and rec["kind"] == "opencode" and rec["pane"] == "w1:p8"
+    msg_id = next(json.loads(l)["id"] for l in sleeper.EVENTS.read_text().splitlines()
+                  if json.loads(l)["event"] == "delivered")
+    assert msg_id in sleeper.recently_delivered() and sleeper.archived(msg_id)["to"] == OC_SESSION
+    assert sleeper.pending_mail(OC_SESSION) == []
+
+
+@pytest.mark.parametrize("extra, needle", [
+    (["-s", "ses_x"], "-s is refused"),
+    (["-c"], "-c is refused"),
+    (["--fork"], "--fork is refused"),
+    (["--prompt", "hi"], "--prompt is refused"),
+    (["--prompt=hi"], "--prompt is refused"),
+    (["--pure"], "--pure is refused"),
+    (["--port", "4096"], "--port is refused"),
+    (["--hostname", "0.0.0.0"], "--hostname is refused"),
+    (["--auto"], "--auto is refused"),
+    (["--agent", "plan"], "--agent is refused"),
+    (["serve"], "no positional"),
+    (["."], "no positional"),
+    (["-m"], "missing its value"),
+    (["--model", "--pure"], "missing its value"),
+])
+def test_spawn_opencode_takes_only_a_model(oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path,
+                                          monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+                                          extra: list[str], needle: str) -> None:
+    assert _spawn(monkeypatch, checkout, kind="opencode", extra=extra) == 2
+    assert needle in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+
+
+@pytest.mark.parametrize("setup, needle", [
+    ("no-policy", "no opencode guardrail"),
+    ("foreign-policy", "not root-owned"),
+    ("writable-policy", "not root-owned"),
+    ("klinikon", "Klinikon tree"),
+    ("dot-opencode", ".opencode exists"),
+    ("home-opencode", ".opencode exists; opencode would load it"),
+    ("plugin-config", "opencode.json sets plugin (only"),
+    ("agent-config-jsonc", "opencode.jsonc sets agent (only"),
+    ("escaped-key", "opencode.json sets plugin (only"),
+    ("commented-key", "opencode.jsonc sets plugin (only"),
+    ("lsp-config", "opencode.json sets lsp (only"),
+    ("tui-config", "tui.jsonc exists (TUI plugins"),
+    ("linked-instructions", "AGENTS.md links out of the checkout"),
+    ("malformed-config", "not valid JSON(C)"),
+    ("skill-shadow", "shadows global skill(s) glab"),
+    ("nested-skill-by-name", "shadows global skill(s) glab"),
+    ("builtin-shadow", "shadows global skill(s) customize-opencode"),
+    ("full", "already runs 2 opencode lane(s)"),
+    ("reserved", "already runs 2 opencode lane(s)"),
+    ("same-name", "a spawn named impl-1 is starting already"),
+])
+def test_spawn_opencode_machine_and_checkout_refusals(oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path,
+                                                      monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str], setup: str,
+                                                      needle: str) -> None:
+    cwd = checkout
+    if setup == "no-policy":
+        sleeper.OPENCODE_POLICY.unlink()
+    elif setup == "foreign-policy":
+        monkeypatch.setattr(sleeper, "OPENCODE_POLICY_UID", 0 if os.getuid() else 1)
+    elif setup == "writable-policy":
+        sleeper.OPENCODE_POLICY.chmod(0o666)
+    elif setup == "klinikon":
+        cwd = sleeper.SPAWN_ROOT / "klinikon" / "mbeg"
+        (cwd / ".git").mkdir(parents=True)
+    elif setup == "dot-opencode":
+        (checkout / ".opencode" / "plugins").mkdir(parents=True)
+        cwd = checkout / "sub"                                   # found from below too
+    elif setup == "home-opencode":
+        (Path(oc_policy["home"]) / ".opencode").mkdir()
+    elif setup == "plugin-config":
+        (checkout / "opencode.json").write_text('{"plugin": ["./x.js"]}')
+    elif setup == "agent-config-jsonc":
+        (checkout / "opencode.jsonc").write_text('// lanes\n{ "agent" : {"build": {}} }')
+    elif setup == "escaped-key":                                 # decodes to "plugin" (Codex review of 4b)
+        (checkout / "opencode.json").write_text('{"pl\\u0075gin": ["./evil.js"]}')
+    elif setup == "commented-key":
+        (checkout / "opencode.jsonc").write_text('{"plugin" /* c */ : ["./evil.js"], // more\n}')
+    elif setup == "lsp-config":                                  # lsp and formatter commands run on edits
+        (checkout / "opencode.json").write_text('{"lsp": {"x": {"command": ["./run.sh"]}}}')
+    elif setup == "tui-config":
+        (checkout / "tui.jsonc").write_text('{"plugin": ["./x.js"]}')
+    elif setup == "linked-instructions":
+        (checkout / "AGENTS.md").symlink_to(Path(oc_policy["home"]) / ".claude" / "skills" / "glab" / "SKILL.md")
+    elif setup == "malformed-config":
+        (checkout / "opencode.json").write_text('{"plugin": ')
+    elif setup == "skill-shadow":
+        (checkout / ".claude" / "skills" / "glab").mkdir(parents=True)
+        (checkout / ".claude" / "skills" / "glab" / "SKILL.md").write_text("plain\n")
+    elif setup == "nested-skill-by-name":                       # found as the shim finds it: deep, by front matter
+        (checkout / ".agents" / "skills" / "a" / "b").mkdir(parents=True)
+        (checkout / ".agents" / "skills" / "a" / "b" / "SKILL.md").write_text("---\nname: 'glab'\n---\nx\n")
+    elif setup == "builtin-shadow":
+        (checkout / ".agents" / "skills" / "customize-opencode").mkdir(parents=True)
+        (checkout / ".agents" / "skills" / "customize-opencode" / "SKILL.md").write_text("x\n")
+    elif setup == "full":
+        fake.agents[0]["agent"] = "opencode"
+        _write_policy({**oc_policy, "max_lanes": 1})
+        needle = "already runs 1 opencode lane(s)"
+    elif setup == "reserved":                                    # a spawn still waiting for its session counts
+        fake.agents[0]["agent"] = "opencode"
+        with sleeper.locked():
+            sleeper.record_spawned("other", {"pane": "w1:p9", "kind": "opencode", "uuid": None,
+                                             "at": sleeper.dt.datetime.now().isoformat(timespec="seconds")})
+    elif setup == "same-name":                                   # another spawn of that name holds its reservation
+        with sleeper.locked():
+            sleeper.record_spawned("impl-1", {"pane": None, "kind": "opencode", "uuid": None,
+                                              "at": sleeper.dt.datetime.now().isoformat(timespec="seconds")})
+    assert _spawn(monkeypatch, cwd, kind="opencode") == 1
+    assert needle in capsys.readouterr().err
+    assert not any(c[:2] in (("tab", "create"), ("agent", "start")) for c in fake.calls)
+    assert ("impl-1" in sleeper.spawned_records()) == (setup == "same-name") and "spawn-refused" in events()
+
+
+def test_spawn_opencode_allows_a_harmless_project_config(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                        checkout: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (checkout / "opencode.json").write_text('{"$schema": "https://opencode.ai/config.json", "share": "disabled"}')
+    (checkout / "opencode.jsonc").write_text('// ok\n{"theme": "system", "share": "disabled",}')
+    (checkout / ".claude" / "skills" / "ssh-triage").mkdir(parents=True)        # no global skill of that name
+    (checkout / ".claude" / "skills" / "ssh-triage" / "SKILL.md").write_text("x\n")
+    (checkout / ".claude" / "skills" / "glab").mkdir()                          # no SKILL.md: not a skill
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 0
+
+
+def test_spawn_opencode_reservation_is_dropped_when_no_lane_starts(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                                  checkout: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    fake.start_error = "agent_not_ready"
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert sleeper.spawned_records() == {}
+    with sleeper.locked():
+        assert sleeper.opencode_lanes(sleeper.list_agents()) == 0
+
+
+def test_spawn_opencode_that_never_shows_an_empty_composer_types_nothing(
+        oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.screen = oc_screen("20-permission-dialog")
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "agent_not_ready" in capsys.readouterr().err
+    assert prompts(fake) == [] and ("tab", "close", "w1:t8") in fake.calls
+    assert sleeper.spawned_records() == {}
+
+
+def test_spawn_opencode_without_a_session_keeps_the_lane_and_its_name(
+        oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_starts_session = False
+    fake.start_session_appears = False
+    monkeypatch.setattr(sleeper, "OPENCODE_SESSION_SECONDS", 2)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 3
+    assert "was typed, but no session id appeared" in capsys.readouterr().err
+    assert len(prompts(fake)) == 1 and sleeper.spawned_records()["impl-1"]["uuid"] is None
+    assert _spawn(monkeypatch, checkout, name="impl-1", kind="opencode") == 1     # the name stays taken
+    assert "is live in w1:p8" in capsys.readouterr().err
+    with sleeper.locked():
+        assert sleeper.opencode_lanes(sleeper.list_agents()) == 1                 # counted once, by its pane
+
+
+def test_a_spawned_name_survives_herdr_dropping_it(oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path,
+                                                   monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 0
+    capsys.readouterr()
+    lane = next(a for a in fake.agents if a["pane_id"] == "w1:p8")
+    lane["name"] = None                                          # a Herdr restart forgot the agent's name
+    state, hit, _key = sleeper.resolve_target("impl-1", sleeper.list_agents(), journal())
+    assert state == "live" and hit["pane_id"] == "w1:p8"
+    assert next(r for r in sleeper.presence_rows() if r["session"] == OC_SESSION)["name"] == "impl-1"
+    assert sleeper.name_taken("impl-1", sleeper.list_agents()) == "spawned in w1:p8"
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p8")
+    assert sleeper.context_sender(sleeper.list_agents()) == "impl-1"
+    assert sleeper.cmd_whoami(types.SimpleNamespace(json=True)) == 0
+    me = json.loads(capsys.readouterr().out)
+    assert me["name"] == "impl-1" and me["address"] == f"{sleeper.this_machine()}/impl-1"
+    assert me["pane"] == "w1:p8" and me["kind"] == "opencode" and me["session"] == OC_SESSION
+
+
+def test_whoami_outside_an_agent_pane(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                      capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    assert sleeper.cmd_whoami(types.SimpleNamespace(json=False)) == 1
+    assert "not run inside a Herdr agent pane" in capsys.readouterr().err
+
+
+def test_an_opencode_row_is_never_woken_automatically(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    fake.screen = EMPTY_SCREEN                                           # slept as a claude pane, read as opencode
+    entry = {**slept_entry(fake), "kind": "opencode"}
+    assert sleeper.wake_entry(entry) is False
+    assert sleeper.OPENCODE_NO_SLEEP in capsys.readouterr().err and events()[-1] == "wake-refused"
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": entry})
+    monkeypatch_input = iter([""])
+    import builtins
+    real_input = builtins.input
+    builtins.input = lambda _prompt="": next(monkeypatch_input)
+    try:
+        assert sleeper.cmd_stub("w1:p1", UUID) == 0                   # Enter in the stub: no exec either
+    finally:
+        builtins.input = real_input
+    assert sleeper.OPENCODE_NO_SLEEP in capsys.readouterr().out
+    assert fake.execvps == [] and not any(c[:2] == ("agent", "start") for c in fake.calls)
+
+
+@pytest.mark.parametrize("setup", ["none", "other-shim", "older-process", "another-pid"])
+def test_spawn_opencode_needs_the_shims_load_marker(oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path,
+                                                    monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str], setup: str) -> None:
+    monkeypatch.setattr(sleeper, "OPENCODE_MARKER_SECONDS", 1)
+    marker = Path(oc_policy["marker_dir"]) / f"shim-{OC_PID}.json"
+    if setup == "none":
+        marker.unlink()                                          # the plugin failed to load: silent in opencode
+    elif setup == "other-shim":
+        _marker(oc_policy, sha256="0" * 64)
+    elif setup == "older-process":
+        _marker(oc_policy, at=time.time() - 3600)                # an earlier opencode with the same pid
+    elif setup == "another-pid":
+        marker.rename(marker.with_name("shim-4243.json"))
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "no guardrail load marker" in capsys.readouterr().err
+    assert prompts(fake) == [] and ("tab", "close", "w1:t8") in fake.calls
+    assert sleeper.spawned_records() == {} and "spawn-failed" in events()
+
+
+def test_spawn_opencode_waits_for_the_session_after_an_uncertain_prompt(
+        oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_error = (None,)                                  # our own subprocess timeout: no Herdr code
+    assert _spawn(monkeypatch, checkout, kind="opencode", json_out=True) == 0
+    assert json.loads(capsys.readouterr().out)["session"] == OC_SESSION    # it was typed: delivered, not resent
+
+
+def test_spawn_opencode_without_a_session_after_an_uncertain_prompt_says_so(
+        oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_error = ("agent_prompt_stalled",)
+    fake.prompt_starts_session = False
+    fake.start_session_appears = False
+    monkeypatch.setattr(sleeper, "OPENCODE_SESSION_SECONDS", 2)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 3
+    assert "may have been typed (`agent prompt`: agent_prompt_stalled); look at the pane" in capsys.readouterr().err
+
+
+def test_spawn_opencode_into_a_blocked_lane_is_not_typed(oc_policy: dict[str, Any], fake: FakeHerdr, checkout: Path,
+                                                         monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    fake.prompt_error = ("agent_blocked",)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "could not be typed" in capsys.readouterr().err
+    assert sleeper.spawned_records()["impl-1"]["uuid"] is None             # the lane runs: it keeps its name
+
+
+def test_spawn_opencode_rechecks_the_name_under_the_lock(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                         checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    answers = iter([None, "spawned in w1:p5"])                  # free at the first look, taken by the second
+    monkeypatch.setattr(sleeper, "name_taken", lambda name, agents: next(answers))
+    with sleeper.locked():
+        sleeper.record_spawned("impl-1", {"pane": "w1:p5", "kind": "opencode", "uuid": "ses_other",
+                                          "at": sleeper.dt.datetime.now().isoformat(timespec="seconds")})
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "is spawned in w1:p5; pick another name" in capsys.readouterr().err
+    assert sleeper.spawned_records()["impl-1"]["uuid"] == "ses_other"      # the other spawn's record stays
+
+
+def test_spawn_opencode_whose_reservation_was_taken_closes_its_tab(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                                    checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    real = sleeper.pane_at_shell
+
+    def slow_shell(pane: str) -> bool | None:                    # meanwhile another spawn took the name over
+        with sleeper.locked():
+            rec = sleeper.spawned_records()["impl-1"]
+            sleeper.record_spawned("impl-1", {**rec, "token": "someone-else"})
+        return real(pane)
+    monkeypatch.setattr(sleeper, "pane_at_shell", slow_shell)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "the reservation for impl-1 was lost" in capsys.readouterr().err
+    assert ("tab", "close", "w1:t8") in fake.calls and not any(c[:2] == ("agent", "start") for c in fake.calls)
+    assert sleeper.spawned_records()["impl-1"]["token"] == "someone-else"      # theirs, untouched
+
+
+def test_spawn_opencode_rechecks_capacity_before_the_start(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                           checkout: Path, monkeypatch: pytest.MonkeyPatch,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    _write_policy({**oc_policy, "max_lanes": 1})
+    real = sleeper.pane_at_shell
+
+    def lane_appears(pane: str) -> bool | None:                  # a lane started by hand while the shell came up
+        fake.agents[0]["agent"] = "opencode"
+        return real(pane)
+    monkeypatch.setattr(sleeper, "pane_at_shell", lane_appears)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 1
+    assert "runs 1 opencode lane(s) now" in capsys.readouterr().err
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls) and sleeper.spawned_records() == {}
+
+
+def test_spawn_opencode_keeps_a_record_another_spawn_holds_by_the_end(oc_policy: dict[str, Any], fake: FakeHerdr,
+                                                                      checkout: Path,
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    real = sleeper.opencode_composer_state
+
+    def taken_while_typing(screen: str | None) -> tuple[str, str]:
+        with sleeper.locked():
+            rec = sleeper.spawned_records()["impl-1"]
+            sleeper.record_spawned("impl-1", {**rec, "token": "someone-else"})
+        return real(screen)
+    monkeypatch.setattr(sleeper, "opencode_composer_state", taken_while_typing)
+    assert _spawn(monkeypatch, checkout, kind="opencode") == 0
+    assert sleeper.spawned_records()["impl-1"]["token"] == "someone-else" and "spawn-record-kept" in events()
