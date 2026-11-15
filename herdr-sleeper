@@ -7631,7 +7631,6 @@ WAIT_ASK_RE = re.compile(
 WAIT_TODO_RE = re.compile(
     r"(?i)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
     r"bitte (?:führe|starte|gib|tipp))")
-TURN_EVENT_RE = re.compile(r'"hook_event_name"\s*:\s*"(?:Stop|UserPromptSubmit)"')
 RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
 PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
 
@@ -7687,8 +7686,13 @@ def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None, termin
         asks = read_json(ASKS)
     except (SleeperError, OSError):
         return None
-    return sum(1 for v in asks.values() if isinstance(v, dict) and v.get("state") == "open"
-               and ask_is_mine(v, uuid, name, pane, terminal))
+    mine = [v for v in asks.values() if isinstance(v, dict) and v.get("state") == "open"
+            and ask_is_mine(v, uuid, name, pane, terminal)]
+    if not mine and not (name and pane and terminal) and any(
+            isinstance(v, dict) and v.get("state") == "open" and v.get("asker_pane") in (pane, None)
+            for v in asks.values()):
+        return None   # an ask kept over a /clear can't be ruled out without the name and terminal
+    return len(mine)
 
 
 def append_turn_row(row: dict) -> bool:
@@ -7821,11 +7825,9 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
     if isinstance(payload, dict) and payload.get("hook_event_name") in ("Stop", "UserPromptSubmit"):
         turn_hook(str(payload["hook_event_name"]), payload)
         return 0
-    if not isinstance(payload, dict) and TURN_EVENT_RE.search(raw):
-        return 0  # a malformed turn payload stays silent: no say(), whose log lock may wait
+    if not isinstance(payload, dict):
+        return 0  # a payload that isn't a JSON object stays silent: say()'s log lock may wait
     try:
-        if not isinstance(payload, dict):
-            raise ValueError("hook payload is not a JSON object")
         hook_event, tool = payload.get("hook_event_name"), payload.get("tool_name")
         if hook_event == "PostToolUse" and tool == "ListAgents":
             asleep = [r for r in presence_rows() if r["state"] == "asleep"]

@@ -8808,7 +8808,8 @@ def test_the_stop_makes_one_short_herdr_call(fake: FakeHerdr, monkeypatch: pytes
 
 
 @pytest.mark.parametrize("raw", ['{"hook_event_name": "Stop", "session_id": ', '["x", {"hook_event_name": "Stop"}]',
-                                 '{"hook_event_name": "UserPromptSubmit", "prompt": "x"'])
+                                 '{"hook_event_name": "UserPromptSubmit", "prompt": "x"', '{"hook_event_name":"St',
+                                 '{"hook_event_name":"\\u0053top", oops}', ''])
 def test_a_malformed_turn_payload_is_silent(state: Path, monkeypatch: pytest.MonkeyPatch,
                                             capsys: pytest.CaptureFixture[str], raw: str) -> None:
     logged: list[str] = []
@@ -8826,3 +8827,19 @@ def test_a_week_old_marker_is_pruned_on_the_next_prompt(state: Path, monkeypatch
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
                                               "prompt": "hi"}) == ("", "")
     assert not stale.exists() and sleeper.turn_marker(UUID).exists()
+
+
+def test_an_ask_that_may_have_survived_a_clear_is_unknown_without_herdr(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    monkeypatch.setattr(sleeper, "turn_identity", lambda: ("w1:p1", None, None))   # agent list timed out
+    sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": "an-older-session", "asker_agent": "a",
+                                             "asker_pane": "w1:p1", "asker_terminal": "t1", "created": 1}})
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "Which one?"}) == ("", "")
+    assert _turn_rows()[0]["open_asks"] is None
+    # another pane's ask doesn't make this one unknown
+    sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": "x", "asker_pane": "w9:p9", "created": 1}})
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "last_assistant_message": "Which one?"}) == ("", "")
+    assert _turn_rows()[1]["open_asks"] == 0
