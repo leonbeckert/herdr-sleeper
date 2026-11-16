@@ -9307,12 +9307,13 @@ def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: 
     say(f"codex usage limit in {pane} has reset; continue note queued (msg {msg_id})")
 
 
-def codex_note_problem(msg: dict, pane: str, uuid: str) -> str | None:
+def codex_note_problem(msg: dict, pane: str, uuid: str, last_look: bool = False) -> str | None:
     """Why a queued Codex continue note must not be typed in now, or None. Every typing path asks
     (type_mail), so a note queued while the composer could not take it is dropped once someone went on
     by hand, the incident ended, or the feature was turned off, before the watcher's tick sees it. A
     note dropped while its incident is still open (a dry run, an unreadable screen) is queued again by
-    the watcher (codex_limit) once it may go in."""
+    the watcher (codex_limit) once it may go in. The last look (right before typing, after mail_refusal)
+    reads the screen once more, so that read must show the empty composer too."""
     if msg.get("expect_pane") != pane:
         return "the mail would go into another pane"
     try:
@@ -9326,9 +9327,13 @@ def codex_note_problem(msg: dict, pane: str, uuid: str) -> str | None:
     incident = read_codex_stuck()["limits"].get(pane)
     if not isinstance(incident, dict) or incident.get("continue_id") != msg.get("id") or incident.get("uuid") != uuid:
         return "the usage-limit incident is over"
-    kind, _detail = codex_stuck_screen(herdr_screen(pane))
+    screen = herdr_screen(pane)
+    kind, _detail = codex_stuck_screen(screen)
     if kind != "usage-limit":
         return "the screen no longer shows the usage limit"
+    if last_look and codex_composer_state(screen)[0] != "empty":
+        # this read comes after mail_refusal's: it must clear the composer gate on its own
+        return "the composer is not empty at the last look"
     return None
 
 
@@ -9993,7 +9998,7 @@ def drop_stale_notes(batch: list[tuple[Path, dict]], pane: str, uuid: str, name:
     dropped = False
     for path, msg in batch:
         if msg.get("kind") == CODEX_CONTINUE_KIND:
-            stale = codex_note_problem(msg, pane, uuid)
+            stale = codex_note_problem(msg, pane, uuid, last_look)
             if stale:
                 with contextlib.suppress(FileNotFoundError):
                     path.unlink()

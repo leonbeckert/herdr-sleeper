@@ -9235,3 +9235,23 @@ def test_codex_unreadable_screens_never_count_as_quiet(fake: FakeHerdr, monkeypa
     fake.screen = None                                                    # an unreadable read ends nothing
     sleeper.watch_tick({}, MONITOR_CFG)
     assert ev("codex-limit-end") == [] and "w1:p1" in sleeper.read_codex_stuck()["limits"]
+
+
+def test_codex_continue_last_look_needs_the_empty_composer_too(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, CODEX_LIMIT_B)                   # composer unreadable: the note waits
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(sleeper.pending_mail(UUID)) == 1
+    lines = codex_limit_ansi().splitlines()
+    i = next(n for n, ln in enumerate(lines) if "Ask Codex to do anything" in ln)
+    lines[i] = lines[i].replace("\x1b[2m", "").replace("Ask Codex to do anything", "fix the tests please  ")
+    draft = "\n".join(lines) + "\n"
+    assert sleeper.codex_composer_state(draft)[0] == "draft" and sleeper.codex_stuck_screen(draft)[0] == "usage-limit"
+    screens = iter([codex_limit_ansi(), codex_limit_ansi(), draft])      # first check, mail_refusal, last look
+    monkeypatch.setattr(sleeper, "herdr_screen", lambda pane: next(screens, draft))
+    sleeper.flush_mail(fake.agents)
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+    assert ev("codex-continue-dropped")[-1]["reason"] == "the composer is not empty at the last look"
