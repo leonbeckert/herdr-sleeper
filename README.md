@@ -259,7 +259,7 @@ loops. An npm/bun install shows only its runtime to `lsof`, so it is never
 restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
-`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"),
+`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `codex_stuck` (see "A Codex pane stuck after its turn"),
 `auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
@@ -269,7 +269,7 @@ overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
 idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`,
-`insomnia.json`, `spawned.json`, `names.json` (owed names), `limited.json` (sessions and slots at their usage limit).
+`insomnia.json`, `spawned.json`, `names.json` (owed names), `limited.json` (sessions and slots at their usage limit), `codex-stuck.json` (Codex panes at a menu or their usage limit).
 The directory is 0700 and every file 0600 (files from earlier versions are
 tightened when next written); the two logs rotate to `<name>.1` at 1 MB.
 `panes.json` keeps only the argv a wake would replay, never the raw command
@@ -975,6 +975,33 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
   (e.g. `mbp/dev-mini-setup`) gets one line per slot and reset, once per reset
   window. Events: `dialog-answered`, `limit-wait`, `limit-continue`,
   `limit-all-used-up`, `unknown-dialog`.
+
+### A Codex pane stuck after its turn (*v0.1.44*, B-485)
+
+Herdr takes a Codex pane's state from Codex's lifecycle hooks, and two screens
+open after the turn has ended: a menu (Codex 0.169's "Approaching rate limits,
+switch model?") and the usage limit (`■ You've hit your usage limit … try
+again at 2:34 AM.`). Herdr keeps showing the pane idle, and mail to it waits on
+the composer check. The watcher reads the screen of every Codex pane that is not
+`working` (`codex_stuck`, default on; `dry_run` logs `would report …` instead):
+
+- The usage limit counts only as the last paragraph above the composer, so the
+  same words further up the transcript never match. On a later sighting than the
+  first (20 s; 5 minutes when focused) it logs `codex-limit` and notes it once to
+  `limit_monitor` and to the session that last relayed mail to the pane (from the
+  message archive, by session id like `deliver --re`; none on record: no note).
+  Once the time on screen has passed (this machine's local time, its next
+  occurrence after the first sighting; no time shown: 5 h later), one
+  `Your Codex usage limit has reset. Continue the task you were on.` is queued
+  through the mailbox (`codex-limit-continue`); the empty composer on that
+  screen takes it. The incident ends (`codex-limit-end`) when the screen no
+  longer shows the limit, and a continue still queued then is taken back; a turn
+  after the continue that hits the limit again is a new incident. State:
+  `codex-stuck.json`, so a watcher restart repeats nothing. No account switch.
+- A menu (an unreadable composer plus `enter select`, `esc back` or a selected
+  `› N.` option on the bottom 20 lines) logs `codex-dialog` and notes the pane,
+  its place and the selected option to `limit_monitor`, once per state. No key
+  is ever pressed in a Codex dialog.
 
 ### Auto-resume after a network or API error (*v0.1.27*)
 
