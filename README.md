@@ -997,8 +997,10 @@ the composer check. The watcher reads the screen of every Codex pane that is not
   `Your Codex usage limit has reset. Continue the task you were on.` is queued
   through the mailbox (`codex-limit-continue`); the empty composer on that
   screen takes it. Right before it is typed in, the pane must still show the
-  limit and the incident still be open, else it is dropped
-  (`codex-continue-dropped`): someone may have gone on by hand. The incident ends (`codex-limit-end`) when the screen no
+  limit, the incident still be open and no dry run on, else it is dropped
+  (`codex-continue-dropped`): someone may have gone on by hand. A note dropped
+  while the incident is still open is queued again on a later tick
+  (`codex-limit-continue-lost`). An unreadable screen proves nothing. The incident ends (`codex-limit-end`) when the screen no
   longer shows the limit, and a continue still queued then is taken back; a turn
   after the continue that hits the limit again is a new incident. State:
   `codex-stuck.json`, so a watcher restart repeats nothing. No account switch.

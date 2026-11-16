@@ -8911,7 +8911,7 @@ def test_codex_reset_time_is_the_next_occurrence_after_first_seen() -> None:
     assert sleeper.codex_reset_time("13:00 PM", at(16, 1, 35)) == at(16, 6, 35)  # nonsense: 5 h
 
 
-def codex_setup(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, screen: str,
+def codex_setup(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, screen: str | None,
                 focused: bool = False) -> dict[str, Any]:
     fake.agents[0].update(agent="codex", agent_status="idle", state_change_seq=7, focused=focused, name="review")
     fake.screen = screen
@@ -9175,3 +9175,63 @@ def test_codex_quiet_pane_is_not_read_every_tick(fake: FakeHerdr, monkeypatch: p
     fake.agents[0]["state_change_seq"] = 8                                # a new state is read again
     sleeper.tend_codex_panes(fake.agents, MONITOR_CFG, ctx["clock"]["t"])
     assert len(reads) == 6
+
+
+def test_codex_continue_held_in_a_dry_run_and_requeued_after(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, CODEX_LIMIT_B)                   # composer unreadable: the note waits
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(sleeper.pending_mail(UUID)) == 1
+    sleeper.CONFIG_FILE.write_text("dry_run = true\nexclude = []\n")     # the operator turns dry run on
+    fake.screen = codex_limit_ansi()                                      # the composer could take it now
+    dry = {**MONITOR_CFG, "dry_run": True}
+    sleeper.flush_mail(fake.agents)
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+    assert ev("codex-continue-dropped")[0]["reason"] == "dry run"
+    ctx["clock"]["t"] += 60
+    sleeper.watch_tick({}, dry)
+    assert len(ev("codex-limit-continue-lost")) == 1 and sleeper.pending_mail(UUID) == []
+    assert "continue_id" not in sleeper.read_codex_stuck()["limits"]["w1:p1"]
+    sleeper.CONFIG_FILE.write_text("exclude = []\n")                     # and off again
+    ctx["clock"]["t"] += 60
+    sleeper.watch_tick({}, MONITOR_CFG)
+    [typed] = mailbox_bodies(fake)
+    assert sleeper.CODEX_RESET_NOTE in typed and len(ev("codex-limit-continue")) == 2
+
+
+def test_codex_continue_dropped_on_an_unreadable_screen_is_queued_again(fake: FakeHerdr,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    screens = iter([codex_limit_ansi(), None])                            # the tick reads it, the typing check can't
+    monkeypatch.setattr(sleeper, "herdr_screen", lambda pane: next(screens, fake.screen))
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+    assert ev("codex-continue-dropped")[0]["reason"] == "the screen no longer shows the usage limit"
+    ctx["clock"]["t"] += 60
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(ev("codex-limit-continue-lost")) == 1
+    [typed] = mailbox_bodies(fake)
+    assert sleeper.CODEX_RESET_NOTE in typed
+
+
+def test_codex_unreadable_screens_never_count_as_quiet(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, None)                            # Herdr can't read the pane for minutes
+    for _ in range(8):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 60
+    assert sleeper.CODEX_SEEN == {}
+    fake.screen = codex_limit_ansi()                                      # the same state, readable at last
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    assert len(ev("codex-limit")) == 1
+    fake.screen = None                                                    # an unreadable read ends nothing
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert ev("codex-limit-end") == [] and "w1:p1" in sleeper.read_codex_stuck()["limits"]

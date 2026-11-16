@@ -9179,11 +9179,13 @@ def tend_codex_panes(agents: list[dict], config: dict, now: float) -> None:
                 and pane not in data["limits"]):
             continue  # both screens open as the turn ends; this state showed neither for minutes
         kind, detail = codex_stuck_screen(herdr_screen(pane))
+        if detail == "screen unreadable":
+            continue  # proves nothing: no incident ends, no quiet state starts
         incident = data["limits"].get(pane)
         if isinstance(incident, dict) and incident.get("uuid") != uuid:
             end_codex_limit(pane, incident, data, "the pane runs another session")
             incident = None
-        if kind != "usage-limit" and incident is not None and detail != "screen unreadable":
+        if kind != "usage-limit" and incident is not None:
             end_codex_limit(pane, incident, data, "the screen no longer shows the limit")
         if not seen or seen["seq"] != seq or seen["kind"] != kind:
             CODEX_SEEN[pane] = {"seq": seq, "kind": kind, "first": now}
@@ -9275,17 +9277,32 @@ def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: 
                               f"and can't answer yet; {reset_text}. herdr-sleeper types a continue note into it "
                               f"at {when}.")
         return
-    if incident.get("continue_id") or now < float(incident.get("reset") or math.inf):
+    queued = incident.get("continue_id")
+    if queued:
+        if queued in recently_delivered():
+            return
+        with mailbox_lock(str(uuid), wait=False) as got:  # no typing in flight while we look
+            if not got or any(p.stem.split("-", 1)[-1] == queued for p in pending_mail(str(uuid))):
+                return
+        # neither typed in nor queued: codex_note_problem dropped it (dry run, an unreadable screen ...)
+        for key in ("continue_id", "continue_seq", "continued_at"):
+            incident.pop(key, None)
+        event("codex-limit-continue-lost", pane=pane, uuid=uuid, id=queued)
+    if now < float(incident.get("reset") or math.inf):
         return
     if config["dry_run"]:
         note_skip(pane, "would continue a Codex pane after its usage limit (dry run)")
         return
     msg_id = f"codex-limit-{str(uuid)[:8]}-{int(float(incident.get('first') or now))}"
+    # on disk before the note exists: the typing-time check (another process, maybe) must find it
+    incident.update(continue_id=msg_id, continue_seq=seq, continued_at=now)
+    write_json(CODEX_STUCK, data)
     status = queue_note(str(uuid), CODEX_RESET_NOTE, msg_id, wait=False,
                         extra={"kind": CODEX_CONTINUE_KIND, "expect_pane": pane})
-    if status is None:
-        return  # a delivery holds the mailbox: next tick
-    incident.update(continue_id=msg_id, continue_seq=seq, continued_at=now)
+    if status is None:  # a delivery holds the mailbox: next tick (the caller writes the state back)
+        for key in ("continue_id", "continue_seq", "continued_at"):
+            incident.pop(key, None)
+        return
     event("codex-limit-continue", pane=pane, name=agent.get("name"), uuid=uuid, id=msg_id)
     say(f"codex usage limit in {pane} has reset; continue note queued (msg {msg_id})")
 
@@ -9293,14 +9310,19 @@ def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: 
 def codex_note_problem(msg: dict, pane: str, uuid: str) -> str | None:
     """Why a queued Codex continue note must not be typed in now, or None. Every typing path asks
     (type_mail), so a note queued while the composer could not take it is dropped once someone went on
-    by hand, the incident ended, or the feature was turned off, before the watcher's tick sees it."""
+    by hand, the incident ended, or the feature was turned off, before the watcher's tick sees it. A
+    note dropped while its incident is still open (a dry run, an unreadable screen) is queued again by
+    the watcher (codex_limit) once it may go in."""
     if msg.get("expect_pane") != pane:
         return "the mail would go into another pane"
     try:
-        if not load_config()[0]["codex_stuck"]:
-            return "codex_stuck is off"
+        config = load_config()[0]
     except ConfigError:
         return "the config is broken"
+    if not config["codex_stuck"]:
+        return "codex_stuck is off"
+    if config["dry_run"]:
+        return "dry run"
     incident = read_codex_stuck()["limits"].get(pane)
     if not isinstance(incident, dict) or incident.get("continue_id") != msg.get("id") or incident.get("uuid") != uuid:
         return "the usage-limit incident is over"
