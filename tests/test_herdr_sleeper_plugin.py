@@ -8873,6 +8873,9 @@ def test_codex_stuck_screens_are_told_apart() -> None:
     assert sleeper.codex_stuck_screen(CODEX_LIMIT_B.replace("’", "'")) == ("usage-limit", "2:34 AM")
     no_time = CODEX_LIMIT_B.replace(" or try again at 2:34 AM", "")
     assert sleeper.codex_stuck_screen(no_time) == ("usage-limit", None)
+    # a reply that quotes the message is no error cell
+    quoted = CODEX_LIMIT_B.replace("■ You’ve hit", "• Codex said: You’ve hit")
+    assert sleeper.codex_stuck_screen(quoted)[0] is None
     idle = (CODEX_169 / "screen-06-done.ansi").read_text()
     assert sleeper.codex_stuck_screen(idle) == (None, "the composer is readable")
     assert sleeper.codex_stuck_screen(None) == (None, "screen unreadable")
@@ -8936,10 +8939,10 @@ def test_codex_limit_waits_out_the_debounce_then_notes_once(fake: FakeHerdr, mon
     ctx["clock"]["t"] += 10
     sleeper.watch_tick({}, MONITOR_CFG)
     [rec] = ev("codex-limit")
-    assert rec["pane"] == "w1:p1" and rec["shown"] == "2:34 AM" and rec["sender"] is None
+    assert rec["pane"] == "w1:p1" and rec["shown"] == "2:34 AM" and rec["told"] == []
     [(target, body)] = ctx["notes"]                                       # no mail on record: the monitor only
     assert target == "mbp/dev-mini-setup" and "usage limit" in body and "2:34 AM" in body and "review" in body
-    assert "none on record" in body
+    assert "nobody (no mail on record)" in body
     for _ in range(3):
         ctx["clock"]["t"] += 60
         sleeper.watch_tick({}, MONITOR_CFG)
@@ -8974,7 +8977,7 @@ def test_codex_limit_tells_the_last_sender(fake: FakeHerdr, monkeypatch: pytest.
     sleeper.mark_delivered("m2")
     for p in sleeper.pending_mail(UUID):
         p.unlink()
-    assert sleeper.last_mail_sender(UUID) == (f"mbp/{OTHER_UUID}", "m1")
+    assert sleeper.mail_waiters(UUID) == [(f"mbp/{OTHER_UUID}", "m1")]
     fake.agents[0]["agent_status"] = "idle"
     for _ in range(2):
         sleeper.watch_tick({}, MONITOR_CFG)
@@ -8985,19 +8988,26 @@ def test_codex_limit_tells_the_last_sender(fake: FakeHerdr, monkeypatch: pytest.
     assert f"mbp/{OTHER_UUID}" in ctx["notes"][0][1]
 
 
-def test_codex_last_sender_by_name_and_none(state: Path) -> None:
-    assert sleeper.last_mail_sender(UUID) is None                         # nothing on record: no note
+def test_codex_mail_waiters_by_name_session_and_queue(state: Path) -> None:
+    assert sleeper.mail_waiters(UUID) == []                               # nothing on record: no note
     sleeper.archive_message({"id": "m1", "from": "mini1/ts-ao", "to": UUID, "body": "x", "at_ns": 1})
-    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # no session id: by name
+    assert sleeper.mail_waiters(UUID) == [("mini1/ts-ao", "m1")]          # no session id: by name
     for rec in ({"id": "m2", "from": "mini2/herdr-sleeper", "to": UUID, "body": "x", "at_ns": 2},
                 {"id": "m3", "from": "mini2/owner", "to": UUID, "body": "x", "at_ns": 3, "kind": sleeper.OWNER_ANSWER},
                 {"id": "m4", "from": "mini2/review", "to": "mbp/other", "body": "x", "at_ns": 4, "sent": True},
-                {"id": "m5", "from": "mini2/x", "to": OTHER_UUID, "body": "x", "at_ns": 5}):
+                {"id": "m5", "from": "mini2/x", "to": OTHER_UUID, "body": "x", "at_ns": 5},
+                {"id": "m6", "from": "mini2/review", "to": UUID, "body": "x", "at_ns": 6, "from_session": UUID}):
         sleeper.archive_message(rec)
-    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # ours, the owner's, others' don't count
-    sleeper.archive_message({"id": "m6", "from": "mini2/review", "to": UUID, "body": "x", "at_ns": 6,
-                             "from_session": UUID})
-    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # what it sent itself doesn't count
+    assert sleeper.mail_waiters(UUID) == [("mini1/ts-ao", "m1")]          # ours, the owner's, itself, others' don't count
+    # mail still queued for it: its senders wait too, first; a local one is reached by session id on this machine
+    with sleeper.mailbox_lock(UUID):
+        sleeper.queue_message(UUID, "md-verteidigung", "round 3", "m7", extra={"from_session": OTHER_UUID})
+        sleeper.queue_message(UUID, "herdr-sleeper", sleeper.CODEX_RESET_NOTE, "m8",
+                              extra={"kind": sleeper.CODEX_CONTINUE_KIND})
+    here = sleeper.this_machine()
+    assert sleeper.mail_waiters(UUID) == [(f"{here}/{OTHER_UUID}", "m7")]  # m7 is the newest archived one too
+    sleeper.archive_message({"id": "m9", "from": "mini1/ts-ao", "to": UUID, "body": "x", "at_ns": time.time_ns() + 10**9})
+    assert sleeper.mail_waiters(UUID) == [(f"{here}/{OTHER_UUID}", "m7"), ("mini1/ts-ao", "m9")]
 
 
 def test_codex_limit_continues_after_the_reset_and_ends(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9135,3 +9145,33 @@ def test_codex_limit_ends_when_the_pane_runs_another_session(fake: FakeHerdr, mo
     sleeper.write_json(sleeper.CODEX_STUCK, {"limits": {"w9:p9": {"uuid": UUID, "at": 1.0}}, "dialogs": {}})
     sleeper.watch_tick({}, MONITOR_CFG)
     assert sleeper.read_codex_stuck()["limits"] == {}
+
+
+def test_codex_continue_is_dropped_at_typing_time_once_someone_went_on(fake: FakeHerdr,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, CODEX_LIMIT_B)                   # composer unreadable: the note waits
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(sleeper.pending_mail(UUID)) == 1
+    # the owner went on by hand; the 5 s mail retry sees the empty composer before any tick does
+    fake.screen = (CODEX_169 / "screen-06-done.ansi").read_text()
+    sleeper.flush_mail(fake.agents)
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+    [drop] = ev("codex-continue-dropped")
+    assert drop["reason"] == "the screen no longer shows the usage limit" and sleeper.pending_mail(UUID) == []
+
+
+def test_codex_quiet_pane_is_not_read_every_tick(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, (CODEX_169 / "screen-06-done.ansi").read_text())
+    reads: list[str] = []
+    monkeypatch.setattr(sleeper, "herdr_screen", lambda pane: reads.append(pane) or fake.screen)
+    for _ in range(7):                                                    # 0, 60, ... 360 s
+        sleeper.tend_codex_panes(fake.agents, MONITOR_CFG, ctx["clock"]["t"])
+        ctx["clock"]["t"] += 60
+    assert len(reads) == 5                                                # read until quiet (300 s), then left alone
+    fake.agents[0]["state_change_seq"] = 8                                # a new state is read again
+    sleeper.tend_codex_panes(fake.agents, MONITOR_CFG, ctx["clock"]["t"])
+    assert len(reads) == 6
