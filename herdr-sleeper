@@ -9143,6 +9143,9 @@ def tend_codex_panes(agents: list[dict], config: dict, now: float) -> None:
         CODEX_SEEN.pop(pane, None)
     data = read_codex_stuck()
     before = json.dumps(data, sort_keys=True)
+    for key in ("limits", "dialogs"):  # a pane gone for good leaves its record behind
+        data[key] = {p: r for p, r in data[key].items()
+                     if isinstance(r, dict) and now - float(r.get("at") or 0) < LIMIT_KEEP_SECONDS}
     places: dict[str, str] | None = None
     for agent in agents:
         if agent.get("agent") != "codex" or agent.get("agent_status") == "working":
@@ -9152,7 +9155,7 @@ def tend_codex_panes(agents: list[dict], config: dict, now: float) -> None:
         kind, detail = codex_stuck_screen(herdr_screen(pane))
         incident = data["limits"].get(pane)
         if isinstance(incident, dict) and incident.get("uuid") != uuid:
-            data["limits"].pop(pane)  # the pane runs another session now
+            end_codex_limit(pane, incident, data, "the pane runs another session")
             incident = None
         if kind != "usage-limit" and incident is not None and detail != "screen unreadable":
             end_codex_limit(pane, incident, data, "the screen no longer shows the limit")

@@ -9118,3 +9118,20 @@ def test_codex_stuck_config_switch(state: Path) -> None:
     sleeper.CONFIG_FILE.write_text('codex_stuck = "no"\nexclude = []\n')
     with pytest.raises(sleeper.ConfigError, match="codex_stuck"):
         sleeper.load_config()
+
+
+def test_codex_limit_ends_when_the_pane_runs_another_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    assert "w1:p1" in sleeper.read_codex_stuck()["limits"]
+    fake.agents[0]["agent_session"] = {"value": OTHER_UUID}
+    fake.screen = (CODEX_169 / "screen-06-done.ansi").read_text()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert [r["why"] for r in ev("codex-limit-end")] == ["the pane runs another session"]
+    assert sleeper.read_codex_stuck()["limits"] == {}
+    ctx["clock"]["t"] += 8 * 86400                                        # old records are pruned
+    sleeper.write_json(sleeper.CODEX_STUCK, {"limits": {"w9:p9": {"uuid": UUID, "at": 1.0}}, "dialogs": {}})
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert sleeper.read_codex_stuck()["limits"] == {}
