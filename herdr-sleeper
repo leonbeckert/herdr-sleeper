@@ -258,6 +258,7 @@ DEFAULTS = {
     "machine_aliases": [],       # former labels still accepted: "old=new" (this machine's or a saved one's)
     "answer_dialogs": True,      # answer Claude's limit menu (option 1) and known one-time dialogs
     "limit_monitor": "",         # session told when every account slot is at its limit (mbp/dev-mini-setup)
+    "codex_stuck": True,         # report Codex panes held by a menu or the usage limit; continue after the reset
     "auto_resume": True,         # continue claude turns that died on a network or API error, once the API answers
     "auto_resume_max_age_hours": 24.0,  # older errors are left alone (TOML: auto_resume_max_age = "24h")
     "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
@@ -789,7 +790,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
     unknown = [a for a in values["agents"] if a not in PROFILES]
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
-    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume"):
+    for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume",
+                "codex_stuck"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -9011,6 +9013,263 @@ def restart_in_place(agent: dict, since: float | None, window: float, old: str, 
     return "restarted"
 
 
+# ------------------------------------------------------------ Codex panes stuck after their turn (v0.1.44)
+# Herdr takes a Codex pane's state from Codex's lifecycle hooks, and two screens open after the turn
+# has ended: a menu (2026-11-15 "Approaching rate limits, switch model?") and the usage limit
+# (2026-11-16, ansible-orchestration docs/macos/report.2026-11-16-codex-pane-usage-limit.md). Herdr
+# keeps reporting the pane idle, and mail to it waits on the composer check (B-485). The watcher reads
+# the screen of every Codex pane that isn't working: a menu gets one note to the limit monitor and
+# never a key; the usage limit gets a note to the monitor and to the session that last sent the pane
+# mail, and a continue note through the mailbox once the reset time on screen has passed.
+
+CODEX_STUCK = STATE_DIR / "codex-stuck.json"  # {"limits": {pane: incident}, "dialogs": {pane: {seq, uuid, at}}}
+CODEX_SEEN: dict[str, dict] = {}               # pane -> {seq, kind, first}: per-process watcher memory
+CODEX_LIMIT_TEXT = re.compile(r"You['’]ve hit your usage limit")
+CODEX_RETRY_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AaPp][Mm])\b")
+CODEX_LIMIT_FALLBACK_SECONDS = 5 * 3600        # no reset time on screen: Codex's short window
+CODEX_MENU_HINTS = ("enter select", "esc back")
+CODEX_OPTION_LINE = re.compile(r"^\s*›\s*\d+\.\s+(.*\S)\s*$")
+CODEX_RESET_NOTE = "Your Codex usage limit has reset. Continue the task you were on."
+
+
+def codex_last_block(lines: list[str]) -> list[str]:
+    """The last paragraph (non-empty lines without a blank between) above the composer's `›` row,
+    or above the end of the screen when no line starts with `›`."""
+    prompt = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith(CODEX_GLYPH)), len(lines))
+    block: list[str] = []
+    for line in reversed(lines[:prompt]):
+        if line.strip():
+            block.insert(0, line.strip())
+        elif block:
+            break
+    return block
+
+
+def codex_stuck_screen(screen: str | None) -> tuple[str | None, str | None]:
+    """What holds a Codex pane after its turn: ('usage-limit', the reset time on screen or None),
+    ('dialog', the selected option's text or None), or (None, why not).
+
+    The usage limit counts only as the last paragraph above the composer (Codex's `■` error cell), so
+    the same words further up the transcript, after a later reply, never match. A dialog needs both: a
+    composer the check can't read, and a menu marker on the bottom MENU_TAIL_LINES lines ("enter select",
+    "esc back", or a selected `› N.` option line)."""
+    if screen is None:
+        return None, "screen unreadable"
+    lines = [strip_ansi(ln).rstrip() for ln in screen.splitlines()]
+    text = " ".join(" ".join(codex_last_block(lines)).split())
+    if CODEX_LIMIT_TEXT.search(text):
+        m = CODEX_RETRY_AT.search(text)
+        return "usage-limit", f"{int(m.group(1))}:{m.group(2)} {m.group(3).upper()}" if m else None
+    if codex_composer_state(screen)[0] != "unknown":
+        return None, "the composer is readable"
+    tail = [ln for ln in lines if ln.strip()][-MENU_TAIL_LINES:]
+    options = [m.group(1) for m in (CODEX_OPTION_LINE.match(ln) for ln in tail) if m]
+    hints = any(h in ln.lower() for ln in tail for h in CODEX_MENU_HINTS)
+    if not options and not hints:
+        return None, "no menu on screen"
+    return "dialog", re.split(r"\s{2,}", options[-1])[0] if options else None
+
+
+def codex_reset_time(shown: str | None, first: float) -> float:
+    """When a usage limit first seen at `first` lifts: the next occurrence of the time on screen
+    ("2:34 AM", this machine's local time) after `first`; no time shown: 5 h after `first`."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2}) ([AP]M)", shown or "")
+    if not m or not 1 <= int(m.group(1)) <= 12 or int(m.group(2)) > 59:
+        return first + CODEX_LIMIT_FALLBACK_SECONDS
+    hour = int(m.group(1)) % 12 + (12 if m.group(3) == "PM" else 0)
+    seen = dt.datetime.fromtimestamp(first)
+    at = seen.replace(hour=hour, minute=int(m.group(2)), second=0, microsecond=0)
+    if at <= seen:
+        at += dt.timedelta(days=1)
+    return at.timestamp()
+
+
+def read_codex_stuck() -> dict:
+    try:
+        data = read_json(CODEX_STUCK)
+    except SleeperError:
+        data = {}
+    for key in ("limits", "dialogs"):
+        if not isinstance(data.get(key), dict):
+            data[key] = {}
+    return data
+
+
+def last_mail_sender(uuid: str) -> tuple[str, str] | None:
+    """(where to reach whoever last relayed mail to this session, that message's id), from the
+    message archive (ARCHIVE_DAYS), the way `deliver --re` finds a reply's target: by session id
+    when the sender's is known, else by name. herdr-sleeper's own notes, the owner's answers to asks
+    and what the session sent itself don't count; None when nobody else sent it mail in that time."""
+    best: dict | None = None
+    for rec in archive_all():
+        if rec.get("to") != uuid or rec.get("sent") or rec.get("kind") in (OWNER_ANSWER, AUTO_RESUME_KIND):
+            continue
+        sender = str(rec.get("from") or "")
+        if sender.rpartition("/")[2] == "herdr-sleeper" or rec.get("from_session") == uuid:
+            continue
+        if best is None or int(rec.get("at_ns") or 0) > int(best.get("at_ns") or 0):
+            best = rec
+    if best is None:
+        return None
+    sender = str(best.get("from") or "")
+    machine = sender.rpartition("/")[0]
+    session = best.get("from_session")
+    if valid_session_id(session) and machine:
+        return f"{machine}/{session}", str(best["id"])
+    return (sender, str(best["id"])) if sender_ok(sender) else None
+
+
+def withdraw_note(uuid: str, msg_id: str) -> bool:
+    """Take a still-queued note out of the session's mailbox (never waiting for the lock)."""
+    with mailbox_lock(uuid, wait=False) as got:
+        if not got:
+            return False
+        for path in pending_mail(uuid):
+            if path.stem.split("-", 1)[-1] == msg_id:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                return True
+    return False
+
+
+def tend_codex_panes(agents: list[dict], config: dict, now: float) -> None:
+    """Codex panes that are not working and show a menu or the usage limit (codex_stuck_screen) on
+    a later sighting than the first (DIALOG_ACT_SECONDS; DIALOG_ACT_FOCUSED_SECONDS when focused):
+    events, notes and the continue after the reset. Caller holds the lock. Keys are never pressed."""
+    if not config["codex_stuck"]:
+        return
+    live = {a["pane_id"] for a in agents}
+    for pane in [p for p in CODEX_SEEN if p not in live]:
+        CODEX_SEEN.pop(pane, None)
+    data = read_codex_stuck()
+    before = json.dumps(data, sort_keys=True)
+    places: dict[str, str] | None = None
+    for agent in agents:
+        if agent.get("agent") != "codex" or agent.get("agent_status") == "working":
+            continue
+        pane, seq = agent["pane_id"], agent.get("state_change_seq")
+        uuid = (agent.get("agent_session") or {}).get("value")
+        kind, detail = codex_stuck_screen(herdr_screen(pane))
+        incident = data["limits"].get(pane)
+        if isinstance(incident, dict) and incident.get("uuid") != uuid:
+            data["limits"].pop(pane)  # the pane runs another session now
+            incident = None
+        if kind != "usage-limit" and incident is not None and detail != "screen unreadable":
+            end_codex_limit(pane, incident, data, "the screen no longer shows the limit")
+        seen = CODEX_SEEN.get(pane)
+        if not seen or seen["seq"] != seq or seen["kind"] != kind:
+            CODEX_SEEN[pane] = {"seq": seq, "kind": kind, "first": now}
+            continue
+        if kind is None:
+            continue
+        wait = DIALOG_ACT_FOCUSED_SECONDS if agent.get("focused") is not False else DIALOG_ACT_SECONDS
+        if now - seen["first"] < wait:
+            continue
+        if places is None:
+            try:
+                places = ui_places(agents)
+            except SleeperError:
+                places = {}
+        try:
+            where = f"{this_machine()} › {places.get(pane) or pane}"
+        except ConfigError:
+            where = places.get(pane) or pane
+        if kind == "dialog":
+            codex_dialog(agent, detail, where, data, config, now)
+        else:
+            codex_limit(agent, detail, seen["first"], where, data, config, now)
+    if json.dumps(data, sort_keys=True) != before:
+        write_json(CODEX_STUCK, data)
+
+
+def codex_dialog(agent: dict, selected: str | None, where: str, data: dict, config: dict, now: float) -> None:
+    """One event and one note to the limit monitor per pane, state_change_seq and session."""
+    pane, seq = agent["pane_id"], agent.get("state_change_seq")
+    uuid = (agent.get("agent_session") or {}).get("value")
+    done = data["dialogs"].get(pane)
+    if isinstance(done, dict) and done.get("seq") == seq and done.get("uuid") == uuid:
+        return
+    if config["dry_run"]:
+        note_skip(pane, "would report a Codex menu (dry run)")
+        return
+    data["dialogs"][pane] = {"seq": seq, "uuid": uuid, "at": now}
+    target = config["limit_monitor"]
+    event("codex-dialog", pane=pane, name=agent.get("name"), uuid=uuid, place=where, selected=selected,
+          monitor=target or None)
+    say(f"codex menu in {pane} ({agent.get('name') or '-'}): selected {selected or '?'}")
+    if target:
+        send_note(target, f"{where} ({agent.get('name') or pane}, pane {pane}): a Codex menu holds the pane "
+                          f"after its turn; Herdr shows it {agent.get('agent_status')}. Selected option: "
+                          f"\"{selected or 'not readable'}\". Mail to it waits until someone answers the menu; "
+                          "herdr-sleeper presses no keys in Codex dialogs.")
+
+
+def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: dict, config: dict,
+                now: float) -> None:
+    """A Codex pane at its usage limit: once per incident an event and notes to the limit monitor and
+    to the last sender of mail; once the reset has passed, one continue note through the mailbox.
+    A continue that was typed in and a later turn (another state_change_seq) at the limit again is a
+    new incident."""
+    pane, seq = agent["pane_id"], agent.get("state_change_seq")
+    uuid = (agent.get("agent_session") or {}).get("value")
+    incident = data["limits"].get(pane)
+    if (isinstance(incident, dict) and incident.get("continue_id") and incident.get("continue_seq") != seq
+            and incident["continue_id"] in recently_delivered()):
+        end_codex_limit(pane, incident, data, "hit the limit again after the continue")
+        incident = None
+    if not valid_session_id(uuid):
+        note_skip(pane, "Codex usage limit, but the pane reports no session id (no mail possible)")
+        return
+    if incident is None:
+        if config["dry_run"]:
+            note_skip(pane, "would report a Codex usage limit (dry run)")
+            return
+        reset = codex_reset_time(shown, first)
+        sender = last_mail_sender(str(uuid))
+        incident = {"uuid": uuid, "seq": seq, "first": first, "at": now, "shown": shown, "reset": reset,
+                    "name": agent.get("name"), "sender": sender[0] if sender else None}
+        data["limits"][pane] = incident
+        when = dt.datetime.fromtimestamp(reset).strftime("%a %H:%M")
+        target = config["limit_monitor"]
+        event("codex-limit", pane=pane, name=agent.get("name"), uuid=uuid, place=where, shown=shown,
+              reset=when, monitor=target or None, sender=incident["sender"])
+        say(f"codex usage limit in {pane} ({agent.get('name') or '-'}); continue at {when}")
+        head = f"{where} ({agent.get('name') or pane}, pane {pane})"
+        reset_text = (f"the screen says try again at {shown}" if shown
+                      else "the screen shows no reset time, so 5 h after it was seen")
+        if target:
+            send_note(target, f"{head}: a Codex pane stopped at its usage limit; Herdr shows it "
+                              f"{agent.get('agent_status')}. {reset_text[0].upper()}{reset_text[1:]}; herdr-sleeper "
+                              f"types a continue note into it at {when}. Last sender of mail: "
+                              f"{incident['sender'] or 'none on record'}.")
+        if sender:
+            send_note(sender[0], f"{head}, which you last sent mail to (msg {sender[1]}), stopped at its Codex "
+                                 f"usage limit and can't answer yet; {reset_text}. herdr-sleeper types a "
+                                 f"continue note into it at {when}.")
+        return
+    if incident.get("continue_id") or now < float(incident.get("reset") or math.inf):
+        return
+    if config["dry_run"]:
+        note_skip(pane, "would continue a Codex pane after its usage limit (dry run)")
+        return
+    msg_id = f"codex-limit-{str(uuid)[:8]}-{int(float(incident.get('first') or now))}"
+    status = queue_note(str(uuid), CODEX_RESET_NOTE, msg_id, wait=False)
+    if status is None:
+        return  # a delivery holds the mailbox: next tick
+    incident.update(continue_id=msg_id, continue_seq=seq, continued_at=now)
+    event("codex-limit-continue", pane=pane, name=agent.get("name"), uuid=uuid, id=msg_id)
+    say(f"codex usage limit in {pane} has reset; continue note queued (msg {msg_id})")
+
+
+def end_codex_limit(pane: str, incident: dict, data: dict, why: str) -> None:
+    """Close a usage-limit incident; a continue note still queued for it is taken back."""
+    data["limits"].pop(pane, None)
+    msg_id, uuid = incident.get("continue_id"), incident.get("uuid")
+    withdrawn = bool(msg_id and valid_session_id(uuid) and withdraw_note(str(uuid), str(msg_id)))
+    event("codex-limit-end", pane=pane, name=incident.get("name"), uuid=uuid, why=why,
+          **({"withdrawn": msg_id} if withdrawn else {}))
+
+
 # ------------------------------------------------------------ auto-resume (v0.1.27)
 # When the network or the API goes away, every running Claude turn ends on "API Error: Can't reach
 # the API server …" once Claude's own retries are spent, and the session sits at its prompt looking
@@ -9859,6 +10118,11 @@ def sleep_tick(clocks: dict[str, dict], config: dict, agents: list[dict]) -> Non
                 restarting = tend_dialogs(agents, config, now)
             except SleeperError as exc:
                 say(f"dialogs: {exc}")
+        if not STOP["requested"]:
+            try:  # notes and a queued continue only; never a key into a Codex pane
+                tend_codex_panes(agents, config, now)
+            except Exception as exc:
+                say(f"codex panes: {type(exc).__name__}: {exc}")
         if not STOP["requested"]:
             try:  # queues only; the mail flush after this tick types the notes in
                 tend_api_errors(agents, config, now)

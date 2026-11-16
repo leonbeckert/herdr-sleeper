@@ -92,7 +92,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
-    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS", "DIALOG_SEEN",   # per-process watcher memory
+    for name in ("RESTART_TRIED", "CRON_SCAN", "INSOMNIA_TOKENS", "DIALOG_SEEN", "CODEX_SEEN",  # watcher memory
                  "STALLED", "STALL_CACHE", "AUTO_RESUME_EVENTED"):
         monkeypatch.setattr(sleeper, name, {})
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
@@ -625,7 +625,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
-                      "answer_dialogs": True, "limit_monitor": "", "auto_resume": True,
+                      "answer_dialogs": True, "limit_monitor": "", "codex_stuck": True, "auto_resume": True,
                       "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": []}
     assert set(source.values()) == {"default"}
 
@@ -8843,3 +8843,278 @@ def test_an_ask_that_may_have_survived_a_clear_is_unknown_without_herdr(
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
                                               "last_assistant_message": "Which one?"}) == ("", "")
     assert _turn_rows()[1]["open_asks"] == 0
+
+
+# ---------------------------------------------------------------- Codex panes stuck after their turn (v0.1.44, B-485)
+
+CODEX_169 = Path(__file__).resolve().parent / "fixtures" / "codex-0.169.0"
+CODEX_MENU_A = (CODEX_169 / "screen-08-rate-limit-menu.txt").read_text()   # mini2 2026-11-15, as copied (no ANSI)
+CODEX_LIMIT_B = (CODEX_169 / "screen-09-usage-limit.txt").read_text()      # mini2 2026-11-16, as copied (no ANSI)
+OTHER_UUID = "7b1e0c4d-2f3a-4b5c-9d6e-0f1a2b3c4d5e"
+
+
+def codex_limit_ansi() -> str:
+    """Screen B as `herdr pane read --format ansi` gives it: the copy above lost the styling. The
+    composer, status line and hint rows are the 0.169 lab's (screen-06-done.ansi) with B's texts; the
+    error cell is foreground colour only, as Codex draws history cells (no background)."""
+    done = (CODEX_169 / "screen-06-done.ansi").read_text().splitlines()
+    red = "\x1b[0m\x1b[38;2;243;139;168m"
+    error = [red + ln + "\x1b[0m" for ln in CODEX_LIMIT_B.splitlines()[:2]]
+    status = done[-2].replace("/private/tmp/codex-lab/proj", "~/development/klinikon/klinikon-mbeg") \
+        .replace("Reply OK", "Analysiere beide Agentenergebnisse")
+    hint = done[-1] + "\x1b[38;2;169;170;173m" + " " * 51 + "⚠ 4 warnings · f2 to view\x1b[0m"
+    return "\n".join([*error, " ", *done[-5:-2], status, hint]) + "\n"
+
+
+def test_codex_stuck_screens_are_told_apart() -> None:
+    assert sleeper.codex_stuck_screen(CODEX_MENU_A) == ("dialog", "Keep current model (never show again)")
+    assert sleeper.codex_stuck_screen(CODEX_LIMIT_B) == ("usage-limit", "2:34 AM")
+    assert sleeper.codex_stuck_screen(codex_limit_ansi()) == ("usage-limit", "2:34 AM")
+    assert sleeper.codex_stuck_screen(CODEX_LIMIT_B.replace("’", "'")) == ("usage-limit", "2:34 AM")
+    no_time = CODEX_LIMIT_B.replace(" or try again at 2:34 AM", "")
+    assert sleeper.codex_stuck_screen(no_time) == ("usage-limit", None)
+    idle = (CODEX_169 / "screen-06-done.ansi").read_text()
+    assert sleeper.codex_stuck_screen(idle) == (None, "the composer is readable")
+    assert sleeper.codex_stuck_screen(None) == (None, "screen unreadable")
+    # the limit further up the transcript, a reply after it: not the screen that holds the pane
+    lines = codex_limit_ansi().splitlines()
+    later = "\n".join([*lines[:3], "\x1b[0m• Done: both results compared.\x1b[0m", " ", *lines[3:]])
+    assert sleeper.codex_stuck_screen(later) == (None, "the composer is readable")
+    # a menu needs a composer the check can't read: a draft "› 1. foo" is no menu
+    assert sleeper.codex_stuck_screen(idle.replace("Ask Codex to do anything", "1. check the logs"))[0] is None
+    # no marker on the bottom lines: no dialog either
+    assert sleeper.codex_stuck_screen("  Something\n  else entirely\n") == (None, "no menu on screen")
+
+
+def test_codex_limit_screen_composer_is_empty_with_its_styling() -> None:
+    # the real screen is read with its SGR styling, and its composer is the plain empty one
+    assert sleeper.codex_composer_state(codex_limit_ansi()) == ("empty", "")
+    # the copy without ANSI has no shaded prompt row: unknown, mail would wait (fail closed)
+    assert sleeper.codex_composer_state(CODEX_LIMIT_B) == ("unknown", "the prompt row has no background")
+    assert sleeper.codex_composer_state(CODEX_MENU_A)[0] == "unknown"
+
+
+def test_codex_reset_time_is_the_next_occurrence_after_first_seen() -> None:
+    def at(day: int, h: int, m: int) -> float:
+        return dt.datetime(2026, 11, day, h, m).timestamp()
+    assert sleeper.codex_reset_time("2:34 AM", at(16, 1, 35)) == at(16, 2, 34)   # the night of 2026-11-16
+    assert sleeper.codex_reset_time("2:34 AM", at(15, 23, 50)) == at(16, 2, 34)  # before midnight: tomorrow
+    assert sleeper.codex_reset_time("2:34 AM", at(16, 0, 5)) == at(16, 2, 34)    # after midnight: today
+    assert sleeper.codex_reset_time("2:34 AM", at(16, 2, 34)) == at(17, 2, 34)   # not after it: next day
+    assert sleeper.codex_reset_time("12:05 AM", at(15, 22, 0)) == at(16, 0, 5)
+    assert sleeper.codex_reset_time("12:30 PM", at(16, 9, 0)) == at(16, 12, 30)
+    assert sleeper.codex_reset_time("11:59 PM", at(16, 23, 0)) == at(16, 23, 59)
+    assert sleeper.codex_reset_time(None, at(16, 1, 35)) == at(16, 6, 35)        # no time shown: 5 h
+    assert sleeper.codex_reset_time("13:00 PM", at(16, 1, 35)) == at(16, 6, 35)  # nonsense: 5 h
+
+
+def codex_setup(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, screen: str,
+                focused: bool = False) -> dict[str, Any]:
+    fake.agents[0].update(agent="codex", agent_status="idle", state_change_seq=7, focused=focused, name="review")
+    fake.screen = screen
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(sleeper, "send_note", lambda target, body: notes.append((target, body)))
+    clock = {"t": dt.datetime(2026, 11, 16, 1, 35).timestamp()}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    return {"notes": notes, "clock": clock}
+
+
+def ev(name: str) -> list[dict[str, Any]]:
+    p = sleeper.EVENTS
+    return [r for r in (json.loads(l) for l in p.read_text().splitlines()) if r["event"] == name] if p.exists() else []
+
+
+MONITOR_CFG = {**sleeper.DEFAULTS, "limit_monitor": "mbp/dev-mini-setup"}
+
+
+def test_codex_limit_waits_out_the_debounce_then_notes_once(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    sleeper.watch_tick({}, MONITOR_CFG)
+    ctx["clock"]["t"] += sleeper.DIALOG_ACT_SECONDS - 5
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert ev("codex-limit") == [] and ctx["notes"] == []                 # not yet: a later sighting only
+    ctx["clock"]["t"] += 10
+    sleeper.watch_tick({}, MONITOR_CFG)
+    [rec] = ev("codex-limit")
+    assert rec["pane"] == "w1:p1" and rec["shown"] == "2:34 AM" and rec["sender"] is None
+    [(target, body)] = ctx["notes"]                                       # no mail on record: the monitor only
+    assert target == "mbp/dev-mini-setup" and "usage limit" in body and "2:34 AM" in body and "review" in body
+    assert "none on record" in body
+    for _ in range(3):
+        ctx["clock"]["t"] += 60
+        sleeper.watch_tick({}, MONITOR_CFG)
+    sleeper.CODEX_SEEN.clear()                                            # a watcher restart
+    for _ in range(2):
+        ctx["clock"]["t"] += 60
+        sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(ev("codex-limit")) == 1 and len(ctx["notes"]) == 1
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]
+    assert mailbox_bodies(fake) == []                                     # before the reset: no continue
+
+
+def test_codex_limit_focused_pane_waits_longer(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi(), focused=True)
+    sleeper.watch_tick({}, MONITOR_CFG)
+    ctx["clock"]["t"] += 120
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert ev("codex-limit") == []
+    ctx["clock"]["t"] += sleeper.DIALOG_ACT_FOCUSED_SECONDS
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(ev("codex-limit")) == 1
+
+
+def test_codex_limit_tells_the_last_sender(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    fake.agents[0]["agent_status"] = "working"                            # mail arrives while it works
+    with sleeper.mailbox_lock(UUID):
+        sleeper.queue_message(UUID, "mbp/md-verteidigung", "review round 2", "m1",
+                              extra={"from_session": OTHER_UUID})
+        sleeper.queue_message(UUID, "herdr-sleeper", "a note of ours", "m2")
+    sleeper.mark_delivered("m1")
+    sleeper.mark_delivered("m2")
+    for p in sleeper.pending_mail(UUID):
+        p.unlink()
+    assert sleeper.last_mail_sender(UUID) == (f"mbp/{OTHER_UUID}", "m1")
+    fake.agents[0]["agent_status"] = "idle"
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    targets = [t for t, _b in ctx["notes"]]
+    assert targets == ["mbp/dev-mini-setup", f"mbp/{OTHER_UUID}"]
+    assert "msg m1" in ctx["notes"][1][1] and "2:34 AM" in ctx["notes"][1][1]
+    assert f"mbp/{OTHER_UUID}" in ctx["notes"][0][1]
+
+
+def test_codex_last_sender_by_name_and_none(state: Path) -> None:
+    assert sleeper.last_mail_sender(UUID) is None                         # nothing on record: no note
+    sleeper.archive_message({"id": "m1", "from": "mini1/ts-ao", "to": UUID, "body": "x", "at_ns": 1})
+    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # no session id: by name
+    for rec in ({"id": "m2", "from": "mini2/herdr-sleeper", "to": UUID, "body": "x", "at_ns": 2},
+                {"id": "m3", "from": "mini2/owner", "to": UUID, "body": "x", "at_ns": 3, "kind": sleeper.OWNER_ANSWER},
+                {"id": "m4", "from": "mini2/review", "to": "mbp/other", "body": "x", "at_ns": 4, "sent": True},
+                {"id": "m5", "from": "mini2/x", "to": OTHER_UUID, "body": "x", "at_ns": 5}):
+        sleeper.archive_message(rec)
+    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # ours, the owner's, others' don't count
+    sleeper.archive_message({"id": "m6", "from": "mini2/review", "to": UUID, "body": "x", "at_ns": 6,
+                             "from_session": UUID})
+    assert sleeper.last_mail_sender(UUID) == ("mini1/ts-ao", "m1")        # what it sent itself doesn't count
+
+
+def test_codex_limit_continues_after_the_reset_and_ends(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    reset = dt.datetime(2026, 11, 16, 2, 34).timestamp()
+    ctx["clock"]["t"] = reset - 60
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert mailbox_bodies(fake) == [] and ev("codex-limit-continue") == []
+    ctx["clock"]["t"] = reset + 5
+    sleeper.watch_tick({}, MONITOR_CFG)
+    [typed] = mailbox_bodies(fake)                                        # the flush typed it in at once
+    assert sleeper.CODEX_RESET_NOTE in typed and "msg codex-limit-" in typed
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")][0][2] == "w1:p1"
+    assert len(ev("codex-limit-continue")) == 1
+    for _ in range(2):
+        ctx["clock"]["t"] += 60
+        sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(mailbox_bodies(fake)) == 1                                 # once
+    fake.agents[0].update(agent_status="working", state_change_seq=8)    # the turn runs ...
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert ev("codex-limit-end") == []
+    fake.agents[0].update(agent_status="idle", state_change_seq=9)       # ... and ends on a reply
+    fake.screen = (CODEX_169 / "screen-06-done.ansi").read_text()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    [end] = ev("codex-limit-end")
+    assert end["why"] == "the screen no longer shows the limit" and "withdrawn" not in end
+    assert sleeper.read_codex_stuck()["limits"] == {}
+    assert len(ctx["notes"]) == 1
+
+
+def test_codex_limit_hit_again_after_the_continue_is_a_new_incident(fake: FakeHerdr,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(mailbox_bodies(fake)) == 1
+    fake.agents[0].update(state_change_seq=9)                            # the continue's turn hit it again
+    fake.screen = codex_limit_ansi().replace("2:34 AM", "7:30 AM")
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    assert [r["shown"] for r in ev("codex-limit")] == ["2:34 AM", "7:30 AM"]
+    assert ev("codex-limit-end")[0]["why"] == "hit the limit again after the continue"
+    assert len(ctx["notes"]) == 2 and len(mailbox_bodies(fake)) == 1
+
+
+def test_codex_limit_continue_waiting_is_withdrawn_when_the_screen_changes(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, CODEX_LIMIT_B)                   # composer unreadable: the note waits
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 35).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+    assert len(sleeper.pending_mail(UUID)) == 1
+    fake.screen = (CODEX_169 / "screen-06-done.ansi").read_text()        # someone went on by hand
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert ev("codex-limit-end")[0]["withdrawn"].startswith("codex-limit-")
+    assert sleeper.pending_mail(UUID) == [] and [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
+
+
+def test_codex_dialog_is_reported_once_and_never_answered(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, CODEX_MENU_A)
+    for _ in range(4):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    [rec] = ev("codex-dialog")
+    assert rec["selected"] == "Keep current model (never show again)" and rec["pane"] == "w1:p1"
+    [(target, body)] = ctx["notes"]
+    assert target == "mbp/dev-mini-setup" and "Keep current model (never show again)" in body
+    assert "w1:p1" in body and "›" in body                                # pane and its place
+    sleeper.CODEX_SEEN.clear()                                            # a watcher restart: still once
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    assert len(ctx["notes"]) == 1
+    fake.agents[0]["state_change_seq"] = 12                               # another state, the menu again
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    assert len(ev("codex-dialog")) == 2 and len(ctx["notes"]) == 2
+    assert not [c for c in fake.calls if c[:2] == ("pane", "send-keys")]
+    assert ev("codex-limit") == []
+
+
+def test_codex_stuck_dry_run_and_off(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    skips: list[str] = []
+    monkeypatch.setattr(sleeper, "note_skip", lambda pane, reason: skips.append(reason))
+    for cfg in ({**MONITOR_CFG, "dry_run": True}, {**MONITOR_CFG, "codex_stuck": False}):
+        for _ in range(3):
+            sleeper.watch_tick({}, cfg)
+            ctx["clock"]["t"] += 30
+        ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 3, 0).timestamp()
+        sleeper.watch_tick({}, cfg)
+        assert ev("codex-limit") == [] and ctx["notes"] == [] and mailbox_bodies(fake) == []
+        assert sleeper.read_codex_stuck()["limits"] == {}
+        sleeper.CODEX_SEEN.clear()
+        ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 1, 35).timestamp()
+    assert "would report a Codex usage limit (dry run)" in skips
+    fake.screen = CODEX_MENU_A
+    for _ in range(3):
+        sleeper.watch_tick({}, {**MONITOR_CFG, "dry_run": True})
+        ctx["clock"]["t"] += 30
+    assert "would report a Codex menu (dry run)" in skips and ev("codex-dialog") == []
+
+
+def test_codex_stuck_config_switch(state: Path) -> None:
+    sleeper.CONFIG_FILE.write_text("codex_stuck = false\nexclude = []\n")
+    assert sleeper.load_config()[0]["codex_stuck"] is False
+    sleeper.CONFIG_FILE.write_text('codex_stuck = "no"\nexclude = []\n')
+    with pytest.raises(sleeper.ConfigError, match="codex_stuck"):
+        sleeper.load_config()
