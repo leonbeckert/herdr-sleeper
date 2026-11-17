@@ -7678,14 +7678,13 @@ NEGATION_OPENER_RE = re.compile(
     r"(?i)^\s*(?:no(?: problem| worries| rush)?|nope|not yet|nein|kein problem|noch nicht)\s*,")
 INLINE_QUOTE_RE = re.compile(r'"[^"\n]{0,400}"|“[^“”\n]{0,400}”|„[^„“”\n]{0,400}[“”]')
 LABEL_LINE_RE = re.compile(r"(?m)^[ \t]*(?:#+[ \t].*|\*\*[^*\n]+\?\*\*:?[ \t]*)$")   # a heading, a bold label
-RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
-PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
 PASTE_WRAP_RE = re.compile(r"<pasted_content[^>\n]*>\s*")   # a long typed-in text may come wrapped in this
 # Every envelope of a batch type_mail() typed in (joined by blank lines): which kind, and for a relay
 # its sender and message id. A note from the sleeper itself (CONTINUE_NOTE, RESET_NOTE, CODEX_RESET_NOTE,
 # AUTO_RESUME_NOTE) is told by the `note` mark its archived copy carries, never by its text.
 ENVELOPE_LINE_RE = re.compile(
-    r"(?m)^(?:(?P<answer>\[the owner's answer to your ask)|(?P<peer>\[from \S+ via herdr-sleeper)"
+    r"(?m)^(?:\[the owner's answer to your ask [^\n]*?\(herdr-sleeper, msg (?P<answer>[A-Za-z0-9_-]{1,64})\)\]"
+    r"|(?P<peer>\[from \S+ via herdr-sleeper)"
     r"|\[relayed from (?P<sender>\S+) via herdr-sleeper, msg (?P<id>[A-Za-z0-9_-]{1,64}))")
 CHAIN_SETTERS = ("owner", "relay", "ask-answer")   # the origins that start a chain; the others inherit it
 OWNER_CHAIN_SECONDS = 7200   # an owner chain ends 2 h after his last prompt: a chat nobody watches is no to-do list
@@ -7701,37 +7700,45 @@ def chain_marker(session: str) -> Path | None:
     return STATE_DIR / "turns" / f"{session}.chain.json" if SESSION_ID_RE.fullmatch(session) else None
 
 
-def sleeper_note(sender: str, msg_id: str) -> bool:
-    """Did the sleeper itself queue this message as a note (queue_note's `note` mark, in the archive)?"""
-    if not reserved_sender(sender):
-        return False
-    rec = archived(msg_id)
-    return bool(rec and rec.get("note") is True and reserved_sender(str(rec.get("from"))))
+def envelope_kind(m: re.Match, session: str | None) -> str | None:
+    """What one envelope of a typed-in prompt is, checked against the archive: relay or sleeper-note
+    for a message queued for this very session (a note only with queue_note's `note` mark, which
+    `deliver` never writes), ask-answer for an owner's answer queued for it. None: the archive holds no
+    such message for this session (the owner pasted an envelope, or the archive lost it)."""
+    if m.group("peer"):
+        return "relay"   # ao herdr-relay.py's mini → MacBook envelope: no archive here to check
+    rec = archived(m.group("answer") or m.group("id"))
+    if not rec or not session or rec.get("to") != session:
+        return None
+    if m.group("answer"):
+        return "ask-answer" if rec.get("kind") == OWNER_ANSWER else None
+    if rec.get("kind") == OWNER_ANSWER:
+        return None
+    if rec.get("note") is True and reserved_sender(str(rec.get("from"))) and reserved_sender(m.group("sender")):
+        return "sleeper-note"
+    return "relay"
 
 
-def prompt_origin(prompt: str) -> str:
+def prompt_origin(prompt: str, session: str | None = None) -> str:
     """owner (typed in the pane, as far as the text shows), relay (a peer's message), ask-answer (the
     owner's answer to an ask, typed in by the panel), notification (a background task's event),
-    sleeper-note (a note the sleeper queued itself). The envelopes count only at the very start: an
-    owner who pastes a relayed message is still the owner. A batch of mail counts as a whole: any
-    peer's message makes it relay, else an owner's answer makes it ask-answer."""
+    sleeper-note (a note the sleeper queued itself). The envelopes count only at the very start and
+    only when the archive holds that message for this session: an owner who pastes a relayed message
+    is still the owner. A batch of mail counts as a whole: any peer's message makes it relay, else an
+    owner's answer makes it ask-answer."""
     head = prompt.lstrip()
     wrap = PASTE_WRAP_RE.match(head)
     head = head[wrap.end():] if wrap else head
     if head.startswith("<task-notification>"):
         return "notification"
-    if not (head.startswith(OWNER_ANSWER_HEADER) or any(head.startswith(h) for h in RELAY_HEADS)
-            or PEER_HEAD_RE.match(head)):
-        return "owner"
     kinds = set()
     for m in ENVELOPE_LINE_RE.finditer(head):
-        if m.group("answer"):
-            kinds.add("ask-answer")
-        elif m.group("peer") or not sleeper_note(m.group("sender"), m.group("id")):
-            kinds.add("relay")
-        else:
-            kinds.add("sleeper-note")
-    return next((k for k in ("relay", "ask-answer", "sleeper-note") if k in kinds), "relay")
+        kind = envelope_kind(m, session)
+        if m.start() == 0 and kind is None:
+            return "owner"
+        if kind:
+            kinds.add(kind)
+    return next((k for k in ("relay", "ask-answer", "sleeper-note") if k in kinds), "owner")
 
 
 def _waits_for_reader(text: str) -> bool:
@@ -7862,17 +7869,20 @@ def record_prompt(payload: dict) -> None:
     """UserPromptSubmit: note the turn's origin, its chain's origin and its start (no text) for the Stop
     that ends it. An owner, relay or ask-answer prompt starts a chain; a notification or a sleeper note
     carries on the one before it (none recorded: its own origin). Under the session's turn lock; a lock
-    that stays taken leaves no marker (the Stop then finds none: no-prompt)."""
+    that stays taken still leaves the turn marker, with chain "unknown" (its Stop never blocks)."""
     session = str(payload.get("session_id") or "")
     marker = turn_marker(session)
     if marker is None:
         return
     ensure_state_dir()
     marker.parent.mkdir(mode=0o700, exist_ok=True)
-    origin = prompt_origin(str(payload.get("prompt") or ""))
+    origin = prompt_origin(str(payload.get("prompt") or ""), session)
     now = time.time()
     with turn_lock(session) as held:
-        if not held:
+        if not held:   # still mark the turn (os.replace is atomic), with a chain its Stop never blocks on
+            if origin == "owner":   # an owner chain can only make the gate fail open
+                write_private_json(chain_marker(session), {"origin": origin, "ts": now})
+            write_private_json(marker, {"origin": origin, "chain": "unknown", "ts": now})
             return
         if origin in CHAIN_SETTERS:
             chain, chain_ts = origin, now
@@ -7882,7 +7892,7 @@ def record_prompt(payload: dict) -> None:
         write_private_json(marker, {"origin": origin, "chain": chain, "chain_ts": chain_ts, "ts": now})
     with contextlib.suppress(OSError):   # a session killed mid-turn never Stops: its markers go after a week
         for old in os.scandir(marker.parent):
-            if old.name.endswith((".json", ".lock")) and now - old.stat().st_mtime > 7 * 86400:
+            if old.name.endswith(".json") and now - old.stat().st_mtime > 7 * 86400:   # never a .lock
                 os.unlink(old.path)
 
 
@@ -7981,6 +7991,12 @@ def turn_hook(hook_event: str, payload: dict) -> None:
             return
         out = record_turn_end(payload)
     except Exception as exc:  # noqa: BLE001 - a failing hook never changes a turn
+        if hook_event == "UserPromptSubmit":   # a turn whose prompt wasn't read is never gated
+            with contextlib.suppress(Exception):
+                marker = turn_marker(str(payload.get("session_id") or ""))
+                if marker is not None:
+                    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    write_private_json(marker, {"origin": "unknown", "chain": "unknown", "ts": time.time()})
         if hook_event == "Stop":
             with contextlib.suppress(Exception):
                 append_turn_row({"v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"),

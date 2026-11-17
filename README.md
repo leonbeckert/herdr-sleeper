@@ -541,8 +541,11 @@ each turn ends. It reads no transcript: the prompt's origin comes from the
 `UserPromptSubmit` payload, the reply from the `Stop` payload's
 `last_assistant_message`, both classified in memory. The origin is
 `notification`, `relay`, `ask-answer` or `sleeper-note` only when the prompt
-*starts* with that envelope (a relayed message the owner pastes into his own
-prompt stays `owner`), `no-prompt` when no prompt came since the last Stop,
+*starts* with that envelope and, for the sleeper's own envelopes, the message
+archive holds that message id queued for this very session (a relayed message
+or an answer the owner pastes into his own prompt stays `owner`; the ao
+mini-to-MacBook header `[from X via herdr-sleeper` has no archive here and
+counts as `relay`), `no-prompt` when no prompt came since the last Stop,
 else `owner`. A batch of mail typed in as one prompt counts as a whole: any
 peer's message makes it `relay`, else an owner's answer `ask-answer`. A note
 counts as the sleeper's own only when its archived copy carries the `note`
@@ -557,7 +560,10 @@ prompt (a chat nobody watches is no to-do list); relay and ask-answer chains
 don't expire. No chain, or an expired one: the turn's own origin; an owner
 chain that runs out while the turn runs is checked again at its Stop. A
 prompt's markers and a Stop's read of them happen under the session's turn
-lock (tried for 1 s; a lock that stays taken blocks nothing). A reply waits on the owner when its last three paragraphs ask him to
+lock (tried for 1 s). A prompt that can't take it still marks its turn,
+with chain `unknown`, and a prompt hook that fails marks it `unknown` too:
+such a turn's Stop never blocks. The lock files stay; only week-old markers
+are cleaned up. A reply waits on the owner when its last three paragraphs ask him to
 do something (please sign in, please run/open/approve/confirm, still waiting
 on you, run this in a separate terminal, "Once you're in, I'll …", bitte melde
 dich an, …: a *todo*) or its last two ask him something (should I, which one,

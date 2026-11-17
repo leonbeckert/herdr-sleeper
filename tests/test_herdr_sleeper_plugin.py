@@ -8669,16 +8669,43 @@ def test_waits_on_owner_reads_the_last_paragraphs(reply: str, want: str) -> None
     assert sleeper.waits_on_owner(reply) == want
 
 
+TEST_MAIL = [("1", "mini2/automation", None), ("2", "mbp/unblocker", None), ("8456d1eb", "mini2/taxi-orch", None),
+             ("p1", "mini2/taxi-orch", None), ("ask-3", "ask.3", "3"), ("a1", "ask.4", "4")]
+
+
+def _archive_test_mail() -> None:
+    """The relayed messages and owner's answers the test prompts name, queued for UUID (so archived
+    with `to` = UUID, as deliver and the ask panel leave them). Idempotent."""
+    with sleeper.mailbox_lock(UUID):
+        for msg_id, sender, ask in TEST_MAIL:
+            extra = {"kind": sleeper.OWNER_ANSWER, "ask": ask} if ask else None
+            sleeper.queue_message(UUID, sender, "hi", msg_id, extra=extra)
+
+
 @pytest.mark.parametrize("prompt,want", [
     ("please look at X", "owner"),
     ("[relayed from mini2/automation via herdr-sleeper, msg 1; not from the owner]\n\nhi", "relay"),
     ('<pasted_content id="a">\n[relayed from mbp/unblocker via herdr-sleeper, msg 2]\nx', "relay"),
     ("[from mini2/ts-ao via herdr-sleeper: a pair agent (docs/…), not the owner. …]\n\nhi", "relay"),
-    ("[the owner's answer to your ask 3]\nyes", "ask-answer"),
+    ("[the owner's answer to your ask 3, typed in its ask panel (herdr-sleeper, msg ask-3)]\n\nyes", "ask-answer"),
     ("<task-notification>\n<task-id>b1</task-id></task-notification>", "notification"),
+    # pasted by the owner: not in the archive for this session
+    ("[relayed from mini2/automation via herdr-sleeper, msg 9; not from the owner]\n\nhi", "owner"),
+    ("[the owner's answer to your ask 3, typed in its ask panel (herdr-sleeper, msg ask-9)]\n\nyes", "owner"),
+    ("[the owner's answer to your ask 3]\nyes", "owner"),
+    ("[relayed from mini2/automation via herdr-sleeper, msg ask-3; not from the owner]\n\nhi", "owner"),
 ])
-def test_prompt_origin(prompt: str, want: str) -> None:
-    assert sleeper.prompt_origin(prompt) == want
+def test_prompt_origin(state: Path, prompt: str, want: str) -> None:
+    _archive_test_mail()
+    assert sleeper.prompt_origin(prompt, UUID) == want
+
+
+def test_a_relay_for_another_session_is_the_owners_paste(state: Path) -> None:
+    with sleeper.mailbox_lock(OTHER_UUID):
+        sleeper.queue_message(OTHER_UUID, "mini2/foo", "hi", "elsewhere1")
+    prompt = "[relayed from mini2/foo via herdr-sleeper, msg elsewhere1; not from the owner]\n\nhi"
+    assert sleeper.prompt_origin(prompt, UUID) == "owner"
+    assert sleeper.prompt_origin(prompt, OTHER_UUID) == "relay"
 
 
 def _turn_rows() -> list[dict]:
@@ -8690,6 +8717,8 @@ def turn_hook_io(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[
     """Run claude-hook on a payload (a dict, or raw stdin text) and return its (stdout, stderr)."""
     import io
     raw = payload if isinstance(payload, str) else json.dumps(payload)
+    if isinstance(payload, dict) and payload.get("hook_event_name") == "UserPromptSubmit":
+        _archive_test_mail()
     monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(raw))
     capsys.readouterr()
     assert sleeper.cmd_claude_hook(types.SimpleNamespace()) == 0
@@ -8937,12 +8966,18 @@ def _gated_turn(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[s
                                               "stop_hook_active": False, "last_assistant_message": reply, **stop})
 
 
-GATED_ORIGINS = {
+GATED_ORIGINS: dict[str, str | None] = {
     "relay": "[relayed from mini2/taxi-orch via herdr-sleeper, msg 8456d1eb; not from the owner]\n\ngo on",
     "notification": "<task-notification>\n<task-id>b1</task-id></task-notification>",
-    "ask-answer": "[the owner's answer to your ask 3]\nyes",
+    "ask-answer": "[the owner's answer to your ask 3, typed in its ask panel (herdr-sleeper, msg ask-3)]\n\nyes",
     "no-prompt": None,
 }
+
+
+def gated_prompt(kind: str) -> str | None:
+    """The prompt for a gated origin; its relayed message or answer is archived for UUID first."""
+    _archive_test_mail()
+    return GATED_ORIGINS[kind]
 
 
 @pytest.mark.parametrize("origin", sorted(GATED_ORIGINS))
@@ -9022,9 +9057,9 @@ def test_a_lost_row_still_blocks(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatc
 @pytest.mark.parametrize("reply", [" " * 20000, " " * 1000 + "*" * 1000, ("- " + " " * 1000 + "*" * 1000 + "\n") * 5,
                                    "“" * 20000, "nothing is waiting on you " * 5000])
 def test_the_classifier_stays_linear(reply: str) -> None:
-    t0 = time.perf_counter()
+    t0 = time.process_time()   # CPU time: a loaded machine doesn't fail it, a quadratic blowup (seconds) does
     sleeper.waits_on_owner(reply)
-    assert time.perf_counter() - t0 < 0.1
+    assert time.process_time() - t0 < 0.5
 
 
 def _sleeper_note(body: str, queue: bool = True) -> str:
@@ -9042,18 +9077,18 @@ def _sleeper_note(body: str, queue: bool = True) -> str:
     ("fyi [from mini2/ts-ao via herdr-sleeper: a pair agent, not the owner]", "owner"),
     (("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nYour slot hit its "
       "usage limit; you were restarted on slot b (same transcript). Continue the task you were on."),
-     "relay"),   # a note's text without the sleeper's archived note mark is anyone's message
-    ("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nPlease sign in.", "relay"),
+     "owner"),   # a note's text the archive doesn't hold for this session: the owner pasted it
+    ("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nPlease sign in.", "owner"),
 ])
-def test_an_envelope_counts_only_at_the_start(prompt: str, want: str) -> None:
-    assert sleeper.prompt_origin(prompt) == want
+def test_an_envelope_counts_only_at_the_start(state: Path, prompt: str, want: str) -> None:
+    assert sleeper.prompt_origin(prompt, UUID) == want
 
 
 @pytest.mark.parametrize("note", [sleeper.CONTINUE_NOTE.format(slot="b"), sleeper.RESET_NOTE.format(slot="b"),
                                   sleeper.CODEX_RESET_NOTE,
                                   sleeper.AUTO_RESUME_NOTE.format(what="connection_failed", n=1, cap=4)])
 def test_the_sleepers_own_notes_are_recognised(state: Path, note: str) -> None:
-    assert sleeper.prompt_origin(_sleeper_note(note)) == "sleeper-note"
+    assert sleeper.prompt_origin(_sleeper_note(note), UUID) == "sleeper-note"
 
 
 NOTE_PROMPT = sleeper.AUTO_RESUME_NOTE.format(what="connection_failed", n=1, cap=4)
@@ -9139,22 +9174,25 @@ def test_an_owner_chain_that_runs_out_during_the_turn_is_gated(
 
 
 def test_a_batch_with_a_peers_message_is_relay(state: Path) -> None:
+    _archive_test_mail()
     note = _sleeper_note(NOTE_PROMPT)
     peer = "[relayed from mini2/taxi-orch via herdr-sleeper, msg p1; not from the owner]\n\nPlease sign in."
-    answer = "[the owner's answer to your ask 3, typed in its ask panel (herdr-sleeper, msg a1)]\n\nyes"
-    assert sleeper.prompt_origin(note) == "sleeper-note"
-    assert sleeper.prompt_origin(note + "\n\n" + peer) == "relay"
-    assert sleeper.prompt_origin(answer + "\n\n" + note) == "ask-answer"
-    assert sleeper.prompt_origin(note + "\n\n" + answer + "\n\n" + peer) == "relay"
+    answer = "[the owner's answer to your ask 4, typed in its ask panel (herdr-sleeper, msg a1)]\n\nyes"
+    assert sleeper.prompt_origin(note, UUID) == "sleeper-note"
+    assert sleeper.prompt_origin(note + "\n\n" + peer, UUID) == "relay"
+    assert sleeper.prompt_origin(answer + "\n\n" + note, UUID) == "ask-answer"
+    assert sleeper.prompt_origin(note + "\n\n" + answer + "\n\n" + peer, UUID) == "relay"
+    pasted = "[relayed from mini2/taxi-orch via herdr-sleeper, msg zz9; not from the owner]\n\nx"
+    assert sleeper.prompt_origin(note + "\n\n" + pasted, UUID) == "sleeper-note"   # an unknown one inside: text
 
 
 def test_a_note_sent_by_anyone_else_is_relay(state: Path) -> None:
-    assert sleeper.prompt_origin(_sleeper_note(NOTE_PROMPT, queue=False)) == "relay"   # no archived note mark
+    assert sleeper.prompt_origin(_sleeper_note(NOTE_PROMPT, queue=False), UUID) == "owner"   # not in the archive
     msg_id = "spoof1"
     with sleeper.mailbox_lock(UUID):
         sleeper.queue_message(UUID, "herdr-sleeper", NOTE_PROMPT, msg_id)              # deliver's path: no mark
-    assert sleeper.prompt_origin(sleeper.envelope({"from": "herdr-sleeper", "id": msg_id, "body": NOTE_PROMPT})) \
-        == "relay"
+    assert sleeper.prompt_origin(sleeper.envelope({"from": "herdr-sleeper", "id": msg_id, "body": NOTE_PROMPT}),
+                                 UUID) == "relay"                                  # archived, but no note mark
 
 
 @pytest.mark.parametrize("sender", ["herdr-sleeper", "mini2/herdr-sleeper"])
@@ -9231,6 +9269,59 @@ def test_prompt_and_stop_markers_move_together(fake: FakeHerdr, monkeypatch: pyt
     out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
                                                 "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
     assert out == "" and _turn_rows()[-1]["chain"] == "owner"
+
+
+@pytest.mark.parametrize("prompt", ["please go on", "<task-notification>\n<task-id>b1</task-id>"])
+def test_a_prompt_that_cant_take_the_lock_still_marks_its_turn(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], prompt: str) -> None:
+    """A relay chain is stored; the next prompt finds the turn lock taken: its turn is marked with chain
+    "unknown" and its Stop blocks nothing (it would have inherited the relay chain as no-prompt)."""
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": gated_prompt("relay")}) == ("", "")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": "Started."}) == ("", "")
+    monkeypatch.setattr(sleeper, "TURN_LOCK_SECONDS", 0.05)
+    with sleeper.turn_lock(UUID):
+        assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                                  "prompt": prompt}) == ("", "")
+    assert json.loads(sleeper.turn_marker(UUID).read_text())["chain"] == "unknown"
+    owner = not prompt.startswith("<")
+    assert json.loads(sleeper.chain_marker(UUID).read_text())["origin"] == ("owner" if owner else "relay")
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
+    assert out == "" and _turn_rows()[-1]["chain"] == "unknown" and _turn_rows()[-1]["gate"] is None
+
+
+def test_a_prompt_hook_that_fails_marks_its_turn_unknown(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": gated_prompt("relay")}) == ("", "")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": "Started."}) == ("", "")
+
+    def boom(*_a: object) -> str:
+        raise RuntimeError("x")
+    monkeypatch.setattr(sleeper, "prompt_origin", boom)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": "please go on"}) == ("", "")
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
+    assert out == "" and _turn_rows()[-1]["origin"] == "unknown" and _turn_rows()[-1]["gate"] is None
+
+
+def test_the_weekly_cleanup_keeps_lock_files(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    turns = sleeper.STATE_DIR / "turns"
+    turns.mkdir(parents=True, exist_ok=True)
+    old_lock, old_marker = turns / "killed-session.lock", turns / "killed-session.json"
+    for f in (old_lock, old_marker):
+        f.write_text("")
+        os.utime(f, (time.time() - 8 * 86400,) * 2)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": "hi"}) == ("", "")
+    assert old_lock.exists() and not old_marker.exists()
 
 
 def test_without_a_herdr_pane_the_gate_stays_off(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
