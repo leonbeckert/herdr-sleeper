@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import re
@@ -626,7 +627,8 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
                       "answer_dialogs": True, "limit_monitor": "", "codex_stuck": True, "auto_resume": True,
-                      "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": [], "ask_gate": True}
+                      "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": [], "ask_gate": True,
+                      "ask_mirror": True}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -10583,3 +10585,176 @@ def test_the_closed_popup_numbers_the_newest_next_to_its_prompt(fake: FakeHerdr,
     assert "herdr-sleeper reopen" not in out and "a number reopens that session" in out
     sleeper.cmd_closed_view_open(types.SimpleNamespace())
     assert any(c[:3] == ("plugin", "pane", "open") and "closed-sessions" in c for c in fake.calls)
+
+
+def _fake_moshi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> Path:
+    """A moshi-hook stand-in: `status --json` says paired with E2EE on; `ask` runs BODY (shell), and
+    its argv lands in argv.txt, one argument per line."""
+    fake_bin = tmp_path / "moshi-hook"
+    fake_bin.write_text("#!/bin/sh\n"
+                        'if [ "$1" = status ]; then echo \'{"paired": true, "e2ee": {"policy": "on"}}\'; exit 0; fi\n'
+                        f'for a in "$@"; do printf "%s\\n--\\n" "$a"; done > "{tmp_path}/argv.txt"\n' + body + "\n")
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(sleeper, "moshi_binary", lambda: str(fake_bin))
+    sleeper.MIRRORED.update(ready=None, checked=float("-inf"))
+    return fake_bin
+
+
+def test_mirror_buttons_for_a_question_six_options_more_and_a_todo() -> None:
+    q = {"options": ["now", "tonight"], "recommend": 2}
+    assert sleeper.mirror_choices(q) == [("1. now", "1"), ("2. tonight ★", "2"), (sleeper.MIRROR_TALK, "?")]
+    six = sleeper.mirror_choices({"options": [f"o{i}" for i in range(1, 7)]})
+    assert [t for _, t in six] == ["1", "2", "3", "4", "5", "6"]                  # six fill the card, no talk
+    seven = sleeper.mirror_choices({"options": [f"o{i}" for i in range(1, 8)]})
+    assert [t for _, t in seven] == ["1", "2", "3", "4", "5", "?"] and "pane" in seven[-1][0]
+    assert sleeper.mirror_choices({"options": ["x" * 200, "y"]})[0][0].endswith("…")
+    assert sleeper.mirror_choices({"type": sleeper.TODO, "question": "run it"}) == [
+        (sleeper.MIRROR_DONE, "d"), (sleeper.MIRROR_CANT, "x")]
+
+
+def test_a_tap_on_the_phone_answers_the_ask_the_panels_way(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch, context="canary green 40 min\nrollback is one play") == 0
+    (ask_id, rec), = _asks().items()
+    _sync_delivery(monkeypatch)
+    _fake_moshi(tmp_path, monkeypatch, 'echo "2. tonight ★"; exit 0')
+    assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    done = _asks()[ask_id]
+    assert done["state"] == "answered" and done["answer"].startswith("option 2: tonight")
+    assert "(answered on the phone)" in prompts(fake)[-1][3]
+    assert sleeper.read_mirror_state(ask_id)["outcome"] == "answered-sent"
+    argv = (tmp_path / "argv.txt").read_text().split("\n--\n")
+    assert argv[:2] == ["ask", "--source"] and "--require-remote" in argv and "2. tonight ★" in argv
+    card = argv[-2]
+    assert card.startswith("Question from ") and "Deploy now or tonight?" in card and "rollback is one play" in card
+
+
+@pytest.mark.parametrize("rc,outcome", [(1, "dismissed"), (3, "timed-out"), (4, "unreachable")])
+def test_a_phone_question_without_a_tap_leaves_the_ask_open(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rc: int, outcome: str) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    (ask_id, _), = _asks().items()
+    _fake_moshi(tmp_path, monkeypatch, f"exit {rc}")
+    assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    assert _asks()[ask_id]["state"] == "open"
+    st = sleeper.read_mirror_state(ask_id)
+    assert st["outcome"] == outcome and (("retry_at" in st) == (rc == 4))
+
+
+def test_the_phone_question_ends_when_the_panel_answered_first(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    (ask_id, _), = _asks().items()
+    _fake_moshi(tmp_path, monkeypatch, "sleep 30; echo Done")
+    monkeypatch.setattr(sleeper.time, "sleep", lambda _s: sleeper.close_ask(ask_id, "done"))
+    started = time.monotonic()
+    assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    assert time.monotonic() - started < 15
+    assert sleeper.read_mirror_state(ask_id)["outcome"] == "closed-elsewhere"
+
+
+def test_the_watcher_starts_one_phone_question_per_open_ask_and_only_with_e2ee(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    assert _ask(monkeypatch) == 0
+    started: list[list[str]] = []
+    real_popen = sleeper.subprocess.Popen
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: started.append(argv)
+                        if "ask-mirror" in argv else real_popen(argv, **kw))
+    fake_bin = _fake_moshi(tmp_path, monkeypatch, "exit 0")
+    sleeper.tend_ask_mirrors()
+    assert sorted(a[3] for a in started) == sorted(_asks()) and all(a[2] == "ask-mirror" for a in started)
+    sleeper.tend_ask_mirrors()
+    assert len(started) == 2                                   # running (fresh beat): not started again
+    first = sorted(_asks())[0]
+    sleeper.write_mirror_state(first, outcome="unreachable", retry_at=time.time() - 1)
+    sleeper.write_mirror_state(sorted(_asks())[1], outcome="dismissed")
+    sleeper.tend_ask_mirrors()
+    assert [a[3] for a in started[2:]] == [first]              # unreachable a while ago: again; dismissed: never
+    fake_bin.write_text("#!/bin/sh\necho '{\"paired\": true, \"e2ee\": {\"policy\": \"off\"}}'\n")
+    sleeper.MIRRORED.update(ready=None, checked=float("-inf"))
+    sleeper.write_mirror_state(first, outcome="unreachable", retry_at=time.time() - 1)
+    sleeper.tend_ask_mirrors()
+    assert len(started) == 3                                   # no E2EE: nothing goes to the phone
+
+
+def test_a_mirror_that_keeps_dying_is_given_up_after_three_starts(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    (ask_id, _), = _asks().items()
+    started: list[list[str]] = []
+    real_popen = sleeper.subprocess.Popen
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: started.append(argv)
+                        if "ask-mirror" in argv else real_popen(argv, **kw))
+    _fake_moshi(tmp_path, monkeypatch, "exit 0")
+    real = time.time
+    for n in range(5):   # each start dies at once: its beat ages past the dead mark before the next tick
+        monkeypatch.setattr(sleeper.time, "time", lambda n=n: real() + n * 200)
+        sleeper.tend_ask_mirrors()
+    assert len(started) == 3 and sleeper.read_mirror_state(ask_id)["outcome"] == "failed"
+
+
+def test_mirror_maps_what_moshi_prints_tolerantly_and_a_question_without_options_gets_later() -> None:
+    choices = sleeper.mirror_choices({"options": ["now", "tonight"], "recommend": 2})
+    assert sleeper.mirror_pick(choices, "2. tonight ★\n") == (True, "2")
+    assert sleeper.mirror_pick(choices, "warning: slow\n  2.  TONIGHT ★  \n\n") == (True, "2")    # last line, spacing
+    assert sleeper.mirror_pick(choices, "2. tonight") == (True, "2")                             # star dropped
+    assert sleeper.mirror_pick(choices, "Talk it over in the session") == (True, "?")
+    assert sleeper.mirror_pick(choices, "something else") == (False, None)
+    bare = sleeper.mirror_choices({"options": []})
+    assert bare == [(sleeper.MIRROR_TALK, "?"), (sleeper.MIRROR_LATER, None)]
+
+
+def test_a_live_mirror_holds_its_lock_so_the_watcher_never_starts_a_second(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    (ask_id, _), = _asks().items()
+    started: list[list[str]] = []
+    real_popen = sleeper.subprocess.Popen
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: started.append(argv)
+                        if "ask-mirror" in argv else real_popen(argv, **kw))
+    _fake_moshi(tmp_path, monkeypatch, "exit 0")
+    path = sleeper.mirror_lock_path(ask_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)          # a mirror runs, however old its beat
+    sleeper.write_mirror_state(ask_id, started=1, beat=1)
+    try:
+        sleeper.tend_ask_mirrors()
+        assert started == [] and sleeper.mirror_alive(ask_id)
+        assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+        assert not (tmp_path / "argv.txt").exists()              # a second mirror never asks
+    finally:
+        os.close(fd)
+    assert not sleeper.mirror_alive(ask_id)
+
+
+def test_talk_it_over_from_the_phone_keeps_the_item_open_and_off_the_phone(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch) == 0
+    (ask_id, _), = _asks().items()
+    _sync_delivery(monkeypatch)
+    _fake_moshi(tmp_path, monkeypatch, f'echo "{sleeper.MIRROR_TALK}"; exit 0')
+    assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    rec = _asks()[ask_id]
+    assert rec["state"] == "open" and rec["talk"] and sleeper.read_mirror_state(ask_id)["outcome"] == "talk"
+    assert "talk this over" in prompts(fake)[-1][3]
+
+
+def test_an_unmatched_tap_is_asked_again_and_capped(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch) == 0
+    (ask_id, _), = _asks().items()
+    _fake_moshi(tmp_path, monkeypatch, 'echo "?!"; exit 0')
+    assert sleeper.cmd_ask_mirror(types.SimpleNamespace(ask_id=ask_id, state_dir=str(sleeper.STATE_DIR))) == 0
+    assert _asks()[ask_id]["state"] == "open" and sleeper.read_mirror_state(ask_id)["outcome"] == "retry"
+    started: list[list[str]] = []
+    real_popen = sleeper.subprocess.Popen
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: started.append(argv)
+                        if "ask-mirror" in argv else real_popen(argv, **kw))
+    sleeper.write_mirror_state(ask_id, posts=sleeper.ASK_MIRROR_POSTS - 1)
+    sleeper.tend_ask_mirrors()
+    assert len(started) == 1                                   # once more ...
+    sleeper.write_mirror_state(ask_id, outcome="retry")
+    sleeper.tend_ask_mirrors()
+    assert len(started) == 1 and sleeper.read_mirror_state(ask_id)["outcome"] == "failed"   # ... then never

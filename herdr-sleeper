@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.51"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.52"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -263,6 +263,7 @@ DEFAULTS = {
     "auto_resume_max_age_hours": 24.0,  # older errors are left alone (TOML: auto_resume_max_age = "24h")
     "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
     "ask_gate": True,            # a turn that ends waiting on the owner without an ask covering it is sent back
+    "ask_mirror": True,          # every open ask also goes to the owner's phone as a Moshi question (moshi-hook ask)
 }
 
 
@@ -792,7 +793,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
     for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume",
-                "codex_stuck", "ask_gate"):
+                "codex_stuck", "ask_gate", "ask_mirror"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -7400,6 +7401,295 @@ def ask_target(rec: dict) -> str:
     return uuid
 
 
+# --- the ask mirror: every open ask also on the owner's phone (owner 2026-11-17) -------------------
+# Moshi (the owner's iPhone/iPad app) shows no Herdr panes, but moshi-hook, paired on every Mac, has
+# `moshi-hook ask`: a push and a question with 2-6 buttons that blocks until it is answered. The
+# watcher starts one `ask-mirror` per open item; it runs moshi-hook ask and hands a tap to
+# send_answer(), the panel's own path, so whichever answers first wins. It watches the item while
+# it waits and ends the phone question when the panel (or a withdraw) closed it. Its state lives in
+# STATE_DIR/ask-mirrors/<id>.json (pid, beat, outcome), never in asks.json: no lock is held while
+# the owner thinks. Only with end-to-end encryption on (the card carries the context).
+ASK_MIRROR_TICK = 15               # the watcher looks for open asks without a phone question this often
+ASK_MIRROR_BEAT = 20               # a running mirror rewrites its state file this often
+ASK_MIRROR_DEAD = 90               # a state file older than this without an outcome: the mirror died
+ASK_MIRROR_RETRY = 600             # Moshi unreachable: try again after this long
+ASK_MIRROR_CONTEXT = 900           # characters of context on the card (the owner reads all of it there)
+ASK_MIRROR_OPTION = 60             # characters of one button
+ASK_MIRROR_SPAWNS = 3              # a mirror that died this often without an outcome is given up
+ASK_MIRROR_POSTS = 6               # phone questions per item in all (Moshi down, taps that couldn't be handed on)
+ASK_MIRROR_TIMEOUT = "24h"         # moshi-hook's maximum; after it the phone question is not asked again
+MIRROR_TALK, MIRROR_DONE, MIRROR_CANT = "Talk it over in the session", "Done", "Can't or won't"
+MIRROR_LATER = "Later: leave it open"
+
+
+def mirror_state_path(ask_id: str) -> Path:
+    return STATE_DIR / "ask-mirrors" / f"{ask_id}.json"
+
+
+def read_mirror_state(ask_id: str) -> dict:
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        rec = json.loads(mirror_state_path(ask_id).read_text())
+        if isinstance(rec, dict):
+            return rec
+    return {}
+
+
+def write_mirror_state(ask_id: str, **fields: object) -> None:
+    path = mirror_state_path(ask_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_private_json(path, {**read_mirror_state(ask_id), **fields, "beat": time.time()})
+
+
+def moshi_binary() -> str | None:
+    return shutil.which("moshi-hook") or next(
+        (p for p in ("/opt/homebrew/bin/moshi-hook", "/usr/local/bin/moshi-hook") if os.access(p, os.X_OK)), None)
+
+
+def moshi_ready() -> bool:
+    """moshi-hook is installed, paired and end-to-end encrypted (checked at most every 10 minutes)."""
+    if MIRRORED["ready"] is not None and time.monotonic() - MIRRORED["checked"] < 600:
+        return bool(MIRRORED["ready"])
+    ready = False
+    binary = moshi_binary()
+    if binary:
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            out = subprocess.run([binary, "status", "--json"], capture_output=True, text=True, timeout=15).stdout
+            st = json.loads(out)
+            ready = bool(st.get("paired")) and (st.get("e2ee") or {}).get("policy") == "on"
+    MIRRORED.update(ready=ready, checked=time.monotonic())
+    return ready
+
+
+def mirror_choices(rec: dict) -> list[tuple[str, str | None]]:
+    """(button label, what the panel would take for it; None: leave the item open) for one item: a
+    question's options (numbered, the recommended one starred) and "talk it over", a to-do's done
+    and can't. Moshi takes 2-6 buttons; a question without options gets "later" as its second."""
+    def button(text: str) -> str:
+        text = clean_text(text).replace("\n", " ").strip()
+        return text if len(text) <= ASK_MIRROR_OPTION else text[:ASK_MIRROR_OPTION - 1] + "…"
+    if ask_kind(rec) == TODO:
+        return [(MIRROR_DONE, TODO_DONE), (MIRROR_CANT, TODO_CANT)]
+    options = [str(o) for o in rec.get("options") or []]
+    rec_n = rec.get("recommend")
+    shown = options[:5] if len(options) != 6 else options
+    out: list[tuple[str, str | None]] = [(button(f"{n}. {o}" + (" ★" if rec_n == n else "")), str(n))
+                                         for n, o in enumerate(shown, 1)]
+    if len(out) < 6:
+        out.append((button(MIRROR_TALK if len(options) <= 5 else "More options in the pane: talk it over"), ASK_TALK))
+    if len(out) < 2:
+        out.append((MIRROR_LATER, None))
+    return out
+
+
+def _norm_label(text: str) -> str:
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
+
+
+def mirror_pick(choices: list[tuple[str, str | None]], printed: str) -> tuple[bool, str | None]:
+    """(matched, what the panel takes) for moshi-hook's output: its last non-empty line, compared
+    without case, spacing or Unicode form; a number-led line falls back to its number."""
+    line = next((ln for ln in reversed(printed.splitlines()) if ln.strip()), "")
+    want = _norm_label(line)
+    for label, typed in choices:
+        if _norm_label(label) == want:
+            return True, typed
+    m = re.match(r"\s*(\d)\.", line)
+    if m:
+        hit = [typed for label, typed in choices if label.startswith(m.group(1) + ".")]
+        if len(hit) == 1:
+            return True, hit[0]
+    return False, None
+
+
+def mirror_text(rec: dict) -> str:
+    """The card: the question or to-do, who asks and where, then the context (shortened)."""
+    kind = "To-do" if ask_kind(rec) == TODO else "Question"
+    who = clean_text(f"{rec.get('machine') or this_machine()}/{rec.get('asker') or '?'}")
+    place = clean_text(rec.get("asker_place") or "")   # as filed: the card never waits on herdr
+    context = clean_text(rec.get("context") or "").strip()
+    if len(context) > ASK_MIRROR_CONTEXT:
+        context = context[:ASK_MIRROR_CONTEXT - 1].rstrip() + "… (the rest is in the pane)"
+    lines = [f"{kind} from {who}" + (f", in {place}" if place else "") + ":", clean_text(rec.get("question") or "")]
+    if rec.get("copy"):
+        lines.append("It has a command to run: copy it from the pane on a Mac (c).")
+    return "\n".join(lines) + (f"\n\n{context}" if context else "")
+
+
+def mirror_lock_path(ask_id: str) -> Path:
+    return STATE_DIR / "ask-mirrors" / f"{ask_id}.lock"
+
+
+def mirror_alive(ask_id: str) -> bool:
+    """A mirror holds its item's lock for its whole life: held = alive (a sleeping Mac or a slow
+    herdr call never makes a live one look dead), free = gone."""
+    try:
+        fd = os.open(mirror_lock_path(ask_id), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)   # closing drops a lock we just took
+    return False
+
+
+def _end_stale_moshi(st: dict) -> None:
+    """A mirror that died left its moshi-hook ask running: end it (only our own, by its process
+    group, which the mirror started for it), so no second card stands next to the first."""
+    pgid = st.get("moshi_pgid")
+    if isinstance(pgid, int) and pgid > 1:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGTERM)
+
+
+def tend_ask_mirrors() -> None:
+    """Start a phone question for every open item on this machine that has none running: never
+    asked there, its mirror died (at most ASK_MIRROR_SPAWNS starts), or Moshi was unreachable a
+    while ago (at most ASK_MIRROR_POSTS phone questions per item in all)."""
+    if not moshi_ready():
+        return
+    now = time.time()
+    asks = read_asks()
+    with contextlib.suppress(OSError):   # a closed item's mirror state goes after a week
+        for old in os.scandir(STATE_DIR / "ask-mirrors"):
+            closed = (asks.get(old.name.split(".", 1)[0]) or {}).get("state") != "open"
+            if closed and now - old.stat().st_mtime > 7 * 86400:
+                os.unlink(old.path)
+    for ask_id, rec in asks.items():
+        try:
+            if not isinstance(rec, dict) or rec.get("state") != "open" or rec.get("talk") \
+                    or not ASK_ID_RE.fullmatch(str(ask_id)) or mirror_alive(ask_id):
+                continue
+            st = read_mirror_state(ask_id)
+            outcome = st.get("outcome")
+            posts, spawns = int(st.get("posts") or 0), int(st.get("spawns") or 0)
+            if outcome == "unreachable" and now >= float(st.get("retry_at") or 0):
+                spawns = 0                   # Moshi was down: a fresh start, not a crash
+            elif outcome == "retry":
+                pass                         # a tap that couldn't be handed on: ask once more
+            elif outcome:
+                continue
+            elif st and now - float(st.get("started") or 0) < 30:
+                continue                     # just started: its lock comes in a moment
+            if posts >= ASK_MIRROR_POSTS or spawns >= ASK_MIRROR_SPAWNS:
+                write_mirror_state(ask_id, outcome="failed")
+                event("ask-mirror-failed", id=ask_id, posts=posts, spawns=spawns)
+                continue
+            _end_stale_moshi(st)
+            write_mirror_state(ask_id, outcome=None, started=now, spawns=spawns + 1, posts=posts + 1,
+                               moshi_pgid=None)
+            subprocess.Popen([sys.executable, str(SELF), "ask-mirror", ask_id, str(STATE_DIR)],
+                             start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            event("ask-mirror-started", id=ask_id)
+        except (OSError, ValueError, TypeError, SleeperError) as exc:   # one bad item never stops the others
+            say(f"ask mirror {ask_id}: {type(exc).__name__}: {exc}")
+
+
+def cmd_ask_mirror(args: argparse.Namespace) -> int:
+    """One item's phone question (internal, started by the watcher): moshi-hook ask, then the tap
+    goes the panel's way (send_answer). Ends the question when the item closes elsewhere, and on
+    any way out (an error, SIGTERM): it never leaves a phone question nobody listens to."""
+    set_state_dir(Path(args.state_dir))
+    ask_id = args.ask_id
+    if not ASK_ID_RE.fullmatch(ask_id):
+        return 2
+    lock = mirror_lock_path(ask_id)
+    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        return 0   # another mirror runs this item: never two phone questions
+    try:
+        return _run_mirror(ask_id)
+    finally:
+        os.close(lock_fd)   # the lock goes with it
+
+
+def _run_mirror(ask_id: str) -> int:
+    rec = read_asks().get(ask_id)
+    binary = moshi_binary()
+    MIRRORED.update(ready=None)
+    if not isinstance(rec, dict) or rec.get("state") != "open" or not binary or not moshi_ready():
+        write_mirror_state(ask_id, outcome="gone")
+        return 0
+    choices = mirror_choices(rec)
+    label = re.sub(r"^[-\s]+", "", clean_text(rec.get("asker") or ""))[:40] or "herdr"
+    argv = [binary, "ask", "--source", "herdr-ask", "--label", label, "--require-remote",
+            "--timeout", ASK_MIRROR_TIMEOUT]
+    for text, _ in choices:
+        argv += ["--option", text]
+    argv += ["--", mirror_text(rec)]
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, start_new_session=True)
+    write_mirror_state(ask_id, pid=os.getpid(), moshi_pgid=proc.pid)
+
+    def end_question(*_a: object) -> None:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGTERM)
+    def on_term(*_a: object) -> None:
+        end_question()
+        sys.exit(0)
+    prev = signal.signal(signal.SIGTERM, on_term)
+    try:
+        while proc.poll() is None:
+            time.sleep(2)
+            try:
+                cur = read_asks().get(ask_id)
+            except SleeperError:
+                continue           # a moment's unreadable file: look again
+            if not isinstance(cur, dict) or cur.get("state") != "open" or cur.get("talk"):
+                end_question()     # answered in the panel or withdrawn: the phone question ends
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=10)
+                write_mirror_state(ask_id, outcome="closed-elsewhere", moshi_pgid=None)
+                return 0
+            if time.time() - float(read_mirror_state(ask_id).get("beat") or 0) >= ASK_MIRROR_BEAT:
+                write_mirror_state(ask_id)
+        printed = proc.stdout.read() if proc.stdout else ""
+        rc = proc.returncode
+        write_mirror_state(ask_id, moshi_pgid=None)
+        if rc == 4:
+            write_mirror_state(ask_id, outcome="unreachable", retry_at=time.time() + ASK_MIRROR_RETRY)
+            return 0
+        if rc != 0:
+            write_mirror_state(ask_id, outcome={1: "dismissed", 3: "timed-out"}.get(rc, f"exit-{rc}"))
+            return 0
+        matched, typed = mirror_pick(choices, printed)
+        if not matched:
+            write_mirror_state(ask_id, outcome="retry")   # the watcher asks once more (capped)
+            event("ask-mirror-unmatched", id=ask_id)
+            return 0
+        if typed is None:
+            write_mirror_state(ask_id, outcome="later")
+            return 0
+        rec = read_asks().get(ask_id)
+        got = ask_answer(rec, typed) if isinstance(rec, dict) else None
+        if got is None:
+            write_mirror_state(ask_id, outcome="gone")
+            return 0
+        state, body, keep = got
+        status = BUSY
+        for _ in range(30):   # the panel's own retry: a busy mailbox or lock clears within seconds
+            status, _note = send_answer(ask_id, state, body + "\n(answered on the phone)", keep)
+            if status != BUSY:
+                break
+            write_mirror_state(ask_id)
+            time.sleep(2)
+        write_mirror_state(ask_id, outcome="retry" if status == BUSY else "talk" if keep else f"answered-{status}")
+        event("ask-mirror-answered", id=ask_id, status=status, keep=keep)
+        return 0
+    finally:
+        if proc.poll() is None:
+            end_question()
+        signal.signal(signal.SIGTERM, prev)
+
+
 def kick_delivery(uuid: str, sender: str) -> None:
     """Deliver the session's queued mail in the background (wake it if it sleeps): the panel never
     waits on a wake or a busy session; the watcher retries what this one cannot type in."""
@@ -11487,9 +11777,16 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
             reap_lost_asks(agents)
         except Exception as exc:
             say(f"ask reaper: {type(exc).__name__}: {exc}")
+    if not STOP["requested"] and config.get("ask_mirror") and time.monotonic() - MIRRORED["at"] >= ASK_MIRROR_TICK:
+        MIRRORED["at"] = time.monotonic()
+        try:  # every open ask on the owner's phone too (Moshi shows no Herdr panes)
+            tend_ask_mirrors()
+        except Exception as exc:
+            say(f"ask mirror: {type(exc).__name__}: {exc}")
 
 
 REAPED = {"at": float("-inf")}
+MIRRORED: dict[str, Any] = {"at": float("-inf"), "ready": None, "checked": float("-inf")}
 
 
 def flush_mail_safely(agents: list[dict]) -> None:
@@ -12298,6 +12595,10 @@ def main(argv: list[str] | None = None) -> int:
                    ).set_defaults(fn=cmd_ask_inbox)
     sub.add_parser("ask-inbox-open", help="open the ask inbox as a popup (the plugin action)"
                    ).set_defaults(fn=cmd_ask_inbox_open)
+    amp = sub.add_parser("ask-mirror", help="one ask's phone question through moshi-hook (internal, the watcher)")
+    amp.add_argument("ask_id")
+    amp.add_argument("state_dir")
+    amp.set_defaults(fn=cmd_ask_mirror)
     app = sub.add_parser("ask-pane", help="a tab-design ask's program (internal, kept for old asks)")
     app.add_argument("ask_id")
     app.add_argument("state_dir")

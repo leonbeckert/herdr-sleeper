@@ -260,7 +260,7 @@ restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
 `wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `codex_stuck` (see "A Codex pane stuck after its turn"),
-`auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `ask_gate` (default on; see "Turn-end count and ask gate"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
+`auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `ask_gate` (default on; see "Turn-end count and ask gate"), `ask_mirror` (default on: open asks on the owner's phone through moshi-hook), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one, but report it when it is
@@ -438,6 +438,27 @@ herdr-sleeper ask --done ID                                     # a to-do the se
   The answers are pinned: the options (the recommended one marked ★), `?`, or
   `d`/`x` for a to-do are never paged away; on a short pane they shrink to one
   line each. `z` zooms the panel (an 80-column terminal leaves it about 22).
+- **On the phone** (v0.1.52, owner 2026-11-17): Moshi shows no Herdr panes,
+  so the watcher also puts every open item on the owner's phone with
+  `moshi-hook ask` (`ask_mirror`, default on; only when moshi-hook is paired
+  and end-to-end encrypted). The card names the asker and its place and carries
+  the question and up to 900 characters of context; the buttons are the options
+  (numbered, ★ recommended, at most 5 plus "talk it over", or 6) or, for a
+  to-do, done and can't. A tap goes the panel's way (`send_answer`), marked
+  "(answered on the phone)"; whichever answers first wins, and an item closed
+  in the panel or withdrawn ends its phone question. A command is copied on a
+  Mac (`c`), never from the phone. A question without options gets "talk it
+  over" and "later: leave it open". Dismissed, timed out after 24 h, "later" or
+  "talk it over" on the phone: not asked there again (the pane keeps the item).
+  Moshi unreachable: again after 10 min. A tap that couldn't be matched or
+  handed on is asked once more, at most 6 phone questions per item; a mirror
+  that died 3 times is given up. A live mirror holds `ask-mirrors/<id>.lock`
+  for its whole life, so a sleeping Mac or a slow herdr call never starts a
+  second card; it ends its `moshi-hook ask` on every way out (SIGTERM, error),
+  and the watcher ends one a dead mirror left behind (by its process group).
+  The card's text is an argument of `moshi-hook ask` (it reads no stdin), so a
+  local process listing shows it: asks carry no secrets anyway. A tap answers at
+  once, without the panel's `y` confirm. State in `ask-mirrors/<id>.json`.
 - **Copy and paste** (v0.1.47): the context is wrapped and indented for reading,
   so a command selected out of it breaks in a shell. A command the owner runs
   elsewhere goes in `--copy` (`--copy-file`): the card shows it (a long one in
