@@ -10887,3 +10887,28 @@ def test_the_search_popup_opens_from_the_action(fake: FakeHerdr, monkeypatch: py
     monkeypatch.delenv("CLAUDECODE", raising=False)
     sleeper.cmd_search_view_open(types.SimpleNamespace())
     assert any(c[:3] == ("plugin", "pane", "open") and "search" in c for c in fake.calls)
+def test_deliver_reaches_an_unnamed_session_by_its_tab_label(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2026-11-18 (efficiency msg 915eab7f): presence showed `mbp › ao › moshi` with name `-`; deliver
+    # mbp/moshi and ap's AP_REPORT_TO=mbp/moshi found nothing, the run's report was lost.
+    fake.agents = [agent(name=None)]
+    fake.tab_labels = {"w1:t1": "moshi"}
+    assert deliver(monkeypatch, "moshi") == 0
+    (call,) = prompts(fake)
+    assert call[2] == "w1:p1"
+
+
+def test_deliver_by_tab_label_refuses_two_agents_in_tabs_of_that_label(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch,
+                                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents = [agent(name=None), {**agent(pane="w1:p2", uuid="u2-session", name=None, terminal="t2")}]
+    fake.tab_labels = {"w1:t1": "moshi"}
+    assert deliver(monkeypatch, "moshi") == 1
+    assert "2 live agents by tab label" in capsys.readouterr().err
+    assert prompts(fake) == []
+
+
+def test_close_never_resolves_by_tab_label(fake: FakeHerdr) -> None:
+    fake.agents = [agent(name=None)]
+    fake.tab_labels = {"w1:t1": "moshi"}
+    with pytest.raises(sleeper.SleeperError):
+        sleeper.resolve_target("moshi", fake.agents, {})
