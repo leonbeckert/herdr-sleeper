@@ -537,24 +537,37 @@ global lock, which a sleep transaction may hold longer than a hook may run.
 
 **Turn-end count and ask gate** (*v0.1.45*). Registered also as a
 `UserPromptSubmit` and a `Stop` hook (no matcher), `claude-hook` notes how
-each turn ends. It reads no transcript: the prompt's origin (owner, relay,
-ask-answer, notification; no-prompt when no prompt came since the last Stop)
-comes from the `UserPromptSubmit` payload, the reply from the `Stop` payload's
-`last_assistant_message`, both classified in memory. A reply waits on the
-owner when its last three paragraphs ask him to do something (please sign in,
-please run/open/approve/confirm, still waiting on you, run this in a separate
-terminal, once you're in, bitte melde dich an, …: a *todo*) or its last two
-ask him something (should I, which one, let me know which, a closing `?`: a
-*question*); code blocks and `>` quotes don't count.
+each turn ends. It reads no transcript: the prompt's origin comes from the
+`UserPromptSubmit` payload, the reply from the `Stop` payload's
+`last_assistant_message`, both classified in memory. The origin is `relay`,
+`ask-answer` or `sleeper-note` only when the prompt *starts* with that
+envelope (a relayed message the owner pastes into his own prompt stays
+`owner`), `notification` for a background task's event, `no-prompt` when no
+prompt came since the last Stop, else `owner`. Owner, relay and ask-answer
+prompts start a turn **chain**; a notification, a no-prompt turn and a note the
+sleeper typed in itself (a continue note after a usage limit or its reset, an
+auto-resume note) carry on the chain before them, so a background event's turn
+during the owner's chat counts as his (no chain recorded: the turn's own
+origin). A reply waits on the owner when its last three paragraphs ask him to
+do something (please sign in, please run/open/approve/confirm, still waiting
+on you, run this in a separate terminal, "Once you're in, I'll …", bitte melde
+dich an, …: a *todo*) or its last two ask him something (should I, which one,
+let me know which, a closing `?`: a *question*). Code blocks, `>` quote and
+callout lines, inline quotes ("…", “…”), a `?` that only ends a heading or a
+bold label, a negated wait ("nothing is waiting on you") and closing
+pleasantries ("let me know if anything breaks") don't count: a request inside
+a quote or a callout is never read as one.
 
 The owner's rule (2026-11-17): a session that ends its turn waiting on him
 shows as a blocked question in Herdr. While he chats with a session (his own
 message started the turn) it asks in that chat; everything else goes into
 `herdr-sleeper ask`. So when a turn ends with a reply that waits on the owner,
-the turn was **not** started by the owner in chat (relay, notification,
-ask-answer and no-prompt all count), the session holds no open ask (an unknown
-count blocks nothing), and the Stop payload's `stop_hook_active` is `false`,
-the `Stop` hook prints one JSON object and exits 0:
+the turn's chain was **not** started by the owner in chat (relay, ask-answer,
+and a notification or no-prompt turn without an owner chain all count), the
+session holds no open ask (an unknown count blocks nothing), it runs in a
+Herdr pane (`HERDR_PANE_ID`; `ask` needs one), and the Stop payload's
+`stop_hook_active` is `false`, the `Stop` hook prints one JSON object and
+exits 0:
 
 ```json
 {"decision": "block", "reason": "This reply seems to wait on the owner, but the turn wasn't started by the owner in chat and you hold no open ask, so nobody will see it. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' --option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something only the owner can do (one decision or to-do per ask), then end your turn. If your reply does not wait on the owner, just end your turn again."}
@@ -565,16 +578,18 @@ Claude Code then continues the turn with that reason; the next Stop carries
 misread costs one extra step, never a loop. `ask_gate = false` turns the gate
 off (the turns are still counted); with `dry_run` the hook logs `would block
 the turn end (…) (dry run)` to `sleeper.log` instead. A config that can't be
-read, any failure, or an origin of `owner` blocks nothing.
+read, any failure, or an owner chain blocks nothing.
 
-`turn-ends.jsonl` keeps one row per turn with the classes, the session, pane,
-Herdr name, turn length, open-ask count and `gate` (`blocked`, `dry-run`,
+`turn-ends.jsonl` keeps one row per turn with the origin and chain, the
+reply's class, the session, pane, Herdr name, turn length, open-ask count and
+`gate` (`blocked`, `dry-run`,
 `off`, or null when the gate didn't apply), never text. The hooks print
 nothing else, never wait on a lock (a held one drops the row, not the block;
 one Herdr call of at most 2 s keeps the Stop inside its 5 s) and leave only an
 error's class name. `herdr-sleeper turn-ends [--hours N] [--json]` sums them
 by origin and session, with what the gate did and the range the file still
-holds.
+holds; a turn a block sent back (`stop_hook_active`) is not counted again as a
+wait without an ask.
 
 ## Insomnia
 

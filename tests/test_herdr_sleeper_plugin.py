@@ -8871,6 +8871,8 @@ STATUS_HEAD = ("Step 0.3 is through: the gateway answers on :8443 and the canary
     "Sobald du eingeloggt bist, lege ich das Projekt an.",
     "Two steps left for you:\n\n- Run this in a separate terminal.\n- Tell me when the key is plugged in.",
     "Next:\n\n1. **Run this in a new terminal**: `bash x.sh`",
+    "I'll check the logs once you're done with the login.",
+    "Please type \"clinic-gateway\" at the prompt.",
 ])
 def test_the_ask_gate_reads_requests_to_the_owner(reply: str) -> None:
     assert sleeper.waits_on_owner(reply) in ("todo", "question")
@@ -8893,6 +8895,21 @@ def test_the_two_misses_are_todos() -> None:
     "Completed.\n> Please sign in to Sentry.\n> Once you're in, run the canary.",   # a quote right under prose
     "The panel is no longer waiting for you. I completed the login myself.",
     "Nothing is waiting on you; the run is green.",
+    # the coordinator's second review (2026-11-17)
+    "Done. Let me know if anything breaks.",
+    "Fixed. Let me know if you have questions.",
+    "Gepusht. Bitte gib Bescheid, falls etwas fehlt.",
+    "## What changed?\n\nThe hook now prints the block.",
+    "Deployed.\n\n**Why did it fail?**\n\nThe lock was held; it isn't any more.",
+    'Replied to mini2/foo: "Should I push?" with yes.',
+    "Forwarded it to taxi-orch (“Should I push?”).",
+    "Next I'll check the logs once you're in the office.",
+    "I'm not still waiting for you; the play ran.",
+    "No ask is waiting for you.",
+    "There's nothing waiting for you here.",
+    "nobody is waiting on you",
+    "no one is waiting on you",
+    "> [!NOTE]\n> Please sign in to Sentry once more.\n\nThe callout is from the runbook; I signed in myself.",
 ])
 def test_the_ask_gate_leaves_reports_alone(reply: str) -> None:
     assert sleeper.waits_on_owner(reply) == "none"
@@ -8994,6 +9011,96 @@ def test_a_lost_row_still_blocks(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatc
     with sleeper.flocked(sleeper.TURN_ENDS.with_name(sleeper.TURN_ENDS.name + ".lock")):
         out, _ = _gated_turn(monkeypatch, capsys, GATED_ORIGINS["relay"])
     assert json.loads(out)["decision"] == "block" and not sleeper.TURN_ENDS.exists()
+
+
+@pytest.mark.parametrize("reply", [" " * 20000, " " * 1000 + "*" * 1000, ("- " + " " * 1000 + "*" * 1000 + "\n") * 5,
+                                   "“" * 20000, "nothing is waiting on you " * 5000])
+def test_the_classifier_stays_linear(reply: str) -> None:
+    t0 = time.perf_counter()
+    sleeper.waits_on_owner(reply)
+    assert time.perf_counter() - t0 < 0.1
+
+
+def _sleeper_note(body: str) -> str:
+    return sleeper.envelope({"from": "herdr-sleeper", "id": "n1", "body": body})
+
+
+@pytest.mark.parametrize("prompt,want", [
+    ("Look at what came in:\n[relayed from mini2/foo via herdr-sleeper, msg 1; not from the owner]\n\nhi", "owner"),
+    ("see this: [the owner's answer to your ask 3]\nyes", "owner"),
+    ("fyi [from mini2/ts-ao via herdr-sleeper: a pair agent, not the owner]", "owner"),
+    (("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nYour slot hit its "
+      "usage limit; you were restarted on slot b (same transcript). Continue the task you were on."), "sleeper-note"),
+    ("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nPlease sign in.", "relay"),
+])
+def test_an_envelope_counts_only_at_the_start(prompt: str, want: str) -> None:
+    assert sleeper.prompt_origin(prompt) == want
+
+
+@pytest.mark.parametrize("note", [sleeper.CONTINUE_NOTE.format(slot="b"), sleeper.RESET_NOTE.format(slot="b"),
+                                  sleeper.CODEX_RESET_NOTE,
+                                  sleeper.AUTO_RESUME_NOTE.format(what="connection_failed", n=1, cap=4)])
+def test_the_sleepers_own_notes_are_recognised(state: Path, note: str) -> None:
+    assert sleeper.prompt_origin(_sleeper_note(note)) == "sleeper-note"
+
+
+NOTE_PROMPT = sleeper.AUTO_RESUME_NOTE.format(what="connection_failed", n=1, cap=4)
+
+
+@pytest.mark.parametrize("first,then,blocks", [
+    ("owner", "notification", False),     # the owner is chatting: a background event's turn asks in chat
+    ("owner", None, False),               # a turn without a prompt carries on the owner's chain
+    ("owner", "sleeper-note", False),     # so does a continue note the sleeper typed in
+    ("relay", "notification", True),
+    ("relay", "sleeper-note", True),
+    ("ask-answer", None, True),
+    (None, "notification", True),         # no chain recorded: today's behaviour
+    ("notification", None, True),
+])
+def test_the_gate_follows_the_turn_chain(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                         capsys: pytest.CaptureFixture[str], first: str | None,
+                                         then: str | None, blocks: bool) -> None:
+    prompts = {"owner": "please look at the Sentry job", "relay": GATED_ORIGINS["relay"],
+               "ask-answer": GATED_ORIGINS["ask-answer"], "notification": GATED_ORIGINS["notification"],
+               "sleeper-note": _sleeper_note(NOTE_PROMPT)}
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+
+    def turn(kind: str | None, reply: str) -> str:
+        if kind is not None:
+            assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                                      "prompt": prompts[kind]}) == ("", "")
+        out, err = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                      "stop_hook_active": False, "last_assistant_message": reply})
+        assert err == ""
+        return out
+    assert turn(first, "Started the build; it runs in the background.") == ""
+    out = turn(then, MISS_SENTRY)
+    assert bool(out) == blocks
+    row = _turn_rows()[-1]
+    assert row["origin"] == (then or "no-prompt") and row["gate"] == ("blocked" if blocks else None)
+    assert row["chain"] == (first if first in sleeper.CHAIN_SETTERS else then or "no-prompt")
+
+
+def test_without_a_herdr_pane_the_gate_stays_off(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": MISS_SENTRY}) == ("", "")
+    (row,) = _turn_rows()
+    assert row["pane"] is None and row["waits"] == "todo" and row["gate"] is None
+
+
+def test_turn_ends_leaves_continuations_out_of_the_misses(state: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    rows = [{"at": now, "name": "a", "origin": "relay", "waits": "todo", "open_asks": 0, "gate": "blocked",
+             "stop_hook_active": False},
+            {"at": now, "name": "a", "origin": "no-prompt", "waits": "todo", "open_asks": 0, "gate": None,
+             "stop_hook_active": True}]
+    sleeper.TURN_ENDS.parent.mkdir(parents=True, exist_ok=True)
+    sleeper.TURN_ENDS.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=1.0, json=True)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["waits"] == 2 and out["waits_without_ask"] == 1
 
 
 def test_the_readme_shows_the_gate_reason_as_printed() -> None:
