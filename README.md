@@ -927,7 +927,7 @@ safe); a message delivered before then cancels it`). It is always local: no `--m
   (`closing` in `--json`: the reason, `"pending"` without one, else null).
   `scan` does not act on wishes; only the watcher does.
 
-### Closed sessions: `closed` and `reopen` (*v0.1.49*)
+### Closed sessions: `closed` and `reopen` (*v0.1.51*)
 
 Sessions close themselves when done, which frees their memory; the owner still
 wants to see what each one was for and get it back quickly (owner 2026-11-17).

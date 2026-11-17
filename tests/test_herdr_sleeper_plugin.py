@@ -10499,7 +10499,8 @@ def test_closed_lists_newest_first_with_a_reopen_line(fake: FakeHerdr, monkeypat
     assert _closed(capsys, grep="NEWER")[1].count("\n\n") == 0
     assert _closed(capsys, limit=1)[1].startswith("2026-11-17 11:00")
     assert json.loads(_closed(capsys, json=True)[1])[0]["session"] == "019a-codex"
-    assert _closed(capsys, grep="a'b")[0] == 2
+    assert _closed(capsys, grep="a'b")[0] == 0                          # local: any text
+    assert _closed(capsys, grep="a'b", all=True)[0] == 2                # it can't cross to another machine
 
 
 def test_reopen_resumes_from_the_record_with_a_note(fake: FakeHerdr, checkout: Path, state: Path,
