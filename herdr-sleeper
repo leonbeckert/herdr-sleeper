@@ -7669,6 +7669,7 @@ SLEEPER_NOTE_RE = re.compile(
     r"(?:Your slot hit its usage limit;|Your slot's usage limit has reset|Your Codex usage limit has reset\.|"
     r"Auto-resume: your last turn ended on an API error)")
 CHAIN_SETTERS = ("owner", "relay", "ask-answer")   # the origins that start a chain; the others inherit it
+OWNER_CHAIN_SECONDS = 7200   # an owner chain ends 2 h after his last prompt: a chat nobody watches is no to-do list
 
 
 def turn_marker(session: str) -> Path | None:
@@ -7772,9 +7773,15 @@ def append_turn_row(row: dict) -> bool:
 
 
 def read_chain(session: str) -> str | None:
+    """The origin a notification, no-prompt or sleeper-note turn carries on, or None (it keeps its own):
+    no chain recorded, or an owner chain whose last owner prompt is over OWNER_CHAIN_SECONDS old.
+    Relay and ask-answer chains don't expire."""
     marker = chain_marker(session)
     with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
-        chain = json.loads(marker.read_text())["origin"] if marker else None
+        rec = json.loads(marker.read_text()) if marker else {}
+        chain = rec.get("origin")
+        if chain == "owner" and not time.time() - float(rec["ts"]) <= OWNER_CHAIN_SECONDS:
+            return None
         return chain if chain in CHAIN_SETTERS else None
     return None
 

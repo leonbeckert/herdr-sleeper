@@ -9081,6 +9081,33 @@ def test_the_gate_follows_the_turn_chain(fake: FakeHerdr, monkeypatch: pytest.Mo
     assert row["chain"] == (first if first in sleeper.CHAIN_SETTERS else then or "no-prompt")
 
 
+@pytest.mark.parametrize("later,blocks", [(7140, False), (7260, True)])
+def test_an_owner_chain_ends_two_hours_after_his_last_prompt(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        later: int, blocks: bool) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": "build it in the background"}) == ("", "")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": "Started."}) == ("", "")
+    real = time.time
+    monkeypatch.setattr(sleeper.time, "time", lambda: real() + later)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["notification"]}) == ("", "")
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
+    assert bool(out) == blocks
+    row = _turn_rows()[-1]
+    assert row["chain"] == ("notification" if blocks else "owner") and row["gate"] == ("blocked" if blocks else None)
+    # a relay chain doesn't expire
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["relay"]}) == ("", "")
+    monkeypatch.setattr(sleeper.time, "time", lambda: real() + later + 86400)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": "Started."}) == ("", "")
+    assert sleeper.read_chain(UUID) == "relay"
+
+
 def test_without_a_herdr_pane_the_gate_stays_off(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
                                                  capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.delenv("HERDR_PANE_ID", raising=False)

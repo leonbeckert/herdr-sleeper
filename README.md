@@ -547,8 +547,9 @@ prompt came since the last Stop, else `owner`. Owner, relay and ask-answer
 prompts start a turn **chain**; a notification, a no-prompt turn and a note the
 sleeper typed in itself (a continue note after a usage limit or its reset, an
 auto-resume note) carry on the chain before them, so a background event's turn
-during the owner's chat counts as his (no chain recorded: the turn's own
-origin). A reply waits on the owner when its last three paragraphs ask him to
+during the owner's chat counts as his. An owner chain ends 2 h after his last
+prompt (a chat nobody watches is no to-do list); relay and ask-answer chains
+don't expire. No chain, or an expired one: the turn's own origin. A reply waits on the owner when its last three paragraphs ask him to
 do something (please sign in, please run/open/approve/confirm, still waiting
 on you, run this in a separate terminal, "Once you're in, I'll …", bitte melde
 dich an, …: a *todo*) or its last two ask him something (should I, which one,
