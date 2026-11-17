@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.49"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.50"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -262,7 +262,7 @@ DEFAULTS = {
     "auto_resume": True,         # continue claude turns that died on a network or API error, once the API answers
     "auto_resume_max_age_hours": 24.0,  # older errors are left alone (TOML: auto_resume_max_age = "24h")
     "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
-    "ask_gate": True,            # a turn not started by the owner that ends waiting on him without an ask is sent back
+    "ask_gate": True,            # a turn that ends waiting on the owner without an ask covering it is sent back
 }
 
 
@@ -7953,9 +7953,10 @@ def live_claude_named(to: str) -> bool:
 # Counted since 2026-11-15, gated since 2026-11-17 (owner: a session that ends its turn waiting on him
 # must show as a blocked question in Herdr). Reads no transcript: the UserPromptSubmit payload's prompt
 # gives the turn's origin, the Stop payload's last_assistant_message the reply; both are classified in
-# memory and only the class is kept. A turn the owner didn't start in chat whose reply seems to wait on
-# him while the session holds no open ask is sent back once (ask_gate) to file an ask.
-TURN_SCHEMA = 2                 # row layout and classifier version; bump when either changes
+# memory and only the class is kept. A turn whose reply seems to wait on the owner while no ask covers
+# it (opened this turn or named in the reply) is sent back once (ask_gate) to file an ask, whoever
+# started it: the owner reads the panes, not the chats (2026-11-17).
+TURN_SCHEMA = 3                 # row layout and classifier version; bump when either changes
 TURN_MAX_BYTES = 2_000_000      # turn-ends.jsonl rotates to .1 past this (summaries report the retained range)
 TURN_HERDR_TIMEOUT = 2.0        # the one Herdr call a Stop makes (the hook's own timeout is 5 s)
 # A sentence or list item starts here: an imperative, not "I'll run it in a new shell". No nested
@@ -8104,20 +8105,38 @@ def turn_identity() -> tuple[str | None, str | None, str | None]:
     return pane, (hit or {}).get("name"), (hit or {}).get("terminal_id")
 
 
-def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None, terminal: str | None) -> int | None:
-    """How many open asks this session holds, read without the lock and without quarantining a
-    damaged file (read_asks() would): None when the file can't be read."""
+NO_PROMPT_ASK_WINDOW = 900   # a turn without a prompt (a background wake): asks opened this long ago cover it
+
+
+def _created_epoch(rec: dict) -> float | None:
+    stamp = rec.get("created_ts")
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+        return float(stamp)
+    with contextlib.suppress(TypeError, ValueError):   # records before created_ts: naive local time
+        return dt.datetime.fromisoformat(str(rec.get("created"))).timestamp()
+    return None
+
+
+def open_asks_quiet(uuid: str | None, name: str | None, pane: str | None, terminal: str | None,
+                    started: float | None = None, reply: str = "") -> tuple[int | None, int | None]:
+    """(open asks this session holds, of them the ones that cover this reply), read without the lock and
+    without quarantining a damaged file (read_asks() would); (None, None) when the file can't be read.
+    An ask covers the reply when it was opened during this turn or the reply names its id: an older
+    ask about something else doesn't carry a new request in the chat."""
     try:
         asks = read_json(ASKS)
     except (SleeperError, OSError):
-        return None
-    mine = [v for v in asks.values() if isinstance(v, dict) and v.get("state") == "open"
-            and ask_is_mine(v, uuid, name, pane, terminal)]
+        return None, None
+    mine = {k: v for k, v in asks.items() if isinstance(v, dict) and v.get("state") == "open"
+            and ask_is_mine(v, uuid, name, pane, terminal)}
     if not mine and not (name and pane and terminal) and any(
             isinstance(v, dict) and v.get("state") == "open" and v.get("asker_pane") in (pane, None)
             for v in asks.values()):
-        return None   # an ask kept over a /clear can't be ruled out without the name and terminal
-    return len(mine)
+        return None, None   # an ask kept over a /clear can't be ruled out without the name and terminal
+    since = started - 1 if started is not None else time.time() - NO_PROMPT_ASK_WINDOW
+    covering = [k for k, v in mine.items()
+                if (_created_epoch(v) or 0) >= since or (len(str(k)) >= 4 and str(k) in reply)]
+    return len(mine), len(covering)
 
 
 def append_turn_row(row: dict) -> bool:
@@ -8237,11 +8256,12 @@ def take_turn(uuid: str | None) -> tuple[str, str, float | None]:
 
 
 ASK_GATE_REASON = (
-    "This reply seems to wait on the owner, but the turn wasn't started by the owner in chat and you hold no "
-    "open ask, so nobody will see it. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' "
-    "--option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something "
-    "only the owner can do (one decision or to-do per ask), then end your turn. If your reply does not wait on "
-    "the owner, just end your turn again.")   # ASCII: the hook's stdout is JSON-escaped either way
+    "This reply seems to wait on the owner, and no ask covers it (none opened this turn, none named by its id), "
+    "so nobody will see it: the owner looks only at the ask panels, also while he chats with you. File it now "
+    "with `echo CONTEXT | herdr-sleeper ask --question '...' --option '...' --option '...'` for a decision, or "
+    "`echo CONTEXT | herdr-sleeper ask --todo '...'` for something only the owner can do (one decision or to-do "
+    "per ask; a command he runs goes in --copy), then end your turn. If it waits on an ask you already hold, name "
+    "its id. If your reply does not wait on the owner, just end your turn again.")   # ASCII: the hook's stdout is JSON-escaped either way
 
 
 def log_quiet(msg: str) -> None:
@@ -8253,12 +8273,14 @@ def log_quiet(msg: str) -> None:
 
 
 def ask_gate(row: dict, stop_hook_active: bool) -> str | None:
-    """What the gate does with this turn end: None when it doesn't apply (the owner started the turn's
-    chain in chat, the reply doesn't wait on him, an ask is open or the count is unknown, this Stop
-    already follows a block, or no Herdr pane runs the session: `ask` needs one), else "blocked", "dry-run" or "off" (ask_gate = false). A config that can't be
+    """What the gate does with this turn end: None when it doesn't apply (the reply doesn't wait on the
+    owner, an ask opened this turn or named in the reply covers it, the count is unknown, this Stop
+    already follows a block, or no Herdr pane runs the session: `ask` needs one), else "blocked",
+    "dry-run" or "off" (ask_gate = false). A turn the owner started in chat is gated too (owner
+    2026-11-17: he looks only at the panes that need him, never at a chat). A config that can't be
     read leaves the turn alone (None)."""
-    if (stop_hook_active or row.get("chain") in ("owner", "unknown") or row.get("waits") not in ("question", "todo")
-            or row.get("open_asks") != 0 or not row.get("pane")):
+    if (stop_hook_active or row.get("chain") == "unknown" or row.get("waits") not in ("question", "todo")
+            or row.get("covering_asks") != 0 or not row.get("pane")):
         return None
     try:
         config, _ = load_config()
@@ -8269,7 +8291,7 @@ def ask_gate(row: dict, stop_hook_active: bool) -> str | None:
     if config["dry_run"]:
         with contextlib.suppress(OSError):
             log_quiet(f"skip {row.get('pane') or row.get('session')}: would block the turn end "
-                      f"({row.get('origin')}, waits {row.get('waits')}, no open ask) (dry run)")
+                      f"({row.get('origin')}, waits {row.get('waits')}, no covering ask) (dry run)")
         return "dry-run"
     return "blocked"
 
@@ -8288,8 +8310,9 @@ def record_turn_end(payload: dict) -> str | None:
         "v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"), "session": uuid, "name": name,
         "pane": pane, "origin": origin, "chain": chain, "turn_s": int(time.time() - started) if started else None,
         "waits": waits_on_owner(reply) if isinstance(reply, str) else "unknown",
-        "open_asks": open_asks_quiet(uuid, name, pane, terminal),
         "stop_hook_active": bool(payload.get("stop_hook_active"))}
+    row["open_asks"], row["covering_asks"] = open_asks_quiet(uuid, name, pane, terminal, started,
+                                                            reply if isinstance(reply, str) else "")
     row["gate"] = ask_gate(row, active)
     with contextlib.suppress(OSError):   # a row lost to the disk is a row lost to a held lock: the gate stands
         append_turn_row(row)
@@ -8340,7 +8363,8 @@ def cmd_turn_ends(args: argparse.Namespace) -> int:
                     else:
                         rows.append(r)
     waits = [r for r in rows if r.get("waits") in ("question", "todo")]
-    unasked = [r for r in waits if r.get("open_asks") == 0 and not r.get("stop_hook_active")]   # not a continuation
+    unasked = [r for r in waits if r.get("covering_asks", r.get("open_asks")) == 0
+               and not r.get("stop_hook_active")]   # not a continuation; rows before v0.1.50 count any open ask
     by_origin: dict[str, dict[str, int]] = {}
     for r in rows:
         c = by_origin.setdefault(str(r.get("origin")), {"turns": 0, "waits": 0, "without_ask": 0})

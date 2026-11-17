@@ -568,8 +568,8 @@ prompts start a turn **chain**; a notification, a no-prompt turn and a note the
 sleeper typed in itself (a continue note after a usage limit or its reset, an
 auto-resume note) carry on the chain before them, so a background event's turn
 during the owner's chat counts as his. An owner chain ends 2 h after his last
-prompt (a chat nobody watches is no to-do list); relay and ask-answer chains
-don't expire. No chain, or an expired one: the turn's own origin; an owner
+prompt; relay and ask-answer chains don't expire. Since v0.1.50 the chain only
+feeds the counts: it no longer exempts a turn from the ask gate. No chain, or an expired one: the turn's own origin; an owner
 chain that runs out while the turn runs is checked again at its Stop. A
 prompt's markers and a Stop's read of them happen under the session's turn
 lock (tried for 1 s). A prompt that can't take it still marks its turn,
@@ -587,19 +587,19 @@ problem," doesn't negate) and closing
 pleasantries ("let me know if anything breaks") don't count: a request inside
 a quote or a callout is never read as one.
 
-The owner's rule (2026-11-17): a session that ends its turn waiting on him
-shows as a blocked question in Herdr. While he chats with a session (his own
-message started the turn) it asks in that chat; everything else goes into
-`herdr-sleeper ask`. So when a turn ends with a reply that waits on the owner,
-the turn's chain was **not** started by the owner in chat (relay, ask-answer,
-and a notification or no-prompt turn without an owner chain all count), the
-session holds no open ask (an unknown count blocks nothing), it runs in a
-Herdr pane (`HERDR_PANE_ID`; `ask` needs one), and the Stop payload's
-`stop_hook_active` is `false`, the `Stop` hook prints one JSON object and
-exits 0:
+The owner's rule (2026-11-17, sharpened the same day): a session that ends its
+turn waiting on him shows as a blocked question in Herdr, and everything that
+waits on him goes into `herdr-sleeper ask`, also while he chats with the
+session: he looks only at the panes that need him, never at a chat. So when a
+turn ends with a reply that waits on the owner, no ask of the session covers it
+(an ask covers the reply when it was opened during this turn or the reply names
+its id; an older ask about something else doesn't, and an unknown count blocks
+nothing), it runs in a Herdr pane (`HERDR_PANE_ID`; `ask` needs one), and the
+Stop payload's `stop_hook_active` is `false`, the `Stop` hook prints one JSON
+object and exits 0, whoever started the turn's chain:
 
 ```json
-{"decision": "block", "reason": "This reply seems to wait on the owner, but the turn wasn't started by the owner in chat and you hold no open ask, so nobody will see it. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' --option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something only the owner can do (one decision or to-do per ask), then end your turn. If your reply does not wait on the owner, just end your turn again."}
+{"decision": "block", "reason": "This reply seems to wait on the owner, and no ask covers it (none opened this turn, none named by its id), so nobody will see it: the owner looks only at the ask panels, also while he chats with you. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' --option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something only the owner can do (one decision or to-do per ask; a command he runs goes in --copy), then end your turn. If it waits on an ask you already hold, name its id. If your reply does not wait on the owner, just end your turn again."}
 ```
 
 Claude Code then continues the turn with that reason; the next Stop carries
@@ -607,7 +607,7 @@ Claude Code then continues the turn with that reason; the next Stop carries
 misread costs one extra step, never a loop. `ask_gate = false` turns the gate
 off (the turns are still counted); with `dry_run` the hook logs `would block
 the turn end (…) (dry run)` to `sleeper.log` instead. A config that can't be
-read, any failure, or an owner chain blocks nothing.
+read or any failure blocks nothing.
 
 `turn-ends.jsonl` keeps one row per turn with the origin and chain, the
 reply's class, the session, pane, Herdr name, turn length, open-ask count and

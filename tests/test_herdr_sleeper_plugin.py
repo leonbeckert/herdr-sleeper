@@ -9230,8 +9230,10 @@ def test_a_turn_is_one_metadata_row_and_the_hooks_print_nothing(
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
                                           "prompt": "build the frobnicator"}) == ("", "")
     assert sleeper.turn_marker(UUID).exists()
-    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
-                                          "last_assistant_message": "Built. Should I push it to main?"}) == ("", "")
+    out, err = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                  "stop_hook_active": False,
+                                                  "last_assistant_message": "Built. Should I push it to main?"})
+    assert err == "" and json.loads(out)["decision"] == "block"   # also in the owner's chat: into an ask
     (row,) = _turn_rows()
     assert row["v"] == sleeper.TURN_SCHEMA and row["session"] == UUID and row["name"] == "a"
     assert row["origin"] == "owner" and row["waits"] == "question" and row["open_asks"] == 0
@@ -9486,21 +9488,24 @@ def test_the_ask_gate_blocks_a_turn_the_owner_did_not_start(
     assert json.loads(out) == {"decision": "block", "reason": sleeper.ASK_GATE_REASON}
     assert out.count("\n") == 1 and out.strip().startswith("{")            # one JSON object, nothing else
     (row,) = _turn_rows()
-    assert row["origin"] == origin and row["gate"] == "blocked" and row["v"] == 2
+    assert row["origin"] == origin and row["gate"] == "blocked" and row["v"] == 3
     assert "herdr-sleeper ask --question" in sleeper.ASK_GATE_REASON and "--todo" in sleeper.ASK_GATE_REASON
 
 
-@pytest.mark.parametrize("case", ["owner", "no-wait", "one-ask", "unknown-asks", "hook-active", "no-flag", "off"])
+@pytest.mark.parametrize("case", ["ask-this-turn", "ask-named", "no-wait", "unknown-asks", "hook-active", "no-flag",
+                                  "off"])
 def test_the_ask_gate_lets_the_turn_end(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
                                         capsys: pytest.CaptureFixture[str], case: str) -> None:
     prompt: str | None = GATED_ORIGINS["relay"]
     reply, stop = MISS_WORMS, {}
-    if case == "owner":
-        prompt = "please look at the Sentry job"
+    if case == "ask-this-turn":   # the session filed the ask during this turn
+        sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1",
+                                                 "created": dt.datetime.now().isoformat(timespec="seconds")}})
+    elif case == "ask-named":     # an older ask the reply points at
+        sleeper.write_json(sleeper.ASKS, {"q1b2c3d4": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
+        reply = MISS_WORMS + "\n\nThe answer goes in ask q1b2c3d4."
     elif case == "no-wait":
         reply = "Created klinikon-fleet with its alert; reported to taxi-orch."
-    elif case == "one-ask":
-        sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
     elif case == "unknown-asks":
         sleeper.ensure_state_dir()
         sleeper.ASKS.write_text("{not json")
@@ -9518,12 +9523,57 @@ def test_the_ask_gate_lets_the_turn_end(fake: FakeHerdr, state: Path, monkeypatc
     assert row["gate"] == ("off" if case == "off" else None)
 
 
+@pytest.mark.parametrize("prompt", ["please look at the Sentry job", GATED_ORIGINS["relay"]])
+def test_an_older_ask_about_something_else_does_not_cover_a_new_request(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], prompt: str) -> None:
+    sleeper.write_json(sleeper.ASKS, {"q1b2c3d4": {"state": "open", "uuid": UUID, "panel": "p1",
+                                                   "created": "2026-11-01T09:00:00"}})
+    out, _ = _gated_turn(monkeypatch, capsys, prompt)
+    assert json.loads(out)["decision"] == "block"
+    (row,) = _turn_rows()
+    assert row["open_asks"] == 1 and row["covering_asks"] == 0 and row["gate"] == "blocked"
+
+
+@pytest.mark.parametrize("ago,covers", [(0.5, True), (3, False)])
+def test_an_ask_covers_the_reply_from_the_turn_start_on_and_by_its_created_ts(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], ago: float,
+        covers: bool) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["relay"]}) == ("", "")
+    start = json.loads(sleeper.turn_marker(UUID).read_text())["ts"]
+    sleeper.write_json(sleeper.ASKS, {"q1b2c3d4": {"state": "open", "uuid": UUID, "panel": "p1",
+                                                   "created": "2020-01-01T00:00:00",   # wrong on purpose
+                                                   "created_ts": start - ago}})
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_WORMS})
+    assert (out == "") == covers
+    assert _turn_rows()[-1]["covering_asks"] == (1 if covers else 0)
+
+
+def test_a_turn_without_a_prompt_is_covered_by_an_ask_it_just_opened_and_another_sessions_id_never_covers(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    now = time.time()
+    sleeper.write_json(sleeper.ASKS, {"a1b2c3d4": {"state": "open", "uuid": UUID, "panel": "p1",
+                                                   "created_ts": now}})
+    stop = {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False}
+    assert turn_hook_io(monkeypatch, capsys, {**stop, "last_assistant_message": MISS_WORMS}) == ("", "")
+    sleeper.write_json(sleeper.ASKS, {
+        "a1b2c3d4": {"state": "open", "uuid": UUID, "panel": "p1", "created_ts": now - 7200},
+        "e5f6a7b8": {"state": "open", "uuid": OTHER_UUID, "panel": "p9", "created_ts": now}})
+    out, _ = turn_hook_io(monkeypatch, capsys, {**stop, "last_assistant_message": MISS_WORMS + " See ask e5f6a7b8."})
+    assert json.loads(out)["decision"] == "block"
+    assert _turn_rows()[-1]["open_asks"] == 1 and _turn_rows()[-1]["covering_asks"] == 0
+
+
 def test_the_ask_gate_dry_run_only_logs(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
                                         capsys: pytest.CaptureFixture[str]) -> None:
     _gate_config(state, monkeypatch, "dry_run = true\n")
     assert _gated_turn(monkeypatch, capsys, GATED_ORIGINS["notification"]) == ("", "")
     assert _turn_rows()[0]["gate"] == "dry-run"
-    assert "would block the turn end (notification, waits todo, no open ask) (dry run)" in sleeper.LOGFILE.read_text()
+    assert ("would block the turn end (notification, waits todo, no covering ask) (dry run)"
+            in sleeper.LOGFILE.read_text())
 
 
 def test_a_broken_config_blocks_nothing(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
@@ -9593,9 +9643,9 @@ NOTE_PROMPT = sleeper.AUTO_RESUME_NOTE.format(what="connection_failed", n=1, cap
 
 
 @pytest.mark.parametrize("first,then,blocks", [
-    ("owner", "notification", False),     # the owner is chatting: a background event's turn asks in chat
-    ("owner", None, False),               # a turn without a prompt carries on the owner's chain
-    ("owner", "sleeper-note", False),     # so does a continue note the sleeper typed in
+    ("owner", "notification", True),      # the owner chatting changes nothing: he reads the panes, not the chat
+    ("owner", None, True),                # a turn without a prompt carries on the owner's chain
+    ("owner", "sleeper-note", True),      # so does a continue note the sleeper typed in
     ("relay", "notification", True),
     ("relay", "sleeper-note", True),
     ("ask-answer", None, True),
@@ -9630,6 +9680,7 @@ def test_the_gate_follows_the_turn_chain(fake: FakeHerdr, monkeypatch: pytest.Mo
 def test_an_owner_chain_ends_two_hours_after_his_last_prompt(
         fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
         later: int, blocks: bool) -> None:
+    """The chain is still counted (turn-ends); since v0.1.50 it no longer exempts a turn from the gate."""
     monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
                                               "prompt": "build it in the background"}) == ("", "")
@@ -9641,9 +9692,9 @@ def test_an_owner_chain_ends_two_hours_after_his_last_prompt(
                                               "prompt": GATED_ORIGINS["notification"]}) == ("", "")
     out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
                                                 "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
-    assert bool(out) == blocks
+    assert json.loads(out)["decision"] == "block"
     row = _turn_rows()[-1]
-    assert row["chain"] == ("notification" if blocks else "owner") and row["gate"] == ("blocked" if blocks else None)
+    assert row["chain"] == ("notification" if blocks else "owner") and row["gate"] == "blocked"
     # a relay chain doesn't expire
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
                                               "prompt": GATED_ORIGINS["relay"]}) == ("", "")
@@ -9766,7 +9817,7 @@ def test_prompt_and_stop_markers_move_together(fake: FakeHerdr, monkeypatch: pyt
     assert json.loads(sleeper.turn_marker(UUID).read_text())["chain"] == "owner"
     out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
                                                 "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
-    assert out == "" and _turn_rows()[-1]["chain"] == "owner"
+    assert json.loads(out)["decision"] == "block" and _turn_rows()[-1]["chain"] == "owner"
 
 
 @pytest.mark.parametrize("prompt", ["please go on", "<task-notification>\n<task-id>b1</task-id>"])
