@@ -10776,3 +10776,114 @@ def test_a_usage_error_from_an_older_version_is_tried_again_by_the_new_one(
     sleeper.write_mirror_state(ask_id, version="0.1.52")
     sleeper.tend_ask_mirrors()
     assert len(started) == 1 and sleeper.read_mirror_state(ask_id)["version"] == sleeper.PLUGIN_VERSION
+
+
+# ------------------------------------------------------------ search
+
+def _claude_lines(*recs: dict) -> str:
+    return "".join(json.dumps(r) + "\n" for r in recs)
+
+
+def _said(role: str, text: str, at: str = "2026-11-17T20:00:00Z") -> dict:
+    return {"type": role, "timestamp": at, "message": {"role": role, "content": [{"type": "text", "text": text}]}}
+
+
+def test_search_counts_what_was_said_not_tool_traffic(state: Path) -> None:
+    path = state / "projects" / "proj" / f"{UUID}.jsonl"
+    path.write_text(_claude_lines(
+        _said("user", "please look at Moshi pairing", "2026-11-17T19:00:00Z"),
+        {"type": "user", "message": {"content": [{"type": "tool_result", "content": "moshi moshi"}]}},
+        {"type": "user", "isMeta": True, "message": {"content": "moshi caveat"}},
+        _said("user", "<system-reminder>moshi</system-reminder>"),
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "input": {"command": "moshi-hook"}}]}},
+        _said("assistant", "MOSHI paired; token=" + "Ab1" * 20 + " stays out", "2026-11-17T21:00:00Z")))
+    got = sleeper.search_transcript(path, "claude", "moshi")
+    assert got["hits"] == 2 and got["who"] == "agent" and got["at"] == "2026-11-17T21:00:00Z"
+    assert "MOSHI paired" in got["snippet"] and "Ab1Ab1" not in got["snippet"]          # redacted
+    path.write_text(_claude_lines(_said("assistant", "x " * 30 + "moshi " + "y " * 42 + "Zq9" * 20)))
+    assert "Zq9" not in sleeper.search_transcript(path, "claude", "moshi")["snippet"]   # not cut, then missed
+    assert sleeper.search_transcript(path, "claude", "nothing here") == {"hits": 0}
+    assert sleeper.search_transcript(state / "absent.jsonl", "claude", "x")["error"].startswith("cannot read")
+
+
+def test_search_reads_codex_rollouts_without_their_setup_messages(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = state / "codex"
+    day = home / "sessions" / "2026" / "11" / "17"
+    day.mkdir(parents=True)
+    sid = "01a1eb89-6be8-7291-a848-85227b21dc49"
+    monkeypatch.setattr(sleeper, "CODEX_HOMES", [home])
+
+    def msg(role: str, text: str) -> dict:
+        kind = "output_text" if role == "assistant" else "input_text"
+        return {"type": "response_item", "timestamp": "2026-11-17T22:00:00Z",
+                "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]}}
+    (day / f"rollout-2026-11-17T23-03-34-{sid}.jsonl").write_text(_claude_lines(
+        msg("developer", "vault rules"), msg("user", "<environment_context>vault</environment_context>"),
+        {"type": "response_item", "payload": {"type": "function_call_output", "output": "vault"}},
+        msg("user", "check the Vault grant"), msg("assistant", "the vault grant is OK")))
+    path = sleeper.codex_rollout_for(sid)
+    assert path is not None and sleeper.codex_rollout_for("../../etc") is None
+    got = sleeper.search_transcript(path, "codex", "VAULT")
+    assert got["hits"] == 2 and got["who"] == "agent"
+
+
+def test_search_terms_that_can_cross_to_another_machine() -> None:
+    assert sleeper.search_term_problem("moshi pairing") is None
+    assert sleeper.search_term_problem("ä-umlaut") is not None          # REMOTE_ARG_RE is ASCII
+    for bad in ("", "  ", "-x", "$(id)", "a'b", "x" * 81):
+        assert sleeper.search_term_problem(bad), bad
+
+
+def _search(capsys: pytest.CaptureFixture[str], *term: str, here: bool = False, json_out: bool = False) -> tuple[int, str]:
+    code = sleeper.cmd_search(types.SimpleNamespace(term=list(term), here=here, json=json_out))
+    return code, capsys.readouterr().out
+
+
+def test_search_lists_this_machine_and_the_others_newest_first(ssh: FakeSsh, fake: FakeHerdr,
+                                                               monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    path = sleeper.transcript_for(UUID)
+    assert path is not None
+    path.write_text(_claude_lines(_said("user", "where is the moshi daemon", "2026-11-17T10:00:00Z")))
+    ssh.reply(stdout=json.dumps([{"machine": "dev2", "pane": "w2:p1", "place": "ao › far", "name": "far",
+                                  "kind": "claude", "state": "idle", "session": "s", "hits": 3,
+                                  "at": "2026-11-17T12:00:00Z", "who": "agent", "snippet": "moshi far away"}]))
+    code, out = _search(capsys, "moshi")
+    assert code == 0 and ssh.remote_argv() == ["herdr-sleeper", "search", "--here", "--json", "--", "moshi"]
+    assert out.index("dev2 › ao › far") < out.index("where is the moshi daemon")           # newest first
+    assert "3 hits" in out and "1 hit," in out
+    code, out = _search(capsys, "moshi", here=True, json_out=True)
+    assert code == 0 and [r["machine"] for r in json.loads(out)] == ["dev1"]
+    ssh.reply(stderr="herdr-relay: refused: search", rc=1)                       # a mini asking the MacBook
+    code, out = _search(capsys, "moshi")
+    assert code == 3 and "dev2: not searchable from here" in out and "where is the moshi daemon" in out
+
+
+def test_search_is_the_owners_not_an_agents(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.delenv("HERDR_SLEEPER_SEARCH_AS_AGENT", raising=False)
+    assert sleeper.cmd_search(types.SimpleNamespace(term=["x"], here=True, json=True)) == 2
+    assert sleeper.cmd_search_view(types.SimpleNamespace()) == 2
+    assert "an agent doesn't run it" in capsys.readouterr().err
+
+
+def test_search_goes_to_a_pane_here_or_on_the_other_machine(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[list[str]] = []
+
+    def run(argv: list[str], **_k: Any) -> types.SimpleNamespace:
+        ran.append(argv)
+        return types.SimpleNamespace(returncode=0, stdout='{"result": {}}', stderr="")
+    monkeypatch.setattr(sleeper.subprocess, "run", run)
+    assert sleeper.search_focus({"machine": "dev1", "pane": "w1:p2"}) == ""
+    assert sleeper.search_focus({"machine": "dev2", "pane": "w2:p1"}) == ""
+    assert ran == [[sleeper.HERDR_BIN, "agent", "focus", "w1:p2"],
+                   [sleeper.HERDR_BIN, "--machine", "dev2", "agent", "focus", "w2:p1"]]
+    assert sleeper.search_focus({"machine": "dev2", "pane": "-x"}) == "no pane to go to"
+
+
+def test_the_search_popup_opens_from_the_action(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    sleeper.cmd_search_view_open(types.SimpleNamespace())
+    assert any(c[:3] == ("plugin", "pane", "open") and "search" in c for c in fake.calls)

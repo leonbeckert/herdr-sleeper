@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.53"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.54"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -6243,6 +6243,312 @@ def cmd_closed_view_open(_args: argparse.Namespace) -> int:
               "popup", "--width", "90%", "--height", "80%", "--focus")
     except SleeperError as exc:
         print(f"closed-sessions: could not open the popup: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------ `search`
+#
+# The owner's keyword search over the sessions that run now (live and asleep), on this machine and on
+# every saved machine it reaches: what was said in each session (prompts and replies; tool traffic is
+# left out), read from its transcript on the machine it runs on. Nothing is stored or copied
+# elsewhere: rows travel over the same SSH as `presence`, and the popup shows them. A mini's key into
+# the MacBook is the relay's, which doesn't know `search`, so a mini never reads the MacBook's sessions.
+# Snippets go through `redact`. An agent doesn't run it: its output would copy transcript text into
+# that agent's own transcript (refused under CLAUDECODE; `--here` is the hop another machine sends).
+
+SEARCH_TERM_MAX = 80
+SEARCH_SNIPPET = 180            # characters of context shown around the newest hit
+SEARCH_SECONDS = 30             # one machine's answer, transcripts read included
+SEARCH_VIEW_ROWS = 30
+CODEX_HOMES: list[Path] = [Path(os.path.expanduser("~/.codex")),
+                           *sorted(Path(os.path.expanduser("~/.codex-accounts")).glob("*/"))]
+
+
+def codex_rollout_for(uuid: str) -> Path | None:
+    """A codex session's rollout file (`sessions/YYYY/MM/DD/rollout-<when>-<uuid>.jsonl`), the newest one."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", uuid):
+        return None
+    hits = [Path(p) for home in CODEX_HOMES
+            for p in glob.glob(str(home / "sessions" / "*" / "*" / "*" / f"rollout-*-{uuid}.jsonl"))]
+    try:
+        return max(hits, key=lambda p: p.stat().st_mtime) if hits else None
+    except OSError:
+        return None
+
+
+def _search_text(rec: dict, kind: str) -> tuple[str, str] | None:
+    """(who, text) of a transcript record that is conversation: the prompt typed in or the reply.
+    None for tool calls, tool output, reasoning, Claude Code's own records and Codex's setup messages."""
+    if kind == "codex":
+        p = rec.get("payload")
+        if rec.get("type") != "response_item" or not isinstance(p, dict) or p.get("type") != "message":
+            return None
+        role = p.get("role")
+        if role not in ("user", "assistant") or not isinstance(p.get("content"), list):
+            return None
+        text = "\n".join(str(c.get("text")) for c in p["content"]
+                         if isinstance(c, dict) and isinstance(c.get("text"), str))
+        if role == "user" and text.lstrip().startswith(("<environment_context>", "<user_instructions>",
+                                                         "# AGENTS.md", "<permissions")):
+            return None
+        return ("you" if role == "user" else "agent"), text
+    if rec.get("type") not in ("user", "assistant") or rec.get("isMeta"):
+        return None
+    text = _record_text(rec)
+    if rec["type"] == "user":
+        if _skip_prompt(text):
+            return None
+        return "you", _prompt_body(text)
+    return "agent", text
+
+
+def search_transcript(path: Path, kind: str, term: str) -> dict:
+    """Hits of term (any case) in what was said in one transcript: their number, the newest one's time,
+    who said it, and a redacted snippet around it. Lines are filtered as bytes first when the term is
+    plain ASCII, so a 300 MB transcript costs about a second."""
+    needle = term.casefold()
+    raw = term.lower().encode() if term.isascii() and not set(term) & set('"\\') else None
+    hits, last = 0, None
+    try:
+        with path.open("rb") as fh:
+            for line in fh:
+                if raw is not None and raw not in line.lower():
+                    continue
+                rec = _json_record(line)
+                said = _search_text(rec, kind) if rec else None
+                if not said or needle not in said[1].casefold():
+                    continue
+                hits += 1
+                last = (rec, said)
+    except OSError as exc:
+        return {"error": f"cannot read the transcript: {exc.strerror or exc}"}
+    out: dict = {"hits": hits}
+    if last:
+        rec, (who, text) = last
+        # redact before cutting (as the closed-session records do): a token cut in half would slip the filter
+        flat = redact(" ".join(CONTROL_CHARS.sub(" ", text).split()))
+        start = max(0, flat.casefold().find(needle) - SEARCH_SNIPPET // 3)  # -1: the hit was redacted away
+        cut = flat[start:start + SEARCH_SNIPPET]
+        out.update(who=who, at=rec.get("timestamp"),
+                   snippet=("…" if start else "") + cut + ("…" if start + SEARCH_SNIPPET < len(flat) else ""))
+    return out
+
+
+def search_rows(term: str) -> list[dict]:
+    """This machine's sessions (presence: live and asleep) with their hits; sessions without one are left out,
+    a session whose transcript can't be found or read is kept with an `error`."""
+    me = this_machine()
+    rows: list[dict] = []
+    for r in presence_rows():
+        session, kind = r.get("session"), r.get("kind")
+        if not session or kind not in ("claude", "codex"):
+            continue
+        path = transcript_for(session) if kind == "claude" else codex_rollout_for(session)
+        got = search_transcript(path, kind, term) if path else {"error": "no transcript found"}
+        if not got.get("hits") and not got.get("error"):
+            continue
+        rows.append({"machine": me, "pane": r.get("pane"), "place": r.get("place"), "name": r.get("name"),
+                     "kind": kind, "state": r.get("state"), "session": session, **got})
+    return rows
+
+
+def machines_search(term: str) -> tuple[list[dict], list[str]]:
+    """Every enabled saved machine's rows, asked in parallel. A machine whose key can't run `search` (the
+    MacBook seen from a mini: its relay knows only deliver, presence and the like) is named, not retried."""
+    try:
+        labels = sorted(saved_machines())
+    except SleeperError as exc:
+        return [], [str(exc)]
+    results: dict[str, list[dict] | str] = {}
+
+    def ask(label: str) -> None:
+        try:
+            done = remote_sleeper(label, ["search", "--here", "--json", "--", term], timeout=SEARCH_SECONDS)
+            if done.returncode != 0:
+                last = (done.stderr.strip().splitlines() or [f"exit {done.returncode}"])[-1]
+                results[label] = f"{label}: not searchable from here ({one_line(last, 120)})"
+                return
+            got = json.loads(done.stdout or "[]")
+            results[label] = [dict(r, machine=r.get("machine") or label) for r in got if isinstance(r, dict)]
+        except Exception as exc:  # one machine must not cost the others their rows
+            results[label] = str(exc)
+    threads = [threading.Thread(target=ask, args=(label,), daemon=True) for label in labels]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + SEARCH_SECONDS + 1
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    rows: list[dict] = []
+    problems: list[str] = []
+    for label in labels:
+        got = results.get(label, f"{label}: no answer within {SEARCH_SECONDS}s")
+        if isinstance(got, str):
+            problems.append(got)
+        else:
+            rows += got
+    return rows, problems
+
+
+def search_term_problem(term: str) -> str | None:
+    if not term.strip():
+        return "give a word to search for"
+    if len(term) > SEARCH_TERM_MAX:
+        return f"at most {SEARCH_TERM_MAX} characters"
+    if not REMOTE_ARG_RE.fullmatch(term) or term.startswith("-"):
+        return "letters, digits, spaces and ./:@=,+~%_- only, not starting with '-'"
+    return None
+
+
+def _search_order(r: dict) -> tuple:
+    return (bool(r.get("error")), -(_ts(r.get("at")) or 0))
+
+
+def search_split(rows: list[dict]) -> tuple[list[dict], str]:
+    """(the rows with hits, one line naming the sessions that couldn't be searched, or "")."""
+    skipped = [f"{ui_place(r)} ({r['error']})" for r in rows if r.get("error")]
+    return [r for r in rows if not r.get("error")], ("not searched: " + ", ".join(skipped)) if skipped else ""
+
+
+def search_block(n: int, r: dict, width: int) -> list[str]:
+    """One hit row as the owner reads it: where, who, how many hits, when, and the newest one."""
+    where = ui_place(r)
+    state = "asleep" if r.get("state") == "asleep" else (r.get("state") or "?")
+    head = f"{n:>3}  {where}  ({r.get('name') or '-'}, {r.get('kind')}, {state})"
+    when = (_ts(r.get("at")) and dt.datetime.fromtimestamp(_ts(r.get("at"))).strftime("%m-%d %H:%M")) or "?"
+    lines = [f"{head}  {r.get('hits')} hit{'s' if r.get('hits') != 1 else ''}, newest {when}"]
+    lines += wrap_text(f"{r.get('who')}: {r.get('snippet') or ''}", width, " " * 7, " " * 5)
+    return lines
+
+
+def search_guard(cmd: str) -> int | None:
+    if os.environ.get("CLAUDECODE") and not os.environ.get("HERDR_SLEEPER_SEARCH_AS_AGENT"):
+        print(f"{cmd}: the owner's search (prefix key in Herdr); an agent doesn't run it, because its output would "
+              "copy other sessions' transcript text into this one", file=sys.stderr)
+        return 2
+    return None
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """`search TERM`: the running sessions (live and asleep) whose conversation contains TERM, newest hit first,
+    on this machine and every saved machine that answers (`--here`: this machine only)."""
+    refused = search_guard("search")  # the --here hop arrives over SSH, which carries no CLAUDECODE
+    if refused is not None:
+        return refused
+    term = " ".join(args.term)
+    problem = search_term_problem(term)
+    if problem:
+        print(f"search: {problem}", file=sys.stderr)
+        return 2
+    try:
+        rows = search_rows(term)
+    except (SleeperError, ConfigError) as exc:
+        print(f"search: {exc}", file=sys.stderr)
+        return 1
+    problems: list[str] = []
+    if not args.here:
+        more, problems = machines_search(term)
+        rows += more
+    rows.sort(key=_search_order)
+    if args.json:
+        for p in problems:
+            print(f"WARNING: {p}", file=sys.stderr)
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 3 if problems else 0
+    width = max(40, shutil.get_terminal_size((120, 40)).columns - 2)
+    hits, skipped = search_split(rows)
+    for p in problems:
+        print(f"WARNING: {p}")
+    if skipped:
+        print(skipped)
+    for n, r in enumerate(hits, 1):
+        print("\n".join(search_block(n, r, width)))
+    if not hits:
+        print(f"no running session mentions {term!r}")
+    return 3 if problems else 0
+
+
+def search_focus(r: dict) -> str:
+    """Go to a hit's pane: this machine's by `agent focus`, another machine's through Herdr's machine forwarding."""
+    pane = str(r.get("pane") or "")
+    if not REMOTE_TARGET_RE.fullmatch(pane):
+        return "no pane to go to"
+    label = machine_label(r.get("machine"))
+    argv = ([HERDR_BIN, "--machine", label] if label else [HERDR_BIN]) + ["agent", "focus", pane]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=HERDR_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not go there: {exc}"
+    if done.returncode != 0 or '"error"' in done.stdout:
+        return f"could not go there ({one_line(done.stderr or done.stdout, 120)}); it is {ui_place(r)}"
+    return ""
+
+
+def cmd_search_view(_args: argparse.Namespace) -> int:
+    """The `search` popup: type a word, get the running sessions that mention it on every machine, newest
+    hit first, numbered; a number goes to that pane (a sleeper shows its stub: Enter there wakes it),
+    Enter on its own asks for a new word, q closes."""
+    refused = search_guard("search-view")
+    if refused is not None:
+        return refused
+    tty = sys.stdout.isatty()
+    term, rows, note = "", [], ""
+    while True:
+        try:
+            if not term:
+                print(("\033[H\033[2J" if tty else "") + "Search the running sessions of every machine "
+                      "(what was said, any case). Empty line or q closes.", flush=True)
+                term = input("search: ").strip()
+                if term.lower() in ("", "q", "quit", "exit"):
+                    return 0
+                problem = search_term_problem(term)
+                if problem:
+                    input(f"{problem}; Enter to try again ")
+                    term = ""
+                    continue
+                print(f"searching for {term!r} …", flush=True)
+                rows = search_rows(term)
+                more, problems = machines_search(term)
+                rows, skipped = search_split(sorted(rows + more, key=_search_order))
+                note = "\n".join([f"WARNING: {p}" for p in problems] + ([skipped] if skipped else []))
+            width = max(40, shutil.get_terminal_size((100, 30)).columns - 6)
+            shown = rows[:SEARCH_VIEW_ROWS]
+            out = [f"{len(rows)} session{'s' if len(rows) != 1 else ''} mention {term!r}"
+                   + (f" (the newest {SEARCH_VIEW_ROWS} shown)" if len(rows) > SEARCH_VIEW_ROWS else "")]
+            if note:
+                out.append(note)
+            for n, r in reversed(list(enumerate(shown, 1))):
+                out += [""] + search_block(n, r, width)
+            out += ["", "a number goes to that session · Enter searches again · q closes"]
+            print(("\033[H\033[2J" if tty else "") + "\n".join(out), flush=True)
+            if not tty:
+                return 0
+            got = input("> ").strip().lower()
+            if got in ("q", "quit", "exit"):
+                return 0
+            if not got:
+                term = ""
+            elif got.isdigit() and 1 <= int(got) <= len(shown):
+                failed = search_focus(shown[int(got) - 1])
+                if not failed:
+                    return 0
+                input(f"{failed}; Enter to go back ")
+            else:
+                input("no session with that number; Enter to go back ")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        except (SleeperError, ConfigError) as exc:
+            input(f"search: {exc}; Enter to go back ")
+            term = ""
+
+
+def cmd_search_view_open(_args: argparse.Namespace) -> int:
+    """The `search` action: open the search as a popup over the focused tab."""
+    try:
+        herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "search", "--placement",
+              "popup", "--width", "90%", "--height", "80%", "--focus")
+    except SleeperError as exc:
+        print(f"search: could not open the popup: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -12547,6 +12853,15 @@ def main(argv: list[str] | None = None) -> int:
                    ).set_defaults(fn=cmd_closed_view)
     sub.add_parser("closed-view-open", help="open the closed-session list as a popup (the plugin action)"
                    ).set_defaults(fn=cmd_closed_view_open)
+    srp = sub.add_parser("search", help="the running sessions (live and asleep) whose conversation mentions a word, "
+                                        "on this machine and every saved machine it reaches; the owner's, not an agent's")
+    srp.add_argument("term", nargs="+", help="the word or words, any case")
+    srp.add_argument("--json", action="store_true")
+    srp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    srp.set_defaults(fn=cmd_search)
+    sub.add_parser("search-view", help="the search as a popup (the plugin pane)").set_defaults(fn=cmd_search_view)
+    sub.add_parser("search-view-open", help="open the search popup (the plugin action)"
+                   ).set_defaults(fn=cmd_search_view_open)
     rop = sub.add_parser("reopen", help="resume a closed session from its record (`closed`): its machine, cwd, "
                                         "workspace and name; an optional note on stdin goes into its first prompt")
     rop.add_argument("target", help="its name, Claude name or session id (MACHINE/NAME for another machine)")

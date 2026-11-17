@@ -1,6 +1,6 @@
 id = "djbclark.herdr-sleeper"
 name = "Herdr Sleeper"
-version = "0.1.53"
+version = "0.1.54"
 min_herdr_version = "0.9.1"
 description = "Sleep idle resumable agents after a configurable window (fail-closed); wake on focus, Enter, or command."
 platforms = ["macos", "linux"]
@@ -81,3 +81,19 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["./herdr-sleeper", "closed-view"]
+
+# Keyword search over the running sessions (live and asleep) of every machine this one reaches: what was
+# said in each, from its transcript; a number goes to that pane.
+[[actions]]
+id = "search"
+title = "Search the running sessions (all machines) for a word"
+contexts = []
+command = ["./herdr-sleeper", "search-view-open"]
+
+[[panes]]
+id = "search"
+title = "Search the running sessions (all machines)"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["./herdr-sleeper", "search-view"]

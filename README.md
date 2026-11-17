@@ -1020,6 +1020,43 @@ echo "also do B-18" | herdr-sleeper reopen [MACHINE/]NAME|SESSION-ID [--name NEW
   Nothing here deletes a transcript; one that Claude Code pruned meanwhile
   makes `reopen` refuse with the reason.
 
+### Searching the running sessions: `search` (*v0.1.54*)
+
+The owner wants to find, from a key, which running session talked about something
+(owner 2026-11-17; Herdr has no search across panes, and reading the panes is slow
+and shows a Claude pane's visible screen only). `search` reads each running
+session's transcript (live and asleep) on the machine it runs on and lists the
+sessions that mention a word, newest hit first.
+
+```sh
+herdr-sleeper search WORDS [--json]    # this machine and every saved machine that answers
+herdr-sleeper search-view-open         # the popup (plugin action `search`; bind it, e.g. prefix+/)
+```
+
+- **What is searched.** What was said: the prompts typed in and the replies
+  (Claude text blocks; Codex `message` items of the user and the assistant).
+  Tool calls, tool output, reasoning, Claude Code's own records and Codex's setup
+  messages are left out. Any case; the words as one phrase. Plain-ASCII words
+  filter the transcript's lines as bytes first, so ~300 MB of transcripts take
+  about a second. opencode sessions are not searched yet.
+- **A row.** `machine › workspace › tab`, the name, kind and state, the number of
+  hits, the newest one's time and a snippet around it (who said it, the credential
+  filter of the closed-session records applied). A session whose transcript can't
+  be found is named in one `not searched:` line.
+- **The popup.** Type the words, Enter; a number goes to that session's pane
+  (`herdr agent focus`, through `herdr --machine LABEL` for another machine's; a
+  sleeper shows its stub, Enter there wakes it); Enter on its own searches again,
+  q closes.
+- **Other machines.** Each saved machine runs `search --here --json` over the same
+  SSH as `presence`, in parallel (30 s at most); the words cross only in the
+  `presence` argument form (letters, digits, spaces and `./:@=,+~%_-`). A machine
+  that can't run it is named, not retried: a key whose forced command doesn't know
+  `search` (a relay that allows only messages and presence) keeps that machine's
+  transcripts where they are.
+- **Not for agents.** Its output is other sessions' words; an agent that runs it
+  would copy them into its own transcript. Refused under `CLAUDECODE`
+  (`HERDR_SLEEPER_SEARCH_AS_AGENT=1` for a test). Nothing is stored.
+
 ## Other machines
 
 Herdr's saved SSH machines (`herdr machine list`) extend `deliver`, `wake`,
