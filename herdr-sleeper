@@ -5899,7 +5899,15 @@ def append_closed(rec: dict) -> None:
 
 def session_facts(state: str, hit: dict, key: object) -> dict:
     """What a record keeps about a session that is about to close, read while it still runs: its place
-    and workspace label (the tab goes with the close), replayable flags and slot. Best effort."""
+    and workspace label (the tab goes with the close), replayable flags and slot. Best effort: never raises."""
+    try:
+        return _session_facts(state, hit, key)
+    except Exception as exc:  # a record without these beats a close that fails over them
+        say(f"WARN closed-session facts of {hit.get('name') or key}: {type(exc).__name__}: {exc}")
+        return {}
+
+
+def _session_facts(state: str, hit: dict, key: object) -> dict:
     pane = str(hit["pane_id"] if state == "live" else key)
     facts: dict = {"pane": pane}
     with contextlib.suppress(SleeperError):
@@ -5939,7 +5947,18 @@ def record_close(uuid: str, name: str, kind: object, cwd: object, by: str, facts
                  summary: dict | None, forced: list[str] | None = None, note: str | None = None,
                  claude_name: str | None = None) -> dict:
     """Build and append the record of a session that closed. `summary` from the closer (marked
-    summary_source "session" for a self close, "closer" otherwise); none given falls back to the transcript."""
+    summary_source "session" for a self close, "closer" otherwise); none given falls back to the transcript.
+    Never raises: the session is closed already, and a record is not worth failing the close or the tick."""
+    try:
+        return _record_close(uuid, name, kind, cwd, by, facts, spawned, summary, forced, note, claude_name)
+    except Exception as exc:  # anything: the transcript, the archive, the config
+        say(f"WARN no closed-session record for {name} ({uuid}): {type(exc).__name__}: {exc}")
+        return {}
+
+
+def _record_close(uuid: str, name: str, kind: object, cwd: object, by: str, facts: dict, spawned: dict | None,
+                  summary: dict | None, forced: list[str] | None, note: str | None,
+                  claude_name: str | None) -> dict:
     summary = dict(summary or {})
     source = summary.pop("summary_source", None)
     if any(summary.get(k) for k in SUMMARY_FIELDS):
@@ -6149,6 +6168,70 @@ def cmd_closed(args: argparse.Namespace) -> int:
     return 3 if problems else 0
 
 
+CLOSED_VIEW_ROWS = 15   # the popup shows this many of the newest records, the newest next to its prompt
+
+
+def cmd_closed_view(_args: argparse.Namespace) -> int:
+    """The `closed-sessions` popup: the newest records of every machine as numbered blocks (newest at
+    the bottom, next to the prompt); Enter refreshes, a number reopens that session after a `y`, q closes."""
+    while True:
+        try:
+            me = this_machine()
+        except SleeperError as exc:
+            print(f"closed: {exc}")
+            return 1
+        rows = [dict(r, machine=r.get("machine") or me) for r in closed_rows(None, None, CLOSED_VIEW_ROWS)]
+        more, problems = machines_closed(["--limit", str(CLOSED_VIEW_ROWS)])
+        rows = sorted(rows + more, key=lambda r: _ts(r.get("at")) or 0, reverse=True)[:CLOSED_VIEW_ROWS]
+        tty = sys.stdout.isatty()
+        width = max(40, shutil.get_terminal_size((100, 30)).columns - 6)
+        out = [f"WARNING: {p}" for p in problems]
+        targets: dict[int, str] = {}
+        seen: set[tuple[object, object]] = set()
+        numbered = list(enumerate(rows, 1))
+        for n, rec in numbered:  # reopen by name only where the name means this very record (cmd_closed)
+            key = (rec.get("machine"), rec.get("name"))
+            by_name = rec.get("name") and SPAWN_NAME_RE.fullmatch(str(rec["name"])) and key not in seen
+            seen.add(key)
+            if rec.get("kind") == "claude" and not rec.get("reopened_at"):
+                targets[n] = f"{rec['machine']}/{rec['name'] if by_name else rec['session']}"
+        for n, rec in reversed(numbered):
+            block = closed_block(rec, width)
+            out += [""] + [f"{n:>3}  {block[0]}"] + [f"     {ln}" for ln in block[1:]
+                                                     if not ln.lstrip().startswith("reopen ")]
+        if not rows:
+            out.append("no closed sessions recorded")
+        out += ["", "Enter refreshes · a number reopens that session · q closes"]
+        print(("\033[H\033[2J" if tty else "") + "\n".join(out), flush=True)
+        if not tty:
+            return 3 if problems else 0
+        try:
+            got = input("> ").strip().lower()
+            if got in ("q", "quit", "exit"):
+                return 0
+            if got.isdigit() and int(got) in targets:
+                if input(f"reopen {targets[int(got)]}? [y/N] ").strip().lower() == "y":
+                    code = cmd_reopen(argparse.Namespace(target=targets[int(got)], name=None, workspace=None,
+                                                         sender="closed-sessions", machine=None, json=False,
+                                                         here=False, note=""))
+                    input(f"(exit {code}) Enter to go back ")
+            elif got.isdigit():
+                input("no reopenable session with that number; Enter to go back ")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+
+
+def cmd_closed_view_open(_args: argparse.Namespace) -> int:
+    """The `closed-sessions` action: open the closed-session list as a popup over the focused tab."""
+    try:
+        herdr("plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "closed-sessions", "--placement",
+              "popup", "--width", "90%", "--height", "80%", "--focus")
+    except SleeperError as exc:
+        print(f"closed-sessions: could not open the popup: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 # ------------------------------------------------------------ `reopen`
 
 def find_closed(target: str) -> dict | None:
@@ -6184,7 +6267,8 @@ def reopen_note(rec: dict, who: str, note: str) -> str:
 def cmd_reopen(args: argparse.Namespace) -> int:
     """Resume a closed session from its record, on its machine, in its cwd and workspace, under its name.
     Exit as spawn's: 0 resumed and prompted, 3 resumed with the prompt queued, 1 refused or failed, 2 bad input."""
-    note = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    note = args.note if isinstance(getattr(args, "note", None), str) else \
+        "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read(DELIVER_MAX_BYTES + 1)
     if note.strip() and body_problem(note):
         print(f"reopen: note: {body_problem(note)}", file=sys.stderr)
         return 2
@@ -12146,6 +12230,10 @@ def main(argv: list[str] | None = None) -> int:
     cdp.add_argument("--json", action="store_true")
     cdp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     cdp.set_defaults(fn=cmd_closed)
+    sub.add_parser("closed-view", help="closed sessions of every machine as a popup list (the plugin pane)"
+                   ).set_defaults(fn=cmd_closed_view)
+    sub.add_parser("closed-view-open", help="open the closed-session list as a popup (the plugin action)"
+                   ).set_defaults(fn=cmd_closed_view_open)
     rop = sub.add_parser("reopen", help="resume a closed session from its record (`closed`): its machine, cwd, "
                                         "workspace and name; an optional note on stdin goes into its first prompt")
     rop.add_argument("target", help="its name, Claude name or session id (MACHINE/NAME for another machine)")

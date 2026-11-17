@@ -976,6 +976,11 @@ echo "also do B-18" | herdr-sleeper reopen [MACHINE/]NAME|SESSION-ID [--name NEW
   `herdr-sleeper reopen MACHINE/NAME` line (by session id when a newer record
   holds that name). `--all` asks every saved machine in parallel (an
   unreachable one is named, exit 3); only the known fields cross machines.
+- **In Herdr:** the plugin action *Show closed sessions (all machines) and
+  reopen one* opens a popup (90% × 80%, like the ask inbox) with the newest 15
+  records of every machine, numbered, the newest next to the prompt: Enter
+  refreshes, a number reopens that session after a `y` (`--from
+  closed-sessions`), q closes.
 - **`reopen`** finds the newest record whose name, Claude name or session id
   (or an 8+ character id prefix) matches, on its machine (`MACHINE/NAME` goes
   there over SSH, with the note on stdin), and resumes it through `spawn

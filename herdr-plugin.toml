@@ -66,3 +66,18 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["./herdr-sleeper", "ask-inbox"]
+
+# Closed sessions of every machine (task, how, result), newest at the bottom; a number reopens one.
+[[actions]]
+id = "closed-sessions"
+title = "Show closed sessions (all machines) and reopen one"
+contexts = []
+command = ["./herdr-sleeper", "closed-view-open"]
+
+[[panes]]
+id = "closed-sessions"
+title = "Closed sessions (all machines)"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["./herdr-sleeper", "closed-view"]

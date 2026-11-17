@@ -10550,3 +10550,27 @@ def test_closed_and_reopen_reach_the_other_machine(ssh: FakeSsh, fake: FakeHerdr
     assert ssh.remote_argv() == ["herdr-sleeper", "close", "--here", "--from", "dev1/orc", "--summary-file", "-",
                                  "--", "far"]
     assert sleeper.parse_summary(ssh.calls()[-1]["stdin"]) == {"task": "it's done", "result": "all $good"}
+
+
+def test_a_record_that_fails_never_fails_the_close(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: Any, **_k: Any) -> dict:
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(sleeper, "transcript_facts", boom)
+    monkeypatch.setattr(sleeper, "ui_places", boom)
+    assert _close_with(monkeypatch, "a") == 0
+    assert _records() == [] and "closed" in events()
+    assert "no closed-session record for a" in sleeper.LOGFILE.read_text()
+
+
+def test_the_closed_popup_numbers_the_newest_next_to_its_prompt(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                                capsys: pytest.CaptureFixture[str]) -> None:
+    for i, name in enumerate(("old", "new")):
+        sleeper.append_closed({"v": 1, "type": "closed", "at": f"2026-11-1{6 + i}T10:00:00+01:00", "name": name,
+                               "kind": "claude", "session": f"{i}e7e7e7e-0000-4000-8000-000000000007",
+                               "task": f"{name} task"})
+    assert sleeper.cmd_closed_view(types.SimpleNamespace()) == 0          # not a tty: one listing
+    out = capsys.readouterr().out
+    assert out.index("  2  ") < out.index("old task") < out.index("  1  ") < out.index("new task")
+    assert "herdr-sleeper reopen" not in out and "a number reopens that session" in out
+    sleeper.cmd_closed_view_open(types.SimpleNamespace())
+    assert any(c[:3] == ("plugin", "pane", "open") and "closed-sessions" in c for c in fake.calls)
