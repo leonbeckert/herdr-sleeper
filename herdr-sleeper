@@ -7635,16 +7635,17 @@ WAIT_ASK_RE = re.compile(
     # "let me know"/"tell me" ask for an answer, a closing pleasantry doesn't
     r"|(?i:\blet me know\b(?! if (?:you (?:need|want|have) (?:anything|any (?:other |more )?questions?|more)|"
     r"(?:there(?:'s| is) )?anything (?:else|comes up)|something comes up)))"
-    r"|(?im:(?:^|[.!?:;]\s+|\b(?:please|just)\s+)tell me\b)"
+    r"|(?im:(?:^[ \t]*(?:[-*+]|\d+[.)])?[ \t]*[*_]*|[.!?:;]\s+|\b(?:please|just)\s+)tell me\b)"
     r"|(?i:\b(?:sag|gib) mir (?:bitte )?bescheid\b)")
-_SENTENCE = r"(?:^|[.!?:;]\s+|\b(?:please|just)\s+)"   # an imperative, not "I'll run it in a new shell"
+# an imperative (a sentence or list item starts with it), not "I'll run it in a new shell"
+_SENTENCE = r"(?:^[ \t]*(?:[-*+]|\d+[.)])?[ \t]*[*_]*|[.!?:;]\s+|\b(?:please|just)\s+)"
 WAIT_TODO_RE = re.compile(
     r"(?im)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
     r"bitte (?:führe|starte|gib|tipp|melde|logge|öffne|bestätige|klicke|trage|steck)|"
     r"\bplease (?:sign|log) ?(?:in|on)\b|"
     r"\bplease (?:open|approve|confirm|enter|paste|plug|check|install|type|click|tap|insert|unlock|grant|"
     r"answer|reply|decide)\b|"
-    r"\b(?:still )?waiting (?:on|for) you(?:r (?:ok|go|answer|decision|word|input|approval|reply|login|sign-?in))?\b|"
+    r"(?<!not )(?<!n't )(?<!no longer )(?<!nothing is )(?<!nothing's )\b(?:still )?waiting (?:on|for) you(?:r (?:ok|go|answer|decision|word|input|approval|reply|login|sign-?in))?\b|"
     + _SENTENCE + r"run (?:this|it|that|the (?:command|script|following)) in an? (?:separate |new |second |own )?"
     r"(?:terminal|shell)|"
     r"\b(?:once|when|as soon as) you(?:'re| are| have|'ve) (?:done|in|logged|signed|finished|approved|"
@@ -7676,7 +7677,8 @@ def waits_on_owner(text: str) -> str:
     the owner in the last three paragraphs (a command he is to run often sits alone after the request),
     a question in the last two."""
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
-    paras = [p for p in re.split(r"\n\s*\n", text) if p.strip() and not p.lstrip().startswith(">")]
+    text = re.sub(r"(?m)^[ \t]*>.*$", "", text)   # quoted lines, also those right under a line of prose
+    paras = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
     if WAIT_TODO_RE.search("\n".join(paras[-3:])):
         return "todo"
     tail = "\n".join(paras[-2:])
@@ -7773,7 +7775,7 @@ def ask_gate(row: dict, stop_hook_active: bool) -> str | None:
         return None
     try:
         config, _ = load_config()
-    except SleeperError:
+    except (SleeperError, OSError):
         return None
     if not config["ask_gate"]:
         return "off"

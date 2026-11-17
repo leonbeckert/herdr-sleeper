@@ -8869,6 +8869,8 @@ STATUS_HEAD = ("Step 0.3 is through: the gateway answers on :8443 and the canary
     "Tell me when the key is plugged in.",
     "Bitte melde dich bei Sentry an, dann lege ich das Projekt an.",
     "Sobald du eingeloggt bist, lege ich das Projekt an.",
+    "Two steps left for you:\n\n- Run this in a separate terminal.\n- Tell me when the key is plugged in.",
+    "Next:\n\n1. **Run this in a new terminal**: `bash x.sh`",
 ])
 def test_the_ask_gate_reads_requests_to_the_owner(reply: str) -> None:
     assert sleeper.waits_on_owner(reply) in ("todo", "question")
@@ -8888,6 +8890,9 @@ def test_the_two_misses_are_todos() -> None:
     "Fixed and pushed. Let me know if you need anything else.",
     "The logs tell me the job never started; I restarted it and it is running now.",
     "When you're back the report is in docs/report.md; nothing waits on you.",
+    "Completed.\n> Please sign in to Sentry.\n> Once you're in, run the canary.",   # a quote right under prose
+    "The panel is no longer waiting for you. I completed the login myself.",
+    "Nothing is waiting on you; the run is green.",
 ])
 def test_the_ask_gate_leaves_reports_alone(reply: str) -> None:
     assert sleeper.waits_on_owner(reply) == "none"
