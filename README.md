@@ -438,7 +438,7 @@ herdr-sleeper ask --done ID                                     # a to-do the se
   The answers are pinned: the options (the recommended one marked ★), `?`, or
   `d`/`x` for a to-do are never paged away; on a short pane they shrink to one
   line each. `z` zooms the panel (an 80-column terminal leaves it about 22).
-- **On the phone** (v0.1.52, owner 2026-11-17): Moshi shows no Herdr panes,
+- **On the phone** (v0.1.52, buttons at most 40 characters since v0.1.53, owner 2026-11-17): Moshi shows no Herdr panes,
   so the watcher also puts every open item on the owner's phone with
   `moshi-hook ask` (`ask_mirror`, default on; only when moshi-hook is paired
   and end-to-end encrypted). The card names the asker and its place and carries

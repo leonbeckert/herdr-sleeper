@@ -10607,7 +10607,8 @@ def test_mirror_buttons_for_a_question_six_options_more_and_a_todo() -> None:
     assert [t for _, t in six] == ["1", "2", "3", "4", "5", "6"]                  # six fill the card, no talk
     seven = sleeper.mirror_choices({"options": [f"o{i}" for i in range(1, 8)]})
     assert [t for _, t in seven] == ["1", "2", "3", "4", "5", "?"] and "pane" in seven[-1][0]
-    assert sleeper.mirror_choices({"options": ["x" * 200, "y"]})[0][0].endswith("…")
+    long = sleeper.mirror_choices({"options": ["x" * 200, "y"]})[0][0]
+    assert long.endswith("…") and len(long) <= 40                         # moshi-hook refuses longer buttons
     assert sleeper.mirror_choices({"type": sleeper.TODO, "question": "run it"}) == [
         (sleeper.MIRROR_DONE, "d"), (sleeper.MIRROR_CANT, "x")]
 
@@ -10758,3 +10759,20 @@ def test_an_unmatched_tap_is_asked_again_and_capped(
     sleeper.write_mirror_state(ask_id, outcome="retry")
     sleeper.tend_ask_mirrors()
     assert len(started) == 1 and sleeper.read_mirror_state(ask_id)["outcome"] == "failed"   # ... then never
+
+
+def test_a_usage_error_from_an_older_version_is_tried_again_by_the_new_one(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _ask(monkeypatch) == 0
+    (ask_id, _), = _asks().items()
+    started: list[list[str]] = []
+    real_popen = sleeper.subprocess.Popen
+    monkeypatch.setattr(sleeper.subprocess, "Popen", lambda argv, **kw: started.append(argv)
+                        if "ask-mirror" in argv else real_popen(argv, **kw))
+    _fake_moshi(tmp_path, monkeypatch, "exit 0")
+    sleeper.write_mirror_state(ask_id, outcome="exit-2", version=sleeper.PLUGIN_VERSION, posts=1, spawns=1)
+    sleeper.tend_ask_mirrors()
+    assert started == []                                       # the same version: no
+    sleeper.write_mirror_state(ask_id, version="0.1.52")
+    sleeper.tend_ask_mirrors()
+    assert len(started) == 1 and sleeper.read_mirror_state(ask_id)["version"] == sleeper.PLUGIN_VERSION

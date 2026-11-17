@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.52"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.53"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7414,7 +7414,7 @@ ASK_MIRROR_BEAT = 20               # a running mirror rewrites its state file th
 ASK_MIRROR_DEAD = 90               # a state file older than this without an outcome: the mirror died
 ASK_MIRROR_RETRY = 600             # Moshi unreachable: try again after this long
 ASK_MIRROR_CONTEXT = 900           # characters of context on the card (the owner reads all of it there)
-ASK_MIRROR_OPTION = 60             # characters of one button
+ASK_MIRROR_OPTION = 40             # characters of one button (moshi-hook refuses longer ones, exit 2)
 ASK_MIRROR_SPAWNS = 3              # a mirror that died this often without an outcome is given up
 ASK_MIRROR_POSTS = 6               # phone questions per item in all (Moshi down, taps that couldn't be handed on)
 ASK_MIRROR_TIMEOUT = "24h"         # moshi-hook's maximum; after it the phone question is not asked again
@@ -7570,6 +7570,8 @@ def tend_ask_mirrors() -> None:
                 spawns = 0                   # Moshi was down: a fresh start, not a crash
             elif outcome == "retry":
                 pass                         # a tap that couldn't be handed on: ask once more
+            elif str(outcome).startswith("exit-") and st.get("version") != PLUGIN_VERSION:
+                posts = spawns = 0           # moshi-hook refused what an older version built: try the new one
             elif outcome:
                 continue
             elif st and now - float(st.get("started") or 0) < 30:
@@ -7580,7 +7582,7 @@ def tend_ask_mirrors() -> None:
                 continue
             _end_stale_moshi(st)
             write_mirror_state(ask_id, outcome=None, started=now, spawns=spawns + 1, posts=posts + 1,
-                               moshi_pgid=None)
+                               moshi_pgid=None, version=PLUGIN_VERSION)
             subprocess.Popen([sys.executable, str(SELF), "ask-mirror", ask_id, str(STATE_DIR)],
                              start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
