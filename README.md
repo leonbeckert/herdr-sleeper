@@ -673,7 +673,7 @@ echo "build B-17 in this worktree" | herdr-sleeper spawn --cwd ~/development/app
     --name app-b17 [--kind claude|codex|opencode] [--from orc] [--workspace agents|w3] [--json] \
     [-- --dangerously-skip-permissions --model opus]
 herdr-sleeper close app-b17 [--force]
-herdr-sleeper close --self [--reason "B-17 done"]   # from inside the session: close me once this turn ends
+herdr-sleeper close --self [--reason "B-17 done"] [--task … --how … --result …]   # from inside the session: close me once this turn ends
 herdr-sleeper close --self --cancel
 ```
 
@@ -926,6 +926,72 @@ safe); a message delivered before then cancels it`). It is always local: no `--m
   stays open. `presence` shows a pending wish as `[closing: <reason>]`
   (`closing` in `--json`: the reason, `"pending"` without one, else null).
   `scan` does not act on wishes; only the watcher does.
+
+### Closed sessions: `closed` and `reopen` (*v0.1.49*)
+
+Sessions close themselves when done, which frees their memory; the owner still
+wants to see what each one was for and get it back quickly (owner 2026-11-17).
+Every close that goes through herdr-sleeper keeps a record, and `reopen`
+resumes a session from it.
+
+```sh
+herdr-sleeper close --self --task "build the closed-session view" \
+    --how "one record per close, written by close_session" \
+    --result "v0.1.49 pushed (abc1234); AO bump B-123 left open"
+herdr-sleeper close --self --summary-file -   # `task:` / `how:` / `result:` paragraphs on stdin
+herdr-sleeper close app-b17 --task … --how … --result …   # a closer can give one too
+herdr-sleeper closed [--all | --machine M] [--since 7d] [--grep TEXT] [--limit N] [--json]
+echo "also do B-18" | herdr-sleeper reopen [MACHINE/]NAME|SESSION-ID [--name NEW] [--workspace W] [--from X]
+```
+
+- **The record.** `closed.jsonl` in the state dir (0600, append-only, one line
+  per close): when, the machine (config `machine`), its place as Herdr showed
+  it (`workspace › tab`, read before the tab closes) and workspace label, the
+  name and Claude name, kind, session id, cwd, the replayable claude flags
+  (without `-n`), model (the transcript's last reply), subscription slot,
+  who spawned it and when, who closed it (`self`, the closer's name, or `gone`),
+  the refusals a `--force` overrode, and three owner-readable lines: `task`,
+  `how` it was resolved, the `result` (each one line, up to 500 characters).
+- **Where the summary comes from.** `close --self --task/--how/--result` (or
+  `--summary-file PATH|-`; the flags win) stores it with the wish; the record
+  marks it `summary_source: "session"` (`"closer"` for `close NAME …`). A close
+  without one is never refused (`close --self` prints a hint); the record then
+  takes the transcript's first prompt (without the paste wrapper and relay
+  header) as the task and its last reply as the result (`"transcript"`;
+  codex and opencode: the last message the session sent, `"last message"`).
+  Text taken from a transcript goes through a credential filter (private key
+  blocks, GitHub/GitLab/Slack/AWS/OpenAI-style tokens, `*_TOKEN=value`-like
+  assignments, 40+ character mixed-case runs); commit and session ids and
+  paths stay. Given summaries pass the agents' own Bash guardrails already.
+  `close NAME` on another machine sends its summary over stdin, not argv.
+- **Closed without a close.** A spawned session whose tab was closed by hand
+  or whose agent quit is recorded (`closed_by: "gone"`, with when it was first
+  missed) once it has been missing for 10 minutes; one missed tick (a Herdr
+  restart, an account restart) records nothing. A sleep row retired because its
+  pane is gone is recorded too. Sessions that were never spawned and vanish
+  by hand are not (Herdr restarts and `/clear` make "gone" too noisy there).
+- **`closed`** lists the records newest first, one block per session: time,
+  `machine › workspace › tab`, kind, who closed it, how long it ran, who
+  spawned it, then name, session id, cwd, task, how, result, and the exact
+  `herdr-sleeper reopen MACHINE/NAME` line (by session id when a newer record
+  holds that name). `--all` asks every saved machine in parallel (an
+  unreachable one is named, exit 3); only the known fields cross machines.
+- **`reopen`** finds the newest record whose name, Claude name or session id
+  (or an 8+ character id prefix) matches, on its machine (`MACHINE/NAME` goes
+  there over SSH, with the note on stdin), and resumes it through `spawn
+  --resume`: the same cwd, its old workspace when that still exists (else
+  `agents`), its name (`--name` when that is taken), its flags. Every spawn
+  check holds: the transcript must be on that machine and record that cwd, the
+  session must be neither live nor asleep, the cwd must be a checkout below
+  `~/development`. The first prompt says it was reopened, by whom, gives its
+  record and the note, and tells it to check the state before acting. A
+  `reopened` line is appended and `closed` shows it. Claude only for now; for
+  codex and opencode `reopen` prints the resume command. Transcripts are
+  shared across subscription slots, so the session starts on the active slot.
+- **Retention.** A record is about 1 KB. Once the file passes 4 MB it is
+  rewritten without records older than 365 days (at most the newest 5000).
+  Nothing here deletes a transcript; one that Claude Code pruned meanwhile
+  makes `reopen` refuse with the reason.
 
 ## Other machines
 

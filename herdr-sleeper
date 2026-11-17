@@ -4572,11 +4572,30 @@ def prune_spawned(agents: list[dict], journal: dict, now: float) -> None:
             age = now - dt.datetime.fromisoformat(str(rec.get("at"))).timestamp()
         except ValueError:
             age = math.inf
-        if rec.get("uuid") not in present and age >= SPAWN_RECORD_GRACE_SECONDS:
+        uuid = rec.get("uuid")
+        if uuid in present:
+            if rec.get("gone_since") is not None:  # back (a Herdr restart, an account restart)
+                record_spawned(name, {k: v for k, v in rec.items() if k != "gone_since"})
+            continue
+        if valid_session_id(uuid):
+            # a session that ran is recorded as closed once it has been missed CLOSED_GONE_SECONDS
+            # (its tab closed by hand, the agent quit): one missed tick is no close
+            since = rec.get("gone_since")
+            if not _number(since):
+                record_spawned(name, {**rec, "gone_since": now})
+                continue
+            if now - since < CLOSED_GONE_SECONDS:
+                continue
+        if age >= SPAWN_RECORD_GRACE_SECONDS:
             gone.append(name)
     for name in gone:
         record_spawned(name, None)
         event("spawn-record-dropped", name=name, uuid=records[name].get("uuid"), reason="session gone")
+        rec = records[name]
+        if valid_session_id(rec.get("uuid")) and _number(rec.get("gone_since")):
+            record_close(str(rec["uuid"]), name, rec.get("kind"), rec.get("cwd"), "gone", {}, rec, None,
+                         note=f"its tab was closed or its agent quit without a close; missed since "
+                              f"{_iso(float(rec['gone_since']))}")
         prompt = records[name].get("prompt")
         if isinstance(prompt, dict):  # settle_spawn_prompts normally drops it first, with its reason
             event("spawn-prompt-dropped", name=name, pane=records[name].get("pane"), id=prompt.get("id"),
@@ -4711,7 +4730,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     """Create a tab, start a named agent in it, type its first prompt (stdin). Exit 0 started and
     prompted, 3 started with the prompt queued (also a claude with no session id yet: the watcher types
     it in once there is one), 1 refused or failed, 2 bad input."""
-    body = sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    body = args.body if isinstance(getattr(args, "body", None), str) else sys.stdin.read(DELIVER_MAX_BYTES + 1)
     extra = list(args.agent_args or [])
     if extra[:1] == ["--"]:
         extra = extra[1:]
@@ -5060,6 +5079,10 @@ def cmd_close(args: argparse.Namespace) -> int:
     if not args.target:
         print("close: name the session to close (or --self for the calling one)", file=sys.stderr)
         return 2
+    args.summary, problem = summary_from_args(args)
+    if problem:
+        print(f"close: {problem}", file=sys.stderr)
+        return 2
     remote = routed("close", args)
     if remote is not None:
         return remote
@@ -5087,7 +5110,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         print("close: refusing to close the calling session (`close --self` closes it once this turn ends)",
               file=sys.stderr)
         return 1
-    closed, text, _refusals = close_session(uuid, args.target, by, args.force)
+    closed, text, _refusals = close_session(uuid, args.target, by, args.force, summary=args.summary)
     if not closed:
         print(f"close: {text}", file=sys.stderr)
         return 1
@@ -5384,13 +5407,14 @@ def retire_gone_row(key: str, entry: dict, name: str, by: str, phase: str) -> tu
 
 
 def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: float | None = None,
-                  **fields: object) -> tuple[bool, str, list[str]]:
+                  summary: dict | None = None, **fields: object) -> tuple[bool, str, list[str]]:
     """The core of `close`, also the watcher's for `close --self` (by "self", never forced): under the
     global lock and the session's mailbox lock, from fresh state, refuse what would lose work, else
     shut the agent down and close its pane. Returns (closed, the line for the caller, why not: the
     refusals, or the one problem). Never called for the calling session (its own SIGTERM).
     self_close_at: close only while that `close --self` wish is still pending, checked under the
-    mailbox lock (a delivery cancels it under the same lock, before Herdr may show the turn)."""
+    mailbox lock (a delivery cancels it under the same lock, before Herdr may show the turn).
+    summary: task/how/result for the closed-session record (record_close; none falls back to the transcript)."""
     def refused(text: str, why: list[str] | None = None) -> tuple[bool, str, list[str]]:
         return False, text, why or [text]
 
@@ -5408,7 +5432,12 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
             info = herdr("pane", "get", str(hit["pane_id"]), check=False).get("pane") or {}
             phase = "orphaned" if is_orphan(str(key), hit) else hit.get("phase", "asleep")
             if phase in RETIRABLE_PHASES and not info and sleeper_gone(hit):
-                return retire_gone_row(str(key), hit, name, by, phase)
+                done = retire_gone_row(str(key), hit, name, by, phase)
+                if done[0]:
+                    record_close(uuid, name, hit.get("kind"), hit.get("cwd"), by, session_facts("asleep", hit, key),
+                                 spawn_record_of(uuid)[1], summary, note=f"its {phase} pane was gone already",
+                                 claude_name=hit.get("claude_name"))
+                return done
             if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
                     or info.get("agent") not in (None, CLAIM_AGENT):
                 return refused(f"the sleep row for {name} is {phase} and its pane is not provably its own; "
@@ -5423,6 +5452,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
         refusals = close_refusals(state, hit, uuid)
         if refusals and not force:
             return refused(f"{name} " + "; ".join(refusals) + ". Pass --force to close it anyway", refusals)
+        facts = session_facts(state, hit, key)  # its place and flags, before the tab goes
+        spawned = spawn_record_of(uuid)[1]
         pane = hit["pane_id"]
         tab = hit.get("tab_id") if state == "live" else (herdr("pane", "get", pane, check=False).get("pane") or {}).get("tab_id")
         cwd, kind = hit.get("cwd"), hit.get("agent") if state == "live" else hit.get("kind")
@@ -5464,6 +5495,8 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
         drop_self_close(uuid)  # a pending `close --self` is done, whoever closed it
     event("closed", name=name, pane=pane, uuid=uuid, state=state, closed=closed, by=by, forced=bool(refusals),
           overridden=refusals or None, exited=exited, **fields)
+    record_close(uuid, name, kind, cwd, by, facts, spawned, summary, forced=refusals or None,
+                 claude_name=hit.get("claude_name") if state == "asleep" else None)
     if refusals:
         say(f"close {name}: forced by {by} past: {'; '.join(refusals)}")
     resume = manual_command({"cwd": cwd, "argv": hit.get("argv") or [], "uuid": uuid, "kind": kind or "claude"})
@@ -5520,6 +5553,8 @@ def close_self(args: argparse.Namespace) -> int:
     """`close --self [--reason TEXT]` / `close --self --cancel`: always this machine, always the
     calling agent's own session (calling_agent: HERDR_PANE_ID plus the agent as an ancestor)."""
     problem = reason_problem(args.reason)
+    summary, summary_problem = summary_from_args(args)
+    problem = problem or summary_problem
     if problem:
         print(f"close: {problem}", file=sys.stderr)
         return 2
@@ -5550,13 +5585,17 @@ def close_self(args: argparse.Namespace) -> int:
         old = pending.get(uuid)
         rec = {"at": old["at"] if old else now, "since": (old or {}).get("since") or _iso(now), "name": name,
                "pane": me["pane_id"], "reason": args.reason if args.reason is not None else (old or {}).get("reason"),
-               "by": context_sender(agents) or me["pane_id"], "refused": (old or {}).get("refused")}
+               "by": context_sender(agents) or me["pane_id"], "refused": (old or {}).get("refused"),
+               "summary": summary or (old or {}).get("summary")}
         pending[uuid] = rec
         write_json(SELF_CLOSE, pending)
     event("self-close-requested", uuid=uuid, name=name, pane=me["pane_id"], reason=rec["reason"],
           renewed=old is not None)
     held = insomnia_reason(uuid, me["pane_id"], me.get("terminal_id"))
     note = f" (it holds {held}: release it, or the close waits)" if held else ""
+    if not rec["summary"]:
+        note += ("; no --task/--how/--result given, so its closed-session record takes your first prompt and "
+                 "last reply instead (run close --self again with them to add them)")
     print(f"close --self: {name} closes after this turn ends (checked every {MAIL_POLL_SECONDS} s, closed once "
           f"safe); a message delivered before then cancels it{note}")
     return 0
@@ -5589,7 +5628,8 @@ def tend_self_closes(now: float | None = None) -> None:
             continue  # its turn still runs (the one that asked, most likely): next tick
         try:
             closed, text, why = close_session(uuid, name, "self", False, self_close_at=rec["at"],
-                                              via="close --self", reason=rec.get("reason"))
+                                              summary=rec.get("summary") if isinstance(rec.get("summary"), dict)
+                                              else None, via="close --self", reason=rec.get("reason"))
         except SleeperError as exc:
             closed, text, why = False, str(exc), [str(exc)]
         if closed:
@@ -5604,6 +5644,605 @@ def tend_self_closes(now: float | None = None) -> None:
                     write_json(SELF_CLOSE, pending)
             event("self-close-held", uuid=uuid, name=name, why=loud)
             say(f"close --self of {name} waits: {loud}")
+
+
+# ------------------------------------------------------------ closed sessions (`closed`, `reopen`)
+# Sessions close themselves when done (`close --self`) and free their memory; this keeps a short
+# record of each so the owner can see what it was for and reopen it. Every close that goes through
+# close_session appends one line to closed.jsonl (this machine, 0600, append-only): where it ran (its
+# place as Herdr showed it), its session id, cwd and replayable flags, who spawned and who closed it,
+# and three owner-readable fields: task, how it was resolved, the end result. The closing session
+# gives them (`close --self --task … --how … --result …`, or a closer with `close NAME …`); a close
+# without them takes the first prompt and the last reply from the transcript, marked as such. A
+# spawned session that vanished without a close (tab closed by hand, the agent quit) is recorded once
+# it has been gone CLOSED_GONE_SECONDS. `closed` lists the records (every machine with --all);
+# `reopen` resumes one through spawn's checks (transcript present, same cwd, not live or asleep).
+# Records go after CLOSED_KEEP_DAYS once the file passes CLOSED_MAX_BYTES; transcripts are never touched.
+CLOSED = STATE_DIR / "closed.jsonl"
+CLOSED_SCHEMA = 1
+CLOSED_MAX_BYTES = 4_000_000
+CLOSED_KEEP_DAYS = 365
+CLOSED_KEEP_MAX = 5000
+CLOSED_GONE_SECONDS = 600            # a spawned session missing this long without a close is recorded as gone
+SUMMARY_FIELDS = ("task", "how", "result")
+SUMMARY_MAX = 500                    # characters per field, after whitespace is collapsed
+SUMMARY_LABEL_RE = re.compile(r"^\s*(task|how|result)\s*:\s?(.*)$", re.IGNORECASE)
+FALLBACK_HEAD_BYTES = 2_000_000      # the transcript's head holds the first prompt ...
+FALLBACK_TAIL_BYTES = 2_000_000      # ... its tail the last reply and model
+
+# What a summary taken from a transcript must not carry: values that look like credentials. The
+# agents' own Bash guardrails already refuse a command that would print a secret value, so a summary
+# a session gives itself passes them; this filter is for text read back from a transcript.
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.DOTALL),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}"
+               r"|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})"),
+)
+SECRET_ASSIGN = re.compile(r"(?i)\b([A-Za-z0-9_]*(?:secret|token|passw(?:or)?d|api_?key|private_key|credential)"
+                           r"[A-Za-z0-9_]*)(\s*[=:]\s*)(\"[^\"\s]{6,}\"|'[^'\s]{6,}'|[^\s,;]{6,})")
+# a long run of mixed case and digits (an API key, a base64 blob); "/" breaks a run, so paths stay
+SECRET_RUN = re.compile(r"(?<![A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*[A-Z])(?=[A-Za-z0-9+_-]*[a-z])"
+                        r"(?=[A-Za-z0-9+_-]*[0-9])[A-Za-z0-9+_-]{40,}={0,2}")
+REDACTED = "[redacted]"
+
+
+def redact(text: str) -> str:
+    """text with credential-looking values replaced (a key's name stays, its value goes). Commit and
+    session ids (hex, uuids) are kept: they are what a result names."""
+    for pat in SECRET_PATTERNS:
+        text = pat.sub(REDACTED, text)
+    text = SECRET_ASSIGN.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    return SECRET_RUN.sub(REDACTED, text)
+
+
+def one_line(text: object, limit: int = SUMMARY_MAX) -> str:
+    """Whitespace collapsed, control characters dropped, cut to limit with an ellipsis."""
+    flat = " ".join(CONTROL_CHARS.sub(" ", str(text or "")).split())
+    return flat if len(flat) <= limit else flat[:limit - 1].rstrip() + "…"
+
+
+def parse_summary(text: str) -> dict[str, str]:
+    """`task:` / `how:` / `result:` paragraphs (labels in any case; following lines continue the field)."""
+    out: dict[str, list[str]] = {}
+    field = None
+    for line in text.splitlines():
+        m = SUMMARY_LABEL_RE.match(line)
+        if m:
+            field = m.group(1).lower()
+            out.setdefault(field, []).append(m.group(2))
+        elif field:
+            out[field].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def summary_text(summary: dict) -> str:
+    """The labelled form parse_summary reads (what goes to another machine over stdin)."""
+    return "".join(f"{k}: {one_line(summary[k])}\n" for k in SUMMARY_FIELDS if summary.get(k))
+
+
+def summary_from_args(args: argparse.Namespace, stdin_ok: bool = True) -> tuple[dict | None, str | None]:
+    """(summary, problem) from --summary-file (a path or `-` for stdin) and --task/--how/--result (which win).
+    None when nothing was given. Each field one line of at most SUMMARY_MAX characters once collapsed."""
+    got: dict[str, str] = {}
+    path = getattr(args, "summary_file", None)
+    if path:
+        try:
+            if path == "-":
+                if not stdin_ok:
+                    return None, "--summary-file - reads stdin, which carries something else here"
+                raw = sys.stdin.read(DELIVER_MAX_BYTES + 1)
+            else:
+                with open(os.path.expanduser(path), encoding="utf-8") as fh:
+                    raw = fh.read(DELIVER_MAX_BYTES + 1)
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, f"--summary-file: {exc}"
+        got = parse_summary(raw)
+        if not got:
+            return None, "--summary-file has no `task:`, `how:` or `result:` line"
+    for k in SUMMARY_FIELDS:
+        if getattr(args, k, None) is not None:
+            got[k] = getattr(args, k)
+    if not got:
+        return None, None
+    out: dict[str, str] = {}
+    for k, v in got.items():
+        flat = " ".join(CONTROL_CHARS.sub(" ", v).split())
+        if not flat:
+            continue
+        if len(flat) > SUMMARY_MAX:
+            return None, f"--{k} is longer than {SUMMARY_MAX} characters (say it shorter; the record is a summary)"
+        if OWNER_ANSWER_HEADER in flat:
+            return None, f"--{k} imitates an owner's answer"
+        out[k] = redact(flat)
+    return out or None, None
+
+
+def _record_text(rec: dict) -> str:
+    """A transcript record's plain text: a string content, or its text blocks joined; "" for tool traffic."""
+    msg = rec.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(c.get("text")) for c in content
+                         if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str))
+    return ""
+
+
+def _prompt_body(text: str) -> str:
+    """A typed-in prompt without its paste wrapper and relay envelope header: what the session was asked."""
+    text = PASTE_WRAP_RE.sub("", text)
+    text = re.sub(r"</pasted_content[^>\n]*>", "", text).strip()
+    first, _, rest = text.partition("\n")
+    if first.startswith("[relayed from ") or first.startswith(OWNER_ANSWER_HEADER):
+        text = rest.strip()
+    return text
+
+
+def _skip_prompt(text: str) -> bool:
+    """Claude Code's own records that sit where a prompt does: slash command echoes, caveats, reminders."""
+    head = text.lstrip()[:40]
+    return not head or head.startswith(("<command-", "<local-command", "Caveat:", "<system-reminder>",
+                                        "[Request interrupted", "<bash-"))
+
+
+def transcript_facts(path: Path | None) -> dict:
+    """From a claude transcript: first_prompt (the body of the first real prompt), last_reply (the last
+    assistant text), model (the last assistant record's), started (the first timestamp). Best effort:
+    {} when it can't be read. Only the head and the tail are read."""
+    if path is None:
+        return {}
+    out: dict = {}
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            head = fh.read(FALLBACK_HEAD_BYTES)
+            fh.seek(max(0, size - FALLBACK_TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return {}
+    for line in head.splitlines():
+        rec = _json_record(line)
+        if rec is None or rec.get("isSidechain"):
+            continue
+        if "started" not in out and isinstance(rec.get("timestamp"), str):
+            out["started"] = rec["timestamp"]
+        if rec.get("type") == "user" and not rec.get("isMeta"):
+            text = _record_text(rec)
+            if not _skip_prompt(text):
+                out["first_prompt"] = _prompt_body(text)
+                break
+    for line in reversed(tail.splitlines()):
+        rec = _json_record(line)
+        if rec is None or rec.get("type") != "assistant" or rec.get("isSidechain"):
+            continue
+        msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+        model = msg.get("model")
+        if "model" not in out and isinstance(model, str) and model and not model.startswith("<"):
+            out["model"] = model
+        text = _record_text(rec).strip()
+        if text and "last_reply" not in out:
+            out["last_reply"] = text
+        if "model" in out and "last_reply" in out:
+            break
+    return out
+
+
+def fallback_summary(uuid: str, kind: object, name: str | None) -> dict:
+    """task/result for a close that gave none: a claude transcript's first prompt and last reply, else
+    the last message this session sent that the archive holds. Marked by summary_source."""
+    if kind == "claude":
+        facts = transcript_facts(transcript_for(uuid))
+        out = {k: redact(one_line(facts[src])) for k, src in (("task", "first_prompt"), ("result", "last_reply"))
+               if facts.get(src)}
+        if out:
+            return dict(out, summary_source="transcript")
+    if name:
+        sent = [m for m in archive_all() if str(m.get("from", "")).split("/")[-1] == name]
+        if sent:
+            last = max(sent, key=lambda m: m.get("at_ns") or 0)
+            return {"result": redact(one_line(last.get("body"))), "summary_source": "last message"}
+    return {}
+
+
+def _ts(value: object) -> float | None:
+    """An ISO time (or epoch) as epoch seconds, None when it is neither."""
+    if _number(value):
+        return float(value)  # type: ignore[arg-type]
+    with contextlib.suppress(ValueError, TypeError):
+        stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return stamp.timestamp()
+    return None
+
+
+def closed_lock():
+    return flocked(CLOSED.with_name(CLOSED.name + ".lock"))
+
+
+def read_closed() -> list[dict]:
+    """Every record line, oldest first; a line that isn't a JSON object is skipped."""
+    out: list[dict] = []
+    try:
+        with CLOSED.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                with contextlib.suppress(ValueError):
+                    rec = json.loads(line)
+                    if isinstance(rec, dict) and valid_session_id(rec.get("session")):
+                        out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def append_closed(rec: dict) -> None:
+    """Append one record line (0600) under the store's lock; past CLOSED_MAX_BYTES the file is rewritten
+    without records older than CLOSED_KEEP_DAYS (and beyond the newest CLOSED_KEEP_MAX). Best effort:
+    a failure is logged, never fatal (the session is closed already; the `closed` event still names it)."""
+    try:
+        ensure_state_dir()
+        with closed_lock():
+            # not append_private: that rotates at LOG_MAX_BYTES and takes this very lock file
+            with os.fdopen(open_private(CLOSED, os.O_WRONLY | os.O_APPEND), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if CLOSED.stat().st_size > CLOSED_MAX_BYTES:
+                cutoff = time.time() - CLOSED_KEEP_DAYS * 86400
+                keep = [r for r in read_closed() if (_ts(r.get("at")) or 0) >= cutoff][-CLOSED_KEEP_MAX:]
+                tmp = CLOSED.with_name(CLOSED.name + ".tmp")
+                with os.fdopen(open_private(tmp, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as fh:
+                    fh.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in keep)
+                    fh.flush()
+                    full_sync(fh.fileno())
+                os.replace(tmp, CLOSED)
+    except (OSError, SleeperError) as exc:
+        say(f"WARN could not keep the closed-session record of {rec.get('name')} ({rec.get('session')}): {exc}")
+
+
+def session_facts(state: str, hit: dict, key: object) -> dict:
+    """What a record keeps about a session that is about to close, read while it still runs: its place
+    and workspace label (the tab goes with the close), replayable flags and slot. Best effort."""
+    pane = str(hit["pane_id"] if state == "live" else key)
+    facts: dict = {"pane": pane}
+    with contextlib.suppress(SleeperError):
+        agents = list_agents()
+        facts["place"] = ui_places(agents).get(pane)
+        row = next((a for a in agents if a["pane_id"] == pane), None) or {}
+        spaces = herdr("workspace", "list", check=False).get("workspaces") or []
+        ws = next((w for w in spaces if isinstance(w, dict) and w.get("workspace_id") == row.get("workspace_id")), {})
+        facts["workspace"] = ui_label(ws.get("label"))
+    argv = hit.get("argv") if state == "asleep" else None
+    if state == "live":
+        kind = hit.get("agent")
+        with contextlib.suppress(SleeperError):
+            present, argv, pid = agent_process(pane, str(kind))
+            if present is True and kind == "claude":
+                facts["slot"] = session_account(pid)
+    if isinstance(argv, list):
+        replay, _why = replayable_argv([str(a) for a in argv])
+        if replay is not None:
+            flags: list[str] = []
+            skip = False
+            for a in replay:  # the name is the record's own; reopen passes it again
+                if skip:
+                    skip = False
+                    continue
+                if a in ("-n", "--name"):
+                    skip = True
+                    continue
+                if a.startswith("--name="):
+                    continue
+                flags.append(a)
+            facts["argv"] = flags
+    return facts
+
+
+def record_close(uuid: str, name: str, kind: object, cwd: object, by: str, facts: dict, spawned: dict | None,
+                 summary: dict | None, forced: list[str] | None = None, note: str | None = None,
+                 claude_name: str | None = None) -> dict:
+    """Build and append the record of a session that closed. `summary` from the closer (marked
+    summary_source "session" for a self close, "closer" otherwise); none given falls back to the transcript."""
+    summary = dict(summary or {})
+    source = summary.pop("summary_source", None)
+    if any(summary.get(k) for k in SUMMARY_FIELDS):
+        source = source or ("session" if by == "self" else "closer")
+    else:
+        summary = fallback_summary(uuid, kind, name)
+        source = summary.pop("summary_source", None)
+    tfacts = transcript_facts(transcript_for(uuid)) if kind == "claude" else {}
+    machine = None
+    with contextlib.suppress(ConfigError):
+        machine = this_machine()
+    if kind == "claude" and claude_name is None:
+        claude_name = claude_session_name(transcript_for(uuid))
+    rec = {"v": CLOSED_SCHEMA, "type": "closed", "at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+           "machine": machine, "place": facts.get("place"), "workspace": facts.get("workspace"), "name": name,
+           "claude_name": claude_name if claude_name != name else None, "kind": kind, "session": uuid, "cwd": cwd,
+           "argv": facts.get("argv"), "model": tfacts.get("model"), "slot": facts.get("slot"),
+           "spawned_by": (spawned or {}).get("by"), "opened_at": (spawned or {}).get("at") or tfacts.get("started"),
+           "closed_by": by, "forced": forced or None, "note": note,
+           **{k: summary.get(k) for k in SUMMARY_FIELDS}, "summary_source": source}
+    append_closed({k: v for k, v in rec.items() if v is not None})
+    return rec
+
+
+def spawn_record_of(uuid: str) -> tuple[str | None, dict | None]:
+    """(name, record) of the spawn that started this session, if spawned.json still holds it."""
+    return next(((n, r) for n, r in spawned_records().items() if r.get("uuid") == uuid), (None, None))
+
+
+# ------------------------------------------------------------ `closed`
+
+def closed_rows(since_hours: float | None, grep: str | None, limit: int | None) -> list[dict]:
+    """This machine's closed records, newest first, each with `reopened_at/by` from a later `reopened` line."""
+    lines = read_closed()
+    reopened: dict[str, dict] = {}
+    rows: list[dict] = []
+    for rec in lines:
+        if rec.get("type") == "reopened":
+            reopened[rec["session"]] = rec
+        elif rec.get("type", "closed") == "closed":
+            rows.append(rec)
+    out = []
+    cutoff = time.time() - since_hours * 3600 if since_hours is not None else None
+    needle = grep.lower() if grep else None
+    for rec in reversed(rows):
+        if cutoff is not None and (_ts(rec.get("at")) or 0) < cutoff:
+            continue
+        if needle and needle not in json.dumps(rec, ensure_ascii=False).lower():
+            continue
+        again = reopened.get(rec["session"])
+        if again and (_ts(again.get("at")) or 0) >= (_ts(rec.get("at")) or 0):
+            rec = dict(rec, reopened_at=again.get("at"), reopened_by=again.get("by"), reopened_as=again.get("name"))
+        out.append(rec)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+CLOSED_FIELDS = ("v", "type", "at", "machine", "place", "workspace", "name", "claude_name", "kind", "session", "cwd",
+                 "model", "slot", "spawned_by", "opened_at", "closed_by", "note", "task", "how", "result",
+                 "summary_source", "reopened_at", "reopened_by", "reopened_as")
+
+
+def clean_closed_row(row: dict, label: str) -> dict:
+    """A remote record reduced to the known fields as strings (or None); `forced`/`argv` are local detail."""
+    out = {k: (None if row.get(k) is None else one_line(row.get(k), 2000)) for k in CLOSED_FIELDS}
+    out["machine"] = out["machine"] or label
+    return out
+
+
+def remote_closed(label: str, argv: list[str]) -> list[dict]:
+    done = remote_sleeper(label, ["closed", "--json", "--here", *argv])
+    try:
+        rows = json.loads(done.stdout)
+    except ValueError:
+        rows = None
+    if done.returncode != 0 or not isinstance(rows, list):
+        raise SleeperError(f"{label}: closed failed ({(done.stderr.strip().splitlines() or ['no output'])[-1]})")
+    return [clean_closed_row(r, label) for r in rows if isinstance(r, dict) and valid_session_id(r.get("session"))]
+
+
+def machines_closed(argv: list[str]) -> tuple[list[dict], list[str]]:
+    """Every enabled saved machine's records, asked in parallel (REMOTE_SECONDS at most in all)."""
+    try:
+        labels = sorted(saved_machines())
+    except SleeperError as exc:
+        return [], [str(exc)]
+    results: dict[str, list[dict] | str] = {}
+
+    def ask(label: str) -> None:
+        try:
+            results[label] = remote_closed(label, argv)
+        except Exception as exc:  # one machine must not cost the others their rows
+            results[label] = str(exc)
+    threads = [threading.Thread(target=ask, args=(label,), daemon=True) for label in labels]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + REMOTE_SECONDS + 1
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    rows: list[dict] = []
+    problems: list[str] = []
+    for label in labels:
+        got = results.get(label, f"{label}: no answer within {REMOTE_SECONDS}s")
+        if isinstance(got, str):
+            problems.append(got)
+        else:
+            rows += got
+    return rows, problems
+
+
+def _span(rec: dict) -> str:
+    start, end = _ts(rec.get("opened_at")), _ts(rec.get("at"))
+    if start is None or end is None or end < start:
+        return ""
+    mins = int(end - start) // 60
+    return f"ran {mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"ran {mins}m"
+
+
+def closed_block(rec: dict, width: int, target: str | None = None) -> list[str]:
+    """One record as the owner reads it: when, where (machine › workspace › tab), what, how, result, reopen."""
+    when = (_ts(rec.get("at")) and dt.datetime.fromtimestamp(_ts(rec.get("at"))).strftime("%Y-%m-%d %H:%M")) or "?"
+    machine = rec.get("machine")
+    place = rec.get("place") or f"(tab {rec.get('name') or '?'})"
+    where = f"{machine}{PLACE_SEP}{place}" if machine else place
+    by = {"self": "closed itself", "gone": "gone without a close"}.get(str(rec.get("closed_by")),
+                                                                        f"closed by {rec.get('closed_by')}")
+    facts = ", ".join(x for x in (str(rec.get("kind") or "?"), by, _span(rec),
+                                  f"spawned by {rec['spawned_by']}" if rec.get("spawned_by") else "") if x)
+    lines = [f"{when}  {where}  ({facts})"]
+    name = rec.get("name") or "?"
+    alias = f" ({rec['claude_name']})" if rec.get("claude_name") else ""
+    lines.append(f"  {'name':7} {name}{alias}  session {rec.get('session')}  {rec.get('cwd') or ''}".rstrip())
+    for k in SUMMARY_FIELDS:
+        if rec.get(k):
+            lines += wrap_text(str(rec[k]), width, " " * 10, f"  {k:7} ")
+    source = rec.get("summary_source")
+    if source == "transcript":
+        lines.append("  (no summary given: task is its first prompt, result its last reply)")
+    elif source == "last message":
+        lines.append("  (no summary given: result is the last message it sent)")
+    elif not any(rec.get(k) for k in SUMMARY_FIELDS):
+        lines.append("  (no summary given, none found)")
+    if rec.get("note"):
+        lines += wrap_text(str(rec["note"]), width, " " * 10, f"  {'note':7} ")
+    if rec.get("reopened_at"):
+        lines.append(f"  {'reopened':7} {rec['reopened_at']} by {rec.get('reopened_by') or '?'}"
+                     + (f" as {rec['reopened_as']}" if rec.get("reopened_as") and rec["reopened_as"] != name else ""))
+    elif rec.get("kind") == "claude":
+        target = target or str(rec.get("session"))
+        lines.append(f"  {'reopen':7} herdr-sleeper reopen {f'{machine}/{target}' if machine else target}")
+    return lines
+
+
+def cmd_closed(args: argparse.Namespace) -> int:
+    """`closed`: closed sessions, newest first (this machine, a --machine, or --all of them)."""
+    try:
+        since = parse_duration(args.since) if args.since else None
+    except ConfigError as exc:
+        print(f"closed: {exc}", file=sys.stderr)
+        return 2
+    if args.grep is not None and not REMOTE_ARG_RE.fullmatch(args.grep):
+        print("closed: --grep takes letters, digits, spaces and ./:@=,+~%_- only", file=sys.stderr)
+        return 2
+    passed = ((["--since", args.since] if args.since else []) + (["--grep", args.grep] if args.grep else [])
+              + (["--limit", str(args.limit)] if args.limit else []))
+    problems: list[str] = []
+    try:
+        label = None if args.here else machine_label(args.machine)
+        me = this_machine()
+    except SleeperError as exc:
+        print(f"closed: {exc}", file=sys.stderr)
+        return 1
+    if label:
+        try:
+            rows = remote_closed(label, passed)
+        except SleeperError as exc:
+            print(f"closed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        rows = [dict(r, machine=r.get("machine") or me) for r in closed_rows(since, args.grep, args.limit)]
+        if args.all and not args.here:
+            more, problems = machines_closed(passed)
+            rows += more
+    rows.sort(key=lambda r: _ts(r.get("at")) or 0, reverse=True)
+    if args.limit:
+        rows = rows[:args.limit]
+    warn = sys.stderr if args.json else sys.stdout
+    for problem in problems:
+        print(f"WARNING: {problem}", file=warn)
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 3 if problems else 0
+    if not rows:
+        print("no closed sessions recorded" + (" in that range" if since or args.grep else ""))
+        return 3 if problems else 0
+    width = max(40, shutil.get_terminal_size((120, 40)).columns - 2)
+    newest: set[tuple[object, object]] = set()  # reopen by name only where the name means this very record
+    for i, rec in enumerate(rows):
+        key = (rec.get("machine"), rec.get("name"))
+        by_name = rec.get("name") and SPAWN_NAME_RE.fullmatch(str(rec["name"])) and key not in newest \
+            and not re.fullmatch(r"[0-9a-f-]{8,}", str(rec["name"]))
+        newest.add(key)
+        if i:
+            print()
+        print("\n".join(closed_block(rec, width, str(rec["name"]) if by_name else None)))
+    return 3 if problems else 0
+
+
+# ------------------------------------------------------------ `reopen`
+
+def find_closed(target: str) -> dict | None:
+    """The newest closed record whose name, Claude name or session id (or an 8+ character prefix of it) is target."""
+    for rec in closed_rows(None, None, None):
+        session = str(rec.get("session"))
+        if target in (rec.get("name"), rec.get("claude_name"), session) or (
+                len(target) >= 8 and re.fullmatch(r"[0-9a-f-]+", target) and session.startswith(target)):
+            return rec
+    return None
+
+
+def reopen_note(rec: dict, who: str, note: str) -> str:
+    """The first prompt of a reopened session: that it was reopened, its record, and the reopener's note."""
+    lines = [f"[herdr-sleeper reopen] You were reopened by {who} after you closed on {rec.get('at')} "
+             f"({rec.get('closed_by') == 'self' and 'you closed yourself' or 'closed by ' + str(rec.get('closed_by'))}).",
+             "Your closed-session record:"]
+    for k in SUMMARY_FIELDS:
+        if rec.get(k):
+            lines.append(f"  {k}: {rec[k]}")
+    if rec.get("summary_source") in ("transcript", "last message"):
+        lines.append(f"  (no summary was given at the close; these lines come from your {rec['summary_source']})")
+    lines.append("Things may have moved since: check the state first (git status, repo-sync status --here, "
+                 "your handoff file), then continue.")
+    if note.strip():
+        lines += ["", "Note from whoever reopened you:", note.strip()]
+    else:
+        lines.append("No note came with the reopen: report to whoever reopened you that you are back, "
+                     "and wait for what they want.")
+    return "\n".join(lines)
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    """Resume a closed session from its record, on its machine, in its cwd and workspace, under its name.
+    Exit as spawn's: 0 resumed and prompted, 3 resumed with the prompt queued, 1 refused or failed, 2 bad input."""
+    note = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read(DELIVER_MAX_BYTES + 1)
+    if note.strip() and body_problem(note):
+        print(f"reopen: note: {body_problem(note)}", file=sys.stderr)
+        return 2
+    try:
+        label, target = (None, args.target) if args.here else route(args.target, args.machine)
+    except SleeperError as exc:
+        print(f"reopen: {exc}", file=sys.stderr)
+        return 1
+    if label:
+        if remote_target_problem(target):
+            print(f"reopen: {remote_target_problem(target)}", file=sys.stderr)
+            return 2
+        try:
+            who = remote_sender(args.sender) or remote_sender("reopen")
+        except SleeperError as exc:
+            print(f"reopen: {exc}", file=sys.stderr)
+            return 1
+        argv = (["reopen", "--here", "--from", str(who)] + (["--name", args.name] if args.name else [])
+                + (["--workspace", args.workspace] if args.workspace else []) + ["--", target])
+        return relay_remote("reopen", label, argv, note, REMOTE_SPAWN_SECONDS)
+    rec = find_closed(target)
+    if rec is None:
+        print(f"reopen: no closed record matches {target!r} on this machine (`herdr-sleeper closed --all` shows "
+              "where each one closed; then reopen MACHINE/NAME)", file=sys.stderr)
+        return 1
+    uuid, kind = str(rec["session"]), rec.get("kind") or "claude"
+    manual = manual_command({"cwd": rec.get("cwd"), "argv": rec.get("argv") or [], "uuid": uuid, "kind": kind})
+    if kind != "claude":
+        print(f"reopen: {rec.get('name')} ran {kind}, which reopen can't resume yet; by hand: {manual}",
+              file=sys.stderr)
+        return 1
+    name = args.name or rec.get("name") or rec.get("claude_name")
+    if not name or not SPAWN_NAME_RE.fullmatch(str(name)):
+        name = f"reopen-{uuid[:8]}"
+    workspace = args.workspace
+    if workspace is None and rec.get("workspace"):
+        with contextlib.suppress(SleeperError):
+            workspace = rec["workspace"] if workspace_with_label(str(rec["workspace"])) else None
+    agents = list_agents()
+    sender = args.sender or context_sender(agents) or "reopen"
+    if not sender_ok(sender):
+        print("reopen: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+        return 2
+    body = reopen_note(rec, sender, note)
+    spawn_args = argparse.Namespace(cwd=str(rec.get("cwd") or ""), name=str(name), kind="claude", sender=sender,
+                                    workspace=workspace, json=args.json, machine=None, body=body,
+                                    agent_args=[*(rec.get("argv") or []), "--resume", uuid])
+    code = cmd_spawn(spawn_args)
+    if code in (0, 3):
+        machine = None
+        with contextlib.suppress(ConfigError):
+            machine = this_machine()
+        append_closed({"v": CLOSED_SCHEMA, "type": "reopened", "at": dt.datetime.now().astimezone().isoformat(
+            timespec="seconds"), "machine": machine, "session": uuid, "name": str(name), "by": sender})
+        event("reopened", name=str(name), uuid=uuid, by=sender, workspace=workspace)
+    else:
+        print(f"reopen: by hand, if it is still wanted: {manual}", file=sys.stderr)
+    return code
 
 
 # -------------------------------------------------------------------- ask
@@ -7800,8 +8439,10 @@ def routed(cmd: str, args: argparse.Namespace) -> int | None:
             if not who:
                 print("close: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
                 return 2
+            summary = getattr(args, "summary", None)  # over stdin: argv refuses quotes and `$`
             return relay_remote(cmd, label, ["close", "--here", "--from", who] + (["--force"] if args.force else [])
-                                + ["--", target])
+                                + (["--summary-file", "-"] if summary else []) + ["--", target],
+                                summary_text(summary) if summary else "")
         if cmd == "move":
             who = remote_sender(args.sender)
             if not who:
@@ -11483,11 +12124,38 @@ def main(argv: list[str] | None = None) -> int:
                           "delivered before then cancels it")
     clp.add_argument("--reason", help="with --self: why, shown in presence (up to 120 characters)")
     clp.add_argument("--cancel", action="store_true", help="with --self: drop the calling session's pending close")
+    clp.add_argument("--task", help="for the closed-session record (`closed`): what the session was asked to do, "
+                                    f"one line, up to {SUMMARY_MAX} characters")
+    clp.add_argument("--how", help="... how it was resolved (the approach, the decisions)")
+    clp.add_argument("--result", help="... the end result: commits, deploys, msg ids, what is left open and where")
+    clp.add_argument("--summary-file", help="the three as `task:` / `how:` / `result:` paragraphs from a file "
+                                            "(`-`: stdin); the flags win")
     clp.add_argument("--force", action="store_true", help="close past a busy turn, a draft, mail or insomnia (logged)")
     clp.add_argument("--from", dest="sender", help="who closes it (default: the calling pane's agent name)")
     clp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     clp.add_argument("--machine", help="a Herdr saved machine the session runs on (or name it MACHINE/NAME)")
     clp.set_defaults(fn=cmd_close)
+    cdp = sub.add_parser("closed", help="closed sessions, newest first: where they ran, their task, how it was "
+                                        "resolved, the result, and how to reopen them")
+    cdp.add_argument("--all", action="store_true",
+                     help="this machine and every enabled saved machine (an unreachable one is named, exit 3)")
+    cdp.add_argument("--machine", help="a Herdr saved machine's records instead of this one's")
+    cdp.add_argument("--since", help="only closes this recent (90m, 12h, 7d)")
+    cdp.add_argument("--grep", help="only records whose text contains this (any case)")
+    cdp.add_argument("--limit", type=int, help="at most this many")
+    cdp.add_argument("--json", action="store_true")
+    cdp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    cdp.set_defaults(fn=cmd_closed)
+    rop = sub.add_parser("reopen", help="resume a closed session from its record (`closed`): its machine, cwd, "
+                                        "workspace and name; an optional note on stdin goes into its first prompt")
+    rop.add_argument("target", help="its name, Claude name or session id (MACHINE/NAME for another machine)")
+    rop.add_argument("--name", help="another session name (when the old one is taken)")
+    rop.add_argument("--workspace", help="another workspace (default: the one it closed in, else 'agents')")
+    rop.add_argument("--from", dest="sender", help="who reopens it (default: the calling pane's agent name)")
+    rop.add_argument("--machine", help="the Herdr saved machine it closed on (or name it MACHINE/NAME)")
+    rop.add_argument("--json", action="store_true")
+    rop.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
+    rop.set_defaults(fn=cmd_reopen)
     mvp = sub.add_parser("move", help="move a live idle session into a tab of another workspace (refuses busy, "
                                       "draft, focus, shared tab, open ask, mail, asleep)")
     mvp.add_argument("target", nargs="?", help="session name, pane id, agent name, or session id")

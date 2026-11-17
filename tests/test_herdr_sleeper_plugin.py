@@ -10330,3 +10330,223 @@ def test_ask_verify_window_covers_a_slow_login_shell_and_stays_inside_the_openin
     # 2026-11-17: the MacBook's login shell needs ~2.4 s before a typed line runs; 3 s failed every ask.
     assert sleeper.ASK_VERIFY_SECONDS >= 10
     assert sleeper.ASK_SHELL_WAIT_SECONDS + sleeper.ASK_VERIFY_SECONDS < sleeper.ASK_OPENING_SECONDS
+
+
+# ------------------------------------------------------------ closed-session records, `closed`, `reopen`
+
+def _records(kind: str = "closed") -> list[dict[str, Any]]:
+    return [r for r in sleeper.read_closed() if r.get("type") == kind]
+
+
+def _talk(state: Path, uuid: str, cwd: str, prompt: str, reply: str, model: str = "claude-opus-5-5") -> Path:
+    """A claude transcript: a typed-in first prompt, tool traffic, and a last reply."""
+    path = transcript(state, uuid, 1, proj="-talk")
+    rows = [{"type": "agent-name", "agentName": "impl-1"},
+            {"type": "user", "cwd": cwd, "timestamp": "2026-11-17T08:00:00Z",
+             "message": {"role": "user", "content": "<local-command-caveat>Caveat: ignore</local-command-caveat>"}},
+            {"type": "user", "cwd": cwd, "timestamp": "2026-11-17T08:00:01Z", "message": {"role": "user", "content": prompt}},
+            {"type": "assistant", "message": {"model": model, "content": [{"type": "text", "text": "on it"}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "lots of output"}]}},
+            {"type": "assistant", "message": {"model": model, "content": [{"type": "thinking", "thinking": "x"},
+                                                                          {"type": "text", "text": reply}]}},
+            {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "tool_use"}]}}]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+def _close_with(monkeypatch: pytest.MonkeyPatch, target: str, **kw: Any) -> int:
+    args = {"target": target, "force": False, "sender": "orc", "task": None, "how": None, "result": None,
+            "summary_file": None, **kw}
+    return sleeper.cmd_close(types.SimpleNamespace(**args))
+
+
+def _closed(capsys: pytest.CaptureFixture[str], **kw: Any) -> tuple[int, str]:
+    args = {"all": False, "machine": None, "since": None, "grep": None, "limit": None, "json": False, "here": False, **kw}
+    capsys.readouterr()
+    code = sleeper.cmd_closed(types.SimpleNamespace(**args))
+    return code, capsys.readouterr().out
+
+
+def _reopen(monkeypatch: pytest.MonkeyPatch, target: str, note: str = "", **kw: Any) -> int:
+    import io
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(note))
+    args = {"target": target, "name": None, "workspace": None, "sender": "orc", "machine": None, "json": False,
+            "here": False, **kw}
+    return sleeper.cmd_reopen(types.SimpleNamespace(**args))
+
+
+def test_a_close_keeps_a_record_with_the_closers_summary(fake: FakeHerdr, checkout: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _spawn(monkeypatch, checkout, extra=["--", "--model", "haiku"]) == 0
+    fake.tab_labels["w1:t8"] = "impl-1"
+    fake.argv = ["-n", "impl-1", "--model", "haiku", "--dangerously-skip-permissions"]
+    assert _close_with(monkeypatch, "impl-1", task="build B-1", how="TDD, two commits",
+                       result="pushed abc1234; B-2 left open") == 0
+    [rec] = _records()
+    assert rec["name"] == "impl-1" and rec["session"] == SPAWNED_UUID and rec["closed_by"] == "orc"
+    assert rec["place"] == "agents › impl-1" and rec["workspace"] == "agents" and rec["machine"] == sleeper.this_machine()
+    assert rec["spawned_by"] == "orc" and rec["opened_at"] and rec["kind"] == "claude"
+    assert rec["argv"] == ["--model", "haiku", "--dangerously-skip-permissions"]   # the name is the record's own
+    assert (rec["task"], rec["how"], rec["result"]) == ("build B-1", "TDD, two commits", "pushed abc1234; B-2 left open")
+    assert rec["summary_source"] == "closer"
+    assert oct(sleeper.CLOSED.stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_self_close_records_the_sessions_own_summary(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    fake.agents[0]["agent_status"] = "working"
+    assert _self_close(monkeypatch, reason="B-17 done") == 0
+    assert "no --task/--how/--result given" in capsys.readouterr().out    # a hint, never a refusal
+    assert _self_close(monkeypatch, task="fix B-17", how="patched the parser", result="v0.1.2 deployed") == 0
+    assert _closing()[UUID]["summary"] == {"task": "fix B-17", "how": "patched the parser", "result": "v0.1.2 deployed"}
+    assert _closing()[UUID]["reason"] == "B-17 done"                    # kept from the first call
+    monkeypatch.delenv("HERDR_PANE_ID")
+    fake.agents[0]["agent_status"] = "idle"
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    [rec] = _records()
+    assert rec["closed_by"] == "self" and rec["summary_source"] == "session" and rec["result"] == "v0.1.2 deployed"
+
+
+def test_a_self_close_takes_its_summary_from_a_file(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                   tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    f = tmp_path / "summary.txt"
+    f.write_text("Task: build the\n  closed view\nhow: one section\nresult: v0.1.49\n")
+    assert _self_close(monkeypatch, summary_file=str(f), result="v0.1.50") == 0     # a flag wins over the file
+    assert _closing()[UUID]["summary"] == {"task": "build the closed view", "how": "one section", "result": "v0.1.50"}
+    f.write_text("nothing labelled\n")
+    assert _self_close(monkeypatch, summary_file=str(f)) == 2
+    assert "no `task:`" in capsys.readouterr().err
+    assert _self_close(monkeypatch, task="x" * (sleeper.SUMMARY_MAX + 1)) == 2
+    assert _self_close(monkeypatch, task=sleeper.OWNER_ANSWER_HEADER + " x]") == 2
+
+
+def test_a_close_without_a_summary_takes_the_transcript(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                       state: Path) -> None:
+    prompt = ('\n<pasted_content id="7">\n[relayed from mbp/dev-mini-setup via herdr-sleeper, msg 1; not from the '
+              'owner]\n\nYou are impl-1. Build the archive.\n</pasted_content id="7">')
+    reply = "Done. token=" + "Zx9" * 8 + " and ghp_" + "a" * 36 + " pushed 0123456789abcdef0123456789abcdef01234567"
+    _talk(state, UUID, "/tmp/proj", prompt, reply)
+    assert _close_with(monkeypatch, "a") == 0
+    [rec] = _records()
+    assert rec["task"] == "You are impl-1. Build the archive." and rec["summary_source"] == "transcript"
+    assert rec["result"].startswith("Done. token=[redacted] and [redacted] pushed 0123456789abcdef")  # a sha stays
+    assert rec["model"] == "claude-opus-5-5" and rec["opened_at"] == "2026-11-17T08:00:00Z"
+
+
+def test_redact_keeps_ids_and_paths() -> None:
+    keep = ("pushed 5f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f and 0123456789abcdef0123456789abcdef01234567 "
+            "in /Users/dev/development/ansible-orchestration/roles/macos_herdr/files/Agent2Instructions.md")
+    assert sleeper.redact(keep) == keep
+    assert sleeper.redact("API_KEY: abcdef123") == "API_KEY: [redacted]"
+    assert sleeper.redact("x -----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY----- y") == "x [redacted] y"
+    assert sleeper.redact("k " + "aB3" * 15) == "k [redacted]"
+
+
+def test_a_spawned_session_gone_without_a_close_is_recorded_once(fake: FakeHerdr, checkout: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _spawn(monkeypatch, checkout) == 0
+    now = time.time()
+    clock = {"t": now}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    agents = fake.agents
+    fake.agents = [a for a in agents if a["pane_id"] != "w1:p8"]        # gone for one tick (a Herdr restart)
+    clock["t"] = now + 2 * 3600
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "gone_since" in sleeper.read_json(sleeper.SPAWNED)["impl-1"] and _records() == []
+    fake.agents = agents                                                 # back: no record, the mark goes
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "gone_since" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    fake.agents = [a for a in agents if a["pane_id"] != "w1:p8"]        # its tab closed by hand
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    clock["t"] += sleeper.CLOSED_GONE_SECONDS - 5
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "impl-1" in sleeper.read_json(sleeper.SPAWNED) and _records() == []
+    clock["t"] += 10
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    [rec] = _records()
+    assert sleeper.read_json(sleeper.SPAWNED) == {} and rec["closed_by"] == "gone" and "missed since" in rec["note"]
+
+
+def test_closed_lists_newest_first_with_a_reopen_line(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                      state: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    other = "7e7e7e7e-0000-4000-8000-000000000007"
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-16T10:00:00+01:00", "machine": "dev1",
+                           "name": "impl-1", "kind": "claude", "session": other, "task": "older one"})
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-17T10:00:00+01:00", "machine": "dev1",
+                           "place": "agents › impl-1", "name": "impl-1", "kind": "claude", "session": UUID,
+                           "closed_by": "self", "opened_at": "2026-11-17T07:00:00+01:00", "task": "newer one",
+                           "how": "carefully", "result": "pushed", "summary_source": "session"})
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-17T11:00:00+01:00", "machine": "dev1",
+                           "name": "lane", "kind": "codex", "session": "019a-codex", "summary_source": "transcript",
+                           "task": "x"})
+    code, out = _closed(capsys)
+    assert code == 0
+    blocks = out.split("\n\n")
+    assert [b.split("\n")[0][:16] for b in blocks] == ["2026-11-17 11:00", "2026-11-17 10:00", "2026-11-16 10:00"]
+    assert "dev1 › agents › impl-1  (claude, closed itself, ran 3h00m)" in blocks[1]
+    assert "reopen  herdr-sleeper reopen dev1/impl-1" in blocks[1]        # the newest under that name
+    assert f"reopen  herdr-sleeper reopen dev1/{other}" in blocks[2]      # an older one goes by its id
+    assert "reopen" not in blocks[0] and "no summary given" in blocks[0]  # codex: no reopen recipe yet
+    assert _closed(capsys, grep="NEWER")[1].count("\n\n") == 0
+    assert _closed(capsys, limit=1)[1].startswith("2026-11-17 11:00")
+    assert json.loads(_closed(capsys, json=True)[1])[0]["session"] == "019a-codex"
+    assert _closed(capsys, grep="a'b")[0] == 2
+
+
+def test_reopen_resumes_from_the_record_with_a_note(fake: FakeHerdr, checkout: Path, state: Path,
+                                                    monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    _resumable(state, os.path.realpath(checkout))
+    fake.resume_is_spawn = True
+    fake.workspace_labels["w2"] = "you"
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-17T10:00:00+01:00", "machine": "dev1",
+                           "workspace": "you", "name": "impl-1", "kind": "claude", "session": SPAWNED_UUID,
+                           "cwd": os.path.realpath(checkout), "argv": ["--model", "haiku"], "closed_by": "self",
+                           "task": "build B-1", "how": "TDD", "result": "pushed", "summary_source": "session"})
+    assert _reopen(monkeypatch, "impl-1", note="also do B-2") == 0
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert list(start[start.index("--") + 1:]) == ["-n", "impl-1", "--model", "haiku", "--resume", SPAWNED_UUID]
+    create = next(c for c in fake.calls if c[:2] == ("tab", "create"))
+    assert create[create.index("--workspace") + 1] == "w2"                # back in its old workspace
+    typed = next(c for c in fake.calls if c[:2] == ("agent", "prompt"))[3]
+    assert "You were reopened by orc" in typed and "task: build B-1" in typed and typed.endswith("also do B-2")
+    assert _records("reopened")[-1]["by"] == "orc" and "reopened" in events()
+    code, out = _closed(capsys)
+    assert "reopened 2026-" in out and "reopen  herdr-sleeper" not in out
+
+
+def test_reopen_refusals(fake: FakeHerdr, checkout: Path, state: Path, monkeypatch: pytest.MonkeyPatch,
+                         capsys: pytest.CaptureFixture[str]) -> None:
+    assert _reopen(monkeypatch, "nobody") == 1
+    assert "no closed record matches 'nobody'" in capsys.readouterr().err
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-17T10:00:00+01:00", "name": "lane",
+                           "kind": "codex", "session": "019a-codex", "cwd": str(checkout)})
+    assert _reopen(monkeypatch, "lane") == 1
+    assert "reopen can't resume yet; by hand: cd " in capsys.readouterr().err
+    sleeper.append_closed({"v": 1, "type": "closed", "at": "2026-11-17T10:00:00+01:00", "name": "impl-1",
+                           "kind": "claude", "session": SPAWNED_UUID, "cwd": os.path.realpath(checkout)})
+    assert _reopen(monkeypatch, "impl-1") == 1                          # no transcript of it here
+    err = capsys.readouterr().err
+    assert "no transcript of session" in err and "by hand, if it is still wanted" in err
+    assert not any(c[:2] == ("agent", "start") for c in fake.calls)
+
+
+def test_closed_and_reopen_reach_the_other_machine(ssh: FakeSsh, fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    ssh.reply(stdout=json.dumps([{"session": UUID, "at": "2026-11-17T12:00:00+01:00", "name": "far", "kind": "claude",
+                                  "task": "remote task", "argv": ["--bad"], "evil": 1}]))
+    code, out = _closed(capsys, all=True)
+    assert code == 0 and "dev2 › (tab far)" in out and "remote task" in out and "reopen dev2/far" in out
+    assert ssh.remote_argv() == ["herdr-sleeper", "closed", "--json", "--here"]
+    code, out = _closed(capsys, machine="dev2", since="7d", json=True)
+    assert ssh.remote_argv() == ["herdr-sleeper", "closed", "--json", "--here", "--since", "7d"]
+    assert set(json.loads(out)[0]) == set(sleeper.CLOSED_FIELDS)        # only known fields cross
+    ssh.reply(stdout="spawned far\n")
+    assert _reopen(monkeypatch, "dev2/far", note="pick up B-3") == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "reopen", "--here", "--from", "dev1/orc", "--", "far"]
+    assert ssh.calls()[-1]["stdin"] == "pick up B-3"
+    assert _close_with(monkeypatch, "dev2/far", task="it's done", result="all $good") == 0
+    assert ssh.remote_argv() == ["herdr-sleeper", "close", "--here", "--from", "dev1/orc", "--summary-file", "-",
+                                 "--", "far"]
+    assert sleeper.parse_summary(ssh.calls()[-1]["stdin"]) == {"task": "it's done", "result": "all $good"}
