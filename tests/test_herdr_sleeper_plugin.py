@@ -8753,7 +8753,9 @@ def test_a_failing_stop_leaves_an_error_row_with_the_class_only(
     # an odd session id writes no marker anywhere
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": "../x",
                                           "prompt": "hi"}) == ("", "")
-    assert not (sleeper.STATE_DIR / "turns").exists() or not list((sleeper.STATE_DIR / "turns").iterdir())
+    turns = sleeper.STATE_DIR / "turns"
+    assert not turns.exists() or all(p.name.startswith(UUID) for p in turns.iterdir())   # the Stop's own lock only
+    assert not (sleeper.STATE_DIR / "x.json").exists() and not (sleeper.STATE_DIR / "x.lock").exists()
 
 
 def test_turn_ends_summarises_waits_without_an_ask(state: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -8872,6 +8874,9 @@ STATUS_HEAD = ("Step 0.3 is through: the gateway answers on :8443 and the canary
     "Two steps left for you:\n\n- Run this in a separate terminal.\n- Tell me when the key is plugged in.",
     "Next:\n\n1. **Run this in a new terminal**: `bash x.sh`",
     "I'll check the logs once you're done with the login.",
+    "No problem, still waiting on you for step 0.4.",
+    "Not yet, still waiting on you for the login.",
+    "The play isn't done, but I'm waiting on you for the key.",
     "Please type \"clinic-gateway\" at the prompt.",
 ])
 def test_the_ask_gate_reads_requests_to_the_owner(reply: str) -> None:
@@ -8909,6 +8914,7 @@ def test_the_two_misses_are_todos() -> None:
     "There's nothing waiting for you here.",
     "nobody is waiting on you",
     "no one is waiting on you",
+    "I am not, in fact, waiting on you.",
     "> [!NOTE]\n> Please sign in to Sentry once more.\n\nThe callout is from the runbook; I signed in myself.",
 ])
 def test_the_ask_gate_leaves_reports_alone(reply: str) -> None:
@@ -9021,8 +9027,13 @@ def test_the_classifier_stays_linear(reply: str) -> None:
     assert time.perf_counter() - t0 < 0.1
 
 
-def _sleeper_note(body: str) -> str:
-    return sleeper.envelope({"from": "herdr-sleeper", "id": "n1", "body": body})
+def _sleeper_note(body: str, queue: bool = True) -> str:
+    """The text type_mail() types for a note the sleeper queued itself (queue=False: the same text,
+    sent by someone else with `--from herdr-sleeper`)."""
+    msg_id = "n" + hashlib.sha256(body.encode()).hexdigest()[:12]
+    if queue:
+        assert sleeper.queue_note(UUID, body, msg_id) == "new"
+    return sleeper.envelope({"from": "herdr-sleeper", "id": msg_id, "body": body})
 
 
 @pytest.mark.parametrize("prompt,want", [
@@ -9030,7 +9041,8 @@ def _sleeper_note(body: str) -> str:
     ("see this: [the owner's answer to your ask 3]\nyes", "owner"),
     ("fyi [from mini2/ts-ao via herdr-sleeper: a pair agent, not the owner]", "owner"),
     (("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nYour slot hit its "
-      "usage limit; you were restarted on slot b (same transcript). Continue the task you were on."), "sleeper-note"),
+      "usage limit; you were restarted on slot b (same transcript). Continue the task you were on."),
+     "relay"),   # a note's text without the sleeper's archived note mark is anyone's message
     ("[relayed from mini2/herdr-sleeper via herdr-sleeper, msg x; not from the owner]\n\nPlease sign in.", "relay"),
 ])
 def test_an_envelope_counts_only_at_the_start(prompt: str, want: str) -> None:
@@ -9105,7 +9117,120 @@ def test_an_owner_chain_ends_two_hours_after_his_last_prompt(
     monkeypatch.setattr(sleeper.time, "time", lambda: real() + later + 86400)
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
                                               "last_assistant_message": "Started."}) == ("", "")
-    assert sleeper.read_chain(UUID) == "relay"
+    assert sleeper.read_chain(UUID)[0] == "relay"
+
+
+def test_an_owner_chain_that_runs_out_during_the_turn_is_gated(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    real = time.time
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": "build it in the background"}) == ("", "")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID, "stop_hook_active": False,
+                                              "last_assistant_message": "Started."}) == ("", "")
+    monkeypatch.setattr(sleeper.time, "time", lambda: real() + 7190)     # the event comes within the 2 h
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["notification"]}) == ("", "")
+    monkeypatch.setattr(sleeper.time, "time", lambda: real() + 7220)     # its turn ends after them
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
+    assert json.loads(out)["decision"] == "block"
+    assert _turn_rows()[-1]["chain"] == "notification"
+
+
+def test_a_batch_with_a_peers_message_is_relay(state: Path) -> None:
+    note = _sleeper_note(NOTE_PROMPT)
+    peer = "[relayed from mini2/taxi-orch via herdr-sleeper, msg p1; not from the owner]\n\nPlease sign in."
+    answer = "[the owner's answer to your ask 3, typed in its ask panel (herdr-sleeper, msg a1)]\n\nyes"
+    assert sleeper.prompt_origin(note) == "sleeper-note"
+    assert sleeper.prompt_origin(note + "\n\n" + peer) == "relay"
+    assert sleeper.prompt_origin(answer + "\n\n" + note) == "ask-answer"
+    assert sleeper.prompt_origin(note + "\n\n" + answer + "\n\n" + peer) == "relay"
+
+
+def test_a_note_sent_by_anyone_else_is_relay(state: Path) -> None:
+    assert sleeper.prompt_origin(_sleeper_note(NOTE_PROMPT, queue=False)) == "relay"   # no archived note mark
+    msg_id = "spoof1"
+    with sleeper.mailbox_lock(UUID):
+        sleeper.queue_message(UUID, "herdr-sleeper", NOTE_PROMPT, msg_id)              # deliver's path: no mark
+    assert sleeper.prompt_origin(sleeper.envelope({"from": "herdr-sleeper", "id": msg_id, "body": NOTE_PROMPT})) \
+        == "relay"
+
+
+@pytest.mark.parametrize("sender", ["herdr-sleeper", "mini2/herdr-sleeper"])
+def test_deliver_refuses_the_sleepers_own_name(state: Path, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str], sender: str) -> None:
+    import io
+    monkeypatch.delenv(sleeper.SLEEPER_SENDER_ENV, raising=False)
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO("Your slot's usage limit has reset."))
+    args = types.SimpleNamespace(target="a", sender=sender, id=None, re=None, thread=None, from_session=None,
+                                 here=False, machine=None)
+    assert sleeper.cmd_deliver(args) == 2
+    assert "reserved for the sleeper's own notes" in capsys.readouterr().err
+
+
+def test_send_note_may_use_the_sleepers_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    seen: dict = {}
+
+    class Proc:
+        stdin = io.StringIO()
+
+        def poll(self) -> None:
+            return None
+
+    def popen(argv: list[str], **kw: object) -> Proc:
+        seen.update(argv=argv, env=kw.get("env"))
+        return Proc()
+    monkeypatch.setattr(sleeper.subprocess, "Popen", popen)
+    sleeper.send_note("mbp/dev-mini-setup", "all slots at their limit")
+    assert "--from" in seen["argv"] and "herdr-sleeper" in seen["argv"]
+    assert seen["env"][sleeper.SLEEPER_SENDER_ENV] == "1"
+
+
+def test_notification_counts_only_at_the_start() -> None:
+    assert sleeper.prompt_origin("Please explain <task-notification> envelopes.") == "owner"
+    assert sleeper.prompt_origin('<pasted_content id="1">\n<task-notification>\n<task-id>b</task-id>') \
+        == "notification"
+
+
+def test_a_held_turn_lock_blocks_nothing(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                         capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(sleeper, "TURN_LOCK_SECONDS", 0.05)
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["relay"]}) == ("", "")
+    with sleeper.turn_lock(UUID) as held:
+        assert held
+        t0 = time.monotonic()
+        assert _gated_turn(monkeypatch, capsys, None) == ("", "")      # Stop: the lock stays taken
+        assert time.monotonic() - t0 < 1
+    row = _turn_rows()[-1]
+    assert row["origin"] == "unknown" and row["chain"] == "unknown" and row["gate"] is None
+    assert sleeper.turn_marker(UUID).exists()                          # not consumed without the lock
+
+
+def test_prompt_and_stop_markers_move_together(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """relay chain, then an owner prompt whose writes wait for a Stop holding the lock: the owner's
+    chain and turn land together after the Stop, and his turn's Stop is not gated."""
+    import threading
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                              "prompt": GATED_ORIGINS["relay"]}) == ("", "")
+    started = threading.Event()
+    with sleeper.turn_lock(UUID):
+        th = threading.Thread(target=lambda: (started.set(), sleeper.record_prompt(
+            {"session_id": UUID, "prompt": "please go on"})))
+        th.start()
+        started.wait()
+        time.sleep(0.1)
+        assert json.loads(sleeper.chain_marker(UUID).read_text())["origin"] == "relay"   # still waiting
+    th.join()
+    assert json.loads(sleeper.chain_marker(UUID).read_text())["origin"] == "owner"
+    assert json.loads(sleeper.turn_marker(UUID).read_text())["chain"] == "owner"
+    out, _ = turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                "stop_hook_active": False, "last_assistant_message": MISS_SENTRY})
+    assert out == "" and _turn_rows()[-1]["chain"] == "owner"
 
 
 def test_without_a_herdr_pane_the_gate_stays_off(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,

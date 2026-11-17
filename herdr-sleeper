@@ -2985,6 +2985,12 @@ DELIVER_MAX_BYTES = 64 * 1024
 DELIVER_READY_SECONDS = 120   # a resumed claude needs a few seconds before it takes a prompt
 DELIVERED_KEEP = 500
 SENDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,63}")
+SLEEPER_SENDER = "herdr-sleeper"            # the watcher's own notes; `deliver` from a session may not use it
+SLEEPER_SENDER_ENV = "HERDR_SLEEPER_OWN_NOTE"   # set by send_note() for its `deliver --from herdr-sleeper`
+
+
+def reserved_sender(sender: str | None) -> bool:
+    return bool(sender) and str(sender).rsplit("/", 1)[-1] == SLEEPER_SENDER
 
 
 def sender_ok(sender: str | None) -> bool:
@@ -3618,6 +3624,12 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     from_session = getattr(args, "from_session", None)
     if from_session is not None and not valid_session_id(from_session):
         from_session = None
+    # the sleeper's own name: a session that sends as herdr-sleeper would pass for one of its notes
+    # (another machine's `--here` hop was checked there)
+    own_note = os.environ.get(SLEEPER_SENDER_ENV) == "1" or getattr(args, "here", False)
+    if reserved_sender(args.sender) and not own_note:
+        print(f"deliver: --from {SLEEPER_SENDER} is reserved for the sleeper's own notes", file=sys.stderr)
+        return 2
     if not getattr(args, "here", False):
         mine = calling_session()
         from_session = mine
@@ -3650,6 +3662,9 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     sender = args.sender or context_sender(agents)
     if not sender_ok(sender):
         print("deliver: pass --from NAME (letters, digits, _.:@-; up to 64)", file=sys.stderr)
+        return 2
+    if reserved_sender(sender) and not own_note:
+        print(f"deliver: a session named {SLEEPER_SENDER} must pass --from with another name", file=sys.stderr)
         return 2
     try:
         state, hit, _key = resolve_target(args.target, agents, read_json(JOURNAL))
@@ -7657,19 +7672,24 @@ WAITING_FOR_YOU_RE = re.compile(
     r"(?i)\b(?:still )?waiting (?:on|for) you(?:r (?:ok|go|answer|decision|word|input|approval|reply|login|"
     r"sign-?in))?\b")
 NEGATION_RE = re.compile(r"(?i)n't\b|\b(?:not|no|nothing|nobody|none|never|neither|nor)\b")
-INLINE_QUOTE_RE = re.compile(r'"[^"\n]{0,400}"|“[^”\n]{0,400}”|„[^“”\n]{0,400}[“”]')
+SENTENCE_END_RE = re.compile(r"[.!?;:\n]")
+BUT_CLAUSE_RE = re.compile(r"(?i),\s*(?:but|however|yet|aber|doch|jedoch)\b")
+NEGATION_OPENER_RE = re.compile(
+    r"(?i)^\s*(?:no(?: problem| worries| rush)?|nope|not yet|nein|kein problem|noch nicht)\s*,")
+INLINE_QUOTE_RE = re.compile(r'"[^"\n]{0,400}"|“[^“”\n]{0,400}”|„[^„“”\n]{0,400}[“”]')
 LABEL_LINE_RE = re.compile(r"(?m)^[ \t]*(?:#+[ \t].*|\*\*[^*\n]+\?\*\*:?[ \t]*)$")   # a heading, a bold label
 RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
 PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
 PASTE_WRAP_RE = re.compile(r"<pasted_content[^>\n]*>\s*")   # a long typed-in text may come wrapped in this
-# Notes the sleeper itself types in (CONTINUE_NOTE, RESET_NOTE, CODEX_RESET_NOTE, AUTO_RESUME_NOTE): they
-# carry on the turn chain they interrupted, so they keep its origin.
-SLEEPER_NOTE_RE = re.compile(
-    r"\[relayed from (?:[a-z0-9-]+/)?herdr-sleeper via herdr-sleeper, msg [^\]\n]*\]\s*"
-    r"(?:Your slot hit its usage limit;|Your slot's usage limit has reset|Your Codex usage limit has reset\.|"
-    r"Auto-resume: your last turn ended on an API error)")
+# Every envelope of a batch type_mail() typed in (joined by blank lines): which kind, and for a relay
+# its sender and message id. A note from the sleeper itself (CONTINUE_NOTE, RESET_NOTE, CODEX_RESET_NOTE,
+# AUTO_RESUME_NOTE) is told by the `note` mark its archived copy carries, never by its text.
+ENVELOPE_LINE_RE = re.compile(
+    r"(?m)^(?:(?P<answer>\[the owner's answer to your ask)|(?P<peer>\[from \S+ via herdr-sleeper)"
+    r"|\[relayed from (?P<sender>\S+) via herdr-sleeper, msg (?P<id>[A-Za-z0-9_-]{1,64}))")
 CHAIN_SETTERS = ("owner", "relay", "ask-answer")   # the origins that start a chain; the others inherit it
 OWNER_CHAIN_SECONDS = 7200   # an owner chain ends 2 h after his last prompt: a chat nobody watches is no to-do list
+TURN_LOCK_SECONDS = 1.0      # how long a turn hook tries for its session's lock (the hook has 5 s in all)
 
 
 def turn_marker(session: str) -> Path | None:
@@ -7681,29 +7701,48 @@ def chain_marker(session: str) -> Path | None:
     return STATE_DIR / "turns" / f"{session}.chain.json" if SESSION_ID_RE.fullmatch(session) else None
 
 
+def sleeper_note(sender: str, msg_id: str) -> bool:
+    """Did the sleeper itself queue this message as a note (queue_note's `note` mark, in the archive)?"""
+    if not reserved_sender(sender):
+        return False
+    rec = archived(msg_id)
+    return bool(rec and rec.get("note") is True and reserved_sender(str(rec.get("from"))))
+
+
 def prompt_origin(prompt: str) -> str:
     """owner (typed in the pane, as far as the text shows), relay (a peer's message), ask-answer (the
     owner's answer to an ask, typed in by the panel), notification (a background task's event),
-    sleeper-note (a continue note the sleeper typed in). The envelopes count only at the very start:
-    an owner who pastes a relayed message is still the owner."""
-    head = prompt.lstrip()[:800]
-    if head.startswith("<task-notification>") or "<task-notification>" in head[:200]:
-        return "notification"
+    sleeper-note (a note the sleeper queued itself). The envelopes count only at the very start: an
+    owner who pastes a relayed message is still the owner. A batch of mail counts as a whole: any
+    peer's message makes it relay, else an owner's answer makes it ask-answer."""
+    head = prompt.lstrip()
     wrap = PASTE_WRAP_RE.match(head)
     head = head[wrap.end():] if wrap else head
-    if SLEEPER_NOTE_RE.match(head):
-        return "sleeper-note"
-    if head.startswith(OWNER_ANSWER_HEADER):
-        return "ask-answer"
-    if any(head.startswith(h) for h in RELAY_HEADS) or PEER_HEAD_RE.match(head):
-        return "relay"
-    return "owner"
+    if head.startswith("<task-notification>"):
+        return "notification"
+    if not (head.startswith(OWNER_ANSWER_HEADER) or any(head.startswith(h) for h in RELAY_HEADS)
+            or PEER_HEAD_RE.match(head)):
+        return "owner"
+    kinds = set()
+    for m in ENVELOPE_LINE_RE.finditer(head):
+        if m.group("answer"):
+            kinds.add("ask-answer")
+        elif m.group("peer") or not sleeper_note(m.group("sender"), m.group("id")):
+            kinds.add("relay")
+        else:
+            kinds.add("sleeper-note")
+    return next((k for k in ("relay", "ask-answer", "sleeper-note") if k in kinds), "relay")
 
 
 def _waits_for_reader(text: str) -> bool:
-    """"(still) waiting on you", unless its own clause negates it ("nothing is waiting on you")."""
-    for m in WAITING_FOR_YOU_RE.finditer(text):
-        clause = re.split(r"[.!?;:,\n]", text[max(0, m.start() - 200):m.start()])[-1]   # bounded: no n²
+    """"(still) waiting on you", unless its own sentence negates it ("nothing is waiting on you", "I am
+    not, in fact, waiting on you"). A ", but"/", however"/", aber" clause ends the negation's reach, and
+    a sentence-opening "No problem," or "Not yet," is no negation of the wait ("No problem, still
+    waiting on you")."""
+    for m in list(WAITING_FOR_YOU_RE.finditer(text))[-20:]:   # the last ones: a long reply stays cheap
+        sentence = SENTENCE_END_RE.split(text[max(0, m.start() - 200):m.start()])[-1]   # bounded: no n²
+        clause = BUT_CLAUSE_RE.split(sentence)[-1]
+        clause = NEGATION_OPENER_RE.sub("", clause, count=1)
         if not NEGATION_RE.search(clause):
             return True
     return False
@@ -7772,17 +7811,43 @@ def append_turn_row(row: dict) -> bool:
     return True
 
 
-def read_chain(session: str) -> str | None:
-    """The origin a notification, no-prompt or sleeper-note turn carries on, or None (it keeps its own):
-    no chain recorded, or an owner chain whose last owner prompt is over OWNER_CHAIN_SECONDS old.
-    Relay and ask-answer chains don't expire."""
+@contextlib.contextmanager
+def turn_lock(session: str) -> Iterator[bool]:
+    """The session's turn lock: a prompt's chain and turn markers and a Stop's read of them are one
+    step each. Tried for TURN_LOCK_SECONDS without blocking; yields False when it stays taken."""
+    path = STATE_DIR / "turns" / f"{session}.lock"
+    deadline = time.monotonic() + TURN_LOCK_SECONDS
+    with os.fdopen(open_private(path, os.O_RDWR), "a+") as fh:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.02)
+        yield True   # closing the file releases the lock
+
+
+def owner_chain_live(chain_ts: object) -> bool:
+    try:
+        return time.time() - float(chain_ts) <= OWNER_CHAIN_SECONDS   # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def read_chain(session: str) -> tuple[str, float] | None:
+    """(origin, time of its last prompt) a notification, no-prompt or sleeper-note turn carries on, or
+    None (it keeps its own): no chain recorded, or an owner chain whose last owner prompt is over
+    OWNER_CHAIN_SECONDS old. Relay and ask-answer chains don't expire."""
     marker = chain_marker(session)
     with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
         rec = json.loads(marker.read_text()) if marker else {}
-        chain = rec.get("origin")
-        if chain == "owner" and not time.time() - float(rec["ts"]) <= OWNER_CHAIN_SECONDS:
+        chain, ts = rec.get("origin"), float(rec["ts"])
+        if chain not in CHAIN_SETTERS or (chain == "owner" and not owner_chain_live(ts)):
             return None
-        return chain if chain in CHAIN_SETTERS else None
+        return chain, ts
     return None
 
 
@@ -7796,7 +7861,8 @@ def write_private_json(path: Path, rec: dict) -> None:
 def record_prompt(payload: dict) -> None:
     """UserPromptSubmit: note the turn's origin, its chain's origin and its start (no text) for the Stop
     that ends it. An owner, relay or ask-answer prompt starts a chain; a notification or a sleeper note
-    carries on the one before it (none recorded: its own origin)."""
+    carries on the one before it (none recorded: its own origin). Under the session's turn lock; a lock
+    that stays taken leaves no marker (the Stop then finds none: no-prompt)."""
     session = str(payload.get("session_id") or "")
     marker = turn_marker(session)
     if marker is None:
@@ -7805,16 +7871,44 @@ def record_prompt(payload: dict) -> None:
     marker.parent.mkdir(mode=0o700, exist_ok=True)
     origin = prompt_origin(str(payload.get("prompt") or ""))
     now = time.time()
-    if origin in CHAIN_SETTERS:
-        chain = origin
-        write_private_json(chain_marker(session), {"origin": origin, "ts": now})
-    else:
-        chain = read_chain(session) or origin
-    write_private_json(marker, {"origin": origin, "chain": chain, "ts": now})
+    with turn_lock(session) as held:
+        if not held:
+            return
+        if origin in CHAIN_SETTERS:
+            chain, chain_ts = origin, now
+            write_private_json(chain_marker(session), {"origin": origin, "ts": now})
+        else:
+            chain, chain_ts = read_chain(session) or (origin, now)
+        write_private_json(marker, {"origin": origin, "chain": chain, "chain_ts": chain_ts, "ts": now})
     with contextlib.suppress(OSError):   # a session killed mid-turn never Stops: its markers go after a week
         for old in os.scandir(marker.parent):
-            if old.name.endswith(".json") and now - old.stat().st_mtime > 7 * 86400:
+            if old.name.endswith((".json", ".lock")) and now - old.stat().st_mtime > 7 * 86400:
                 os.unlink(old.path)
+
+
+def take_turn(uuid: str | None) -> tuple[str, str, float | None]:
+    """Stop: (origin, chain, start) of the turn that ends, its marker consumed under the turn lock. An
+    owner chain the turn only carried on is checked for its age again now (it may have run out during
+    the turn). The lock staying taken gives ("unknown", "unknown", None): the gate then blocks nothing."""
+    marker = turn_marker(uuid or "")
+    if marker is None or uuid is None:
+        return "no-prompt", "no-prompt", None
+    origin, chain, chain_ts, started = "no-prompt", None, None, None
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with turn_lock(uuid) as held:
+        if not held:
+            return "unknown", "unknown", None
+        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
+            rec = json.loads(marker.read_text())
+            origin, started = str(rec["origin"]), float(rec["ts"])
+            chain, chain_ts = str(rec.get("chain") or origin), rec.get("chain_ts")
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        if chain is None:   # no prompt since the last Stop: the turn carries on the session's chain
+            chain, chain_ts = read_chain(uuid) or (origin, None)
+    if chain == "owner" and origin != "owner" and not owner_chain_live(chain_ts):
+        chain = origin
+    return origin, chain, started
 
 
 ASK_GATE_REASON = (
@@ -7838,7 +7932,7 @@ def ask_gate(row: dict, stop_hook_active: bool) -> str | None:
     chain in chat, the reply doesn't wait on him, an ask is open or the count is unknown, this Stop
     already follows a block, or no Herdr pane runs the session: `ask` needs one), else "blocked", "dry-run" or "off" (ask_gate = false). A config that can't be
     read leaves the turn alone (None)."""
-    if (stop_hook_active or row.get("chain") == "owner" or row.get("waits") not in ("question", "todo")
+    if (stop_hook_active or row.get("chain") in ("owner", "unknown") or row.get("waits") not in ("question", "todo")
             or row.get("open_asks") != 0 or not row.get("pane")):
         return None
     try:
@@ -7861,17 +7955,7 @@ def record_turn_end(payload: dict) -> str | None:
     waits "unknown": the payload carried no reply text. Returns the Stop hook's stdout when the gate
     blocks the turn end, else None."""
     uuid = str(payload.get("session_id") or "") or None
-    marker = turn_marker(uuid or "")
-    origin, chain, started = "no-prompt", None, None
-    if marker is not None:
-        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, KeyError):
-            rec = json.loads(marker.read_text())
-            origin, started = str(rec["origin"]), float(rec["ts"])
-            chain = str(rec.get("chain") or origin)
-        with contextlib.suppress(OSError):
-            marker.unlink()
-    if chain is None:   # no prompt since the last Stop: the turn carries on the session's chain
-        chain = read_chain(uuid or "") or origin
+    origin, chain, started = take_turn(uuid)
     reply = payload.get("last_assistant_message")
     pane, name, terminal = turn_identity()
     active = payload.get("stop_hook_active") is not False   # only a plain false may block: never twice in a row
@@ -8881,9 +8965,9 @@ def send_note(target: str, body: str) -> None:
     global NOTE_JOBS
     NOTE_JOBS = [j for j in NOTE_JOBS if j.poll() is None]
     try:
-        proc = subprocess.Popen([sys.executable, str(SELF), "deliver", "--from", "herdr-sleeper", "--", target],
+        proc = subprocess.Popen([sys.executable, str(SELF), "deliver", "--from", SLEEPER_SENDER, "--", target],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                start_new_session=True, text=True)
+                                start_new_session=True, text=True, env={**os.environ, SLEEPER_SENDER_ENV: "1"})
         assert proc.stdin is not None
         proc.stdin.write(body)
         proc.stdin.close()
@@ -8895,11 +8979,13 @@ def send_note(target: str, body: str) -> None:
 def queue_note(uuid: str, body: str, msg_id: str, wait: bool = True, extra: dict | None = None) -> str | None:
     """Queue a note into a local session's mailbox; the watcher's mail flush types it in. Returns
     queue_message's status, or None when wait=False and a delivery holds the mailbox (under the
-    global lock the watcher must not wait for it: `deliver` takes the mailbox lock first, LESSONS 8.6)."""
+    global lock the watcher must not wait for it: `deliver` takes the mailbox lock first, LESSONS 8.6).
+    The message carries `note: true`, which `deliver` never writes: the turn hook checks it in the
+    archive before it lets a typed-in note carry on the turn chain."""
     with mailbox_lock(uuid, wait=wait) as got:
         if not got:
             return None
-        _msg, status = queue_message(uuid, "herdr-sleeper", body, msg_id, extra=extra)
+        _msg, status = queue_message(uuid, SLEEPER_SENDER, body, msg_id, extra={**(extra or {}), "note": True})
     if status == "new":
         event("deliver-queued", id=msg_id, sender="herdr-sleeper", to=uuid, uuid=uuid, target_state="live",
               bytes=len(body.encode()))

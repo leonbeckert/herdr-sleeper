@@ -539,23 +539,33 @@ global lock, which a sleep transaction may hold longer than a hook may run.
 `UserPromptSubmit` and a `Stop` hook (no matcher), `claude-hook` notes how
 each turn ends. It reads no transcript: the prompt's origin comes from the
 `UserPromptSubmit` payload, the reply from the `Stop` payload's
-`last_assistant_message`, both classified in memory. The origin is `relay`,
-`ask-answer` or `sleeper-note` only when the prompt *starts* with that
-envelope (a relayed message the owner pastes into his own prompt stays
-`owner`), `notification` for a background task's event, `no-prompt` when no
-prompt came since the last Stop, else `owner`. Owner, relay and ask-answer
+`last_assistant_message`, both classified in memory. The origin is
+`notification`, `relay`, `ask-answer` or `sleeper-note` only when the prompt
+*starts* with that envelope (a relayed message the owner pastes into his own
+prompt stays `owner`), `no-prompt` when no prompt came since the last Stop,
+else `owner`. A batch of mail typed in as one prompt counts as a whole: any
+peer's message makes it `relay`, else an owner's answer `ask-answer`. A note
+counts as the sleeper's own only when its archived copy carries the `note`
+mark that only the watcher writes, never by its text; `deliver --from
+herdr-sleeper` is refused to sessions (the watcher's own notes to the monitor
+pass). Owner, relay and ask-answer
 prompts start a turn **chain**; a notification, a no-prompt turn and a note the
 sleeper typed in itself (a continue note after a usage limit or its reset, an
 auto-resume note) carry on the chain before them, so a background event's turn
 during the owner's chat counts as his. An owner chain ends 2 h after his last
 prompt (a chat nobody watches is no to-do list); relay and ask-answer chains
-don't expire. No chain, or an expired one: the turn's own origin. A reply waits on the owner when its last three paragraphs ask him to
+don't expire. No chain, or an expired one: the turn's own origin; an owner
+chain that runs out while the turn runs is checked again at its Stop. A
+prompt's markers and a Stop's read of them happen under the session's turn
+lock (tried for 1 s; a lock that stays taken blocks nothing). A reply waits on the owner when its last three paragraphs ask him to
 do something (please sign in, please run/open/approve/confirm, still waiting
 on you, run this in a separate terminal, "Once you're in, I'll …", bitte melde
 dich an, …: a *todo*) or its last two ask him something (should I, which one,
 let me know which, a closing `?`: a *question*). Code blocks, `>` quote and
 callout lines, inline quotes ("…", “…”), a `?` that only ends a heading or a
-bold label, a negated wait ("nothing is waiting on you") and closing
+bold label, a wait its own sentence negates ("nothing is waiting on you",
+"I am not, in fact, waiting on you"; a ", but" clause or an opening "No
+problem," doesn't negate) and closing
 pleasantries ("let me know if anything breaks") don't count: a request inside
 a quote or a callout is never read as one.
 
