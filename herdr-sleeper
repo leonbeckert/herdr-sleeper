@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.44"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.45"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -262,6 +262,7 @@ DEFAULTS = {
     "auto_resume": True,         # continue claude turns that died on a network or API error, once the API answers
     "auto_resume_max_age_hours": 24.0,  # older errors are left alone (TOML: auto_resume_max_age = "24h")
     "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
+    "ask_gate": True,            # a turn not started by the owner that ends waiting on him without an ask is sent back
 }
 
 
@@ -791,7 +792,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
     for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume",
-                "codex_stuck"):
+                "codex_stuck", "ask_gate"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -7619,20 +7620,36 @@ def live_claude_named(to: str) -> bool:
 
 # ------------------------------------------------------------ turn ends
 
-# Counted, never acted on (owner 2026-11-15: "count" before any gate). Reads no transcript: the
-# UserPromptSubmit payload's prompt gives the turn's origin, the Stop payload's last_assistant_message
-# the reply; both are classified in memory and only the class is kept. Rows are heuristic candidates
-# ("this turn may wait on the owner without an ask"), not confirmed misses.
-TURN_SCHEMA = 1                 # row layout and classifier version; bump when either changes
+# Counted since 2026-11-15, gated since 2026-11-17 (owner: a session that ends its turn waiting on him
+# must show as a blocked question in Herdr). Reads no transcript: the UserPromptSubmit payload's prompt
+# gives the turn's origin, the Stop payload's last_assistant_message the reply; both are classified in
+# memory and only the class is kept. A turn the owner didn't start in chat whose reply seems to wait on
+# him while the session holds no open ask is sent back once (ask_gate) to file an ask.
+TURN_SCHEMA = 2                 # row layout and classifier version; bump when either changes
 TURN_MAX_BYTES = 2_000_000      # turn-ends.jsonl rotates to .1 past this (summaries report the retained range)
 TURN_HERDR_TIMEOUT = 2.0        # the one Herdr call a Stop makes (the hook's own timeout is 5 s)
 WAIT_ASK_RE = re.compile(
     r"(?i)\b(should i|shall i|do you want|would you like|want me to|which (?:one|option|do you)|your call|"
     r"do you prefer|(?:is|are) (?:that|this|these) (?:ok|okay|fine|right)|ok to (?:go|proceed)|"
-    r"soll ich|möchtest du|willst du|sollen wir|passt das|einverstanden)\b")
+    r"soll ich|möchtest du|willst du|sollen wir|passt das|einverstanden)\b"
+    # "let me know"/"tell me" ask for an answer, a closing pleasantry doesn't
+    r"|(?i:\blet me know\b(?! if (?:you (?:need|want|have) (?:anything|any (?:other |more )?questions?|more)|"
+    r"(?:there(?:'s| is) )?anything (?:else|comes up)|something comes up)))"
+    r"|(?im:(?:^|[.!?:;]\s+|\b(?:please|just)\s+)tell me\b)"
+    r"|(?i:\b(?:sag|gib) mir (?:bitte )?bescheid\b)")
+_SENTENCE = r"(?:^|[.!?:;]\s+|\b(?:please|just)\s+)"   # an imperative, not "I'll run it in a new shell"
 WAIT_TODO_RE = re.compile(
-    r"(?i)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
-    r"bitte (?:führe|starte|gib|tipp))")
+    r"(?im)(please run|run (?:this|it) (?:yourself|on)|type `?! |only you can|needs? your (?:word|ok|go|sign)|"
+    r"bitte (?:führe|starte|gib|tipp|melde|logge|öffne|bestätige|klicke|trage|steck)|"
+    r"\bplease (?:sign|log) ?(?:in|on)\b|"
+    r"\bplease (?:open|approve|confirm|enter|paste|plug|check|install|type|click|tap|insert|unlock|grant|"
+    r"answer|reply|decide)\b|"
+    r"\b(?:still )?waiting (?:on|for) you(?:r (?:ok|go|answer|decision|word|input|approval|reply|login|sign-?in))?\b|"
+    + _SENTENCE + r"run (?:this|it|that|the (?:command|script|following)) in an? (?:separate |new |second |own )?"
+    r"(?:terminal|shell)|"
+    r"\b(?:once|when|as soon as) you(?:'re| are| have|'ve) (?:done|in|logged|signed|finished|approved|"
+    r"confirmed|run|typed|entered|plugged|unlocked)\b|"
+    r"\b(?:sobald|wenn) du (?:fertig|eingeloggt|angemeldet|drin)\b)")
 RELAY_HEADS = ("[relayed from ",)          # relay_text(): a peer's message the sleeper typed in
 PEER_HEAD_RE = re.compile(r"\[from \S+ via herdr-sleeper")   # ao herdr-relay.py: mini → MacBook envelope
 
@@ -7655,12 +7672,14 @@ def prompt_origin(prompt: str) -> str:
 
 
 def waits_on_owner(text: str) -> str:
-    """question, todo or none, from the last two paragraphs of a reply (code blocks and quotes stripped)."""
+    """question, todo or none, from the end of a reply (code blocks and quotes stripped): a step for
+    the owner in the last three paragraphs (a command he is to run often sits alone after the request),
+    a question in the last two."""
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     paras = [p for p in re.split(r"\n\s*\n", text) if p.strip() and not p.lstrip().startswith(">")]
-    tail = "\n".join(paras[-2:])
-    if WAIT_TODO_RE.search(tail):
+    if WAIT_TODO_RE.search("\n".join(paras[-3:])):
         return "todo"
+    tail = "\n".join(paras[-2:])
     if WAIT_ASK_RE.search(tail) or re.search(r"\?[*_)\]\s]*$", tail.strip()) or re.search(r"\?[*_)]*\s*\n", tail):
         return "question"
     return "none"
@@ -7728,10 +7747,49 @@ def record_prompt(payload: dict) -> None:
                 os.unlink(old.path)
 
 
-def record_turn_end(payload: dict) -> None:
+ASK_GATE_REASON = (
+    "This reply seems to wait on the owner, but the turn wasn't started by the owner in chat and you hold no "
+    "open ask, so nobody will see it. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' "
+    "--option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something "
+    "only the owner can do (one decision or to-do per ask), then end your turn. If your reply does not wait on "
+    "the owner, just end your turn again.")   # ASCII: the hook's stdout is JSON-escaped either way
+
+
+def log_quiet(msg: str) -> None:
+    """A sleeper.log line from a hook: never waits on the log lock (a held one drops the line), no stderr."""
+    with flocked(LOGFILE.with_name(LOGFILE.name + ".lock"), wait=False) as held:
+        if held:
+            with os.fdopen(open_private(LOGFILE, os.O_WRONLY | os.O_APPEND), "a") as fh:
+                fh.write(f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}\n")
+
+
+def ask_gate(row: dict, stop_hook_active: bool) -> str | None:
+    """What the gate does with this turn end: None when it doesn't apply (the owner started the turn in
+    chat, the reply doesn't wait on him, an ask is open or the count is unknown, or this Stop already
+    follows a block), else "blocked", "dry-run" or "off" (ask_gate = false). A config that can't be
+    read leaves the turn alone (None)."""
+    if (stop_hook_active or row.get("origin") == "owner" or row.get("waits") not in ("question", "todo")
+            or row.get("open_asks") != 0):
+        return None
+    try:
+        config, _ = load_config()
+    except SleeperError:
+        return None
+    if not config["ask_gate"]:
+        return "off"
+    if config["dry_run"]:
+        with contextlib.suppress(OSError):
+            log_quiet(f"skip {row.get('pane') or row.get('session')}: would block the turn end "
+                      f"({row.get('origin')}, waits {row.get('waits')}, no open ask) (dry run)")
+        return "dry-run"
+    return "blocked"
+
+
+def record_turn_end(payload: dict) -> str | None:
     """Stop: one metadata row for the turn that just ended. origin "no-prompt": no prompt since the
-    last Stop (a background event that woke the session without one); waits "unknown": the payload
-    carried no reply text."""
+    last Stop (a background event that woke the session without one, or the turn a block sent back);
+    waits "unknown": the payload carried no reply text. Returns the Stop hook's stdout when the gate
+    blocks the turn end, else None."""
     uuid = str(payload.get("session_id") or "") or None
     marker = turn_marker(uuid or "")
     origin, started = "no-prompt", None
@@ -7743,27 +7801,41 @@ def record_turn_end(payload: dict) -> None:
             marker.unlink()
     reply = payload.get("last_assistant_message")
     pane, name, terminal = turn_identity()
-    append_turn_row({
+    active = payload.get("stop_hook_active") is not False   # only a plain false may block: never twice in a row
+    row = {
         "v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"), "session": uuid, "name": name,
         "pane": pane, "origin": origin, "turn_s": int(time.time() - started) if started else None,
         "waits": waits_on_owner(reply) if isinstance(reply, str) else "unknown",
-        "open_asks": open_asks_quiet(uuid, name, pane, terminal), "stop_hook_active": bool(payload.get("stop_hook_active"))})
+        "open_asks": open_asks_quiet(uuid, name, pane, terminal),
+        "stop_hook_active": bool(payload.get("stop_hook_active"))}
+    row["gate"] = ask_gate(row, active)
+    with contextlib.suppress(OSError):   # a row lost to the disk is a row lost to a held lock: the gate stands
+        append_turn_row(row)
+    return json.dumps({"decision": "block", "reason": ASK_GATE_REASON}) if row["gate"] == "blocked" else None
 
 
 def turn_hook(hook_event: str, payload: dict) -> None:
-    """The silent path for UserPromptSubmit and Stop: nothing to stdout (a UserPromptSubmit hook's stdout
-    becomes context), nothing to stderr or the log. A failure leaves one row naming its class only."""
+    """The quiet path for UserPromptSubmit and Stop: nothing to stderr or the log, and nothing to stdout
+    (a UserPromptSubmit hook's stdout becomes context) except a Stop's one block decision. A failure
+    leaves one row naming its class only and blocks nothing."""
     try:
-        (record_prompt if hook_event == "UserPromptSubmit" else record_turn_end)(payload)
-    except Exception as exc:  # noqa: BLE001 - a measurement hook never changes a turn
+        if hook_event == "UserPromptSubmit":
+            record_prompt(payload)
+            return
+        out = record_turn_end(payload)
+    except Exception as exc:  # noqa: BLE001 - a failing hook never changes a turn
         if hook_event == "Stop":
             with contextlib.suppress(Exception):
                 append_turn_row({"v": TURN_SCHEMA, "at": dt.datetime.now().isoformat(timespec="seconds"),
                                  "error": type(exc).__name__})
+        return
+    if out:
+        print(out)
 
 
 def cmd_turn_ends(args: argparse.Namespace) -> int:
-    """Turn ends that may wait on the owner without an open ask, by origin and session."""
+    """Turn ends that may wait on the owner without an open ask, by origin and session, and what the ask
+    gate did with them."""
     since = dt.datetime.now() - dt.timedelta(hours=args.hours)
     rows, errors, first = [], 0, None
     for p in (TURN_ENDS.with_name(TURN_ENDS.name + ".1"), TURN_ENDS):
@@ -7797,6 +7869,7 @@ def cmd_turn_ends(args: argparse.Namespace) -> int:
         "turns": len(rows), "waits": len(waits), "waits_without_ask": len(unasked),
         "unknown_reply": sum(1 for r in rows if r.get("waits") == "unknown"),
         "unknown_asks": sum(1 for r in waits if r.get("open_asks") is None), "errors": errors,
+        "gate": {g: sum(1 for r in rows if r.get("gate") == g) for g in ("blocked", "dry-run", "off")},
         "by_origin": dict(sorted(by_origin.items())), "sessions": dict(sorted(per.items(), key=lambda kv: -kv[1])[:10])}
     if args.json:
         print(json.dumps(summary))
@@ -7804,6 +7877,9 @@ def cmd_turn_ends(args: argparse.Namespace) -> int:
     kept = f" (rows kept since {summary['retained_since']})" if first and first > since else ""
     print(f"last {args.hours:g} h{kept}: {len(rows)} turn ends, {len(waits)} may wait on the owner, {len(unasked)} "
           f"of them without an open ask; {summary['unknown_reply']} without reply text, {errors} hook errors")
+    gate = summary["gate"]
+    print(f"  ask gate: {gate['blocked']} sent back to file an ask, {gate['dry-run']} would have been (dry run), "
+          f"{gate['off']} while the gate was off")
     for k, v in summary["by_origin"].items():
         print(f"  {k:13} {v['turns']:5} turns  {v['waits']:4} wait  {v['without_ask']:4} without an ask")
     if per:
@@ -7814,8 +7890,8 @@ def cmd_turn_ends(args: argparse.Namespace) -> int:
 
 
 def cmd_claude_hook(_args: argparse.Namespace) -> int:
-    """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook, and the silent UserPromptSubmit/Stop
-    turn count (turn_hook). Fails open: on any error
+    """Claude Code PostToolUse(ListAgents) / PreToolUse(SendMessage) hook, the silent UserPromptSubmit turn note and
+    the Stop turn count with its ask gate (turn_hook). Fails open: on any error
     it prints nothing and the tool behaves as without the plugin. Never takes the global lock: a
     sleep transaction may hold it longer than the hook may run."""
     raw = ""

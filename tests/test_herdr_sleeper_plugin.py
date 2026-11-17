@@ -626,7 +626,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
                       "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
                       "answer_dialogs": True, "limit_monitor": "", "codex_stuck": True, "auto_resume": True,
-                      "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": []}
+                      "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": [], "ask_gate": True}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -8843,6 +8843,171 @@ def test_an_ask_that_may_have_survived_a_clear_is_unknown_without_herdr(
     assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
                                               "last_assistant_message": "Which one?"}) == ("", "")
     assert _turn_rows()[1]["open_asks"] == 0
+
+
+# ------------------------------------------------------------ the ask gate (v0.1.45, owner 2026-11-17)
+
+# The two turn ends the count missed on the MacBook on 2026-11-17 (turn-ends.jsonl: waits "none"), verbatim.
+MISS_SENTRY = ("That job is still stuck on the Sentry login. Please sign in to https://sentry.klinikon.com in the new "
+               "Chrome on the MacBook; the tab is still open on the login page. Once you're in, I'll create "
+               "klinikon-fleet with its alert and stop on the DSN page for you. Then I'll add the canary=true skip "
+               "to alert workflows 2 and 4 and change monitor 8's query, and report to taxi-orch.")
+MISS_WORMS = ("Still waiting on you for step 0.4. Run this in a separate terminal tab and type clinic-gateway at the "
+              "prompt:\n\nbash /Users/leonbeckert/development/20-clients/klinikon/klinikon-taxiagent/"
+              "hospital-backend-rs/ai_notes/worms-checklist/g21-a-run-ab8218b6.sh")
+STATUS_HEAD = ("Step 0.3 is through: the gateway answers on :8443 and the canary run is green.\n\n"
+               "The checklist moved to 0.4; the dry run printed nothing unexpected.\n\n")
+
+
+@pytest.mark.parametrize("reply", [
+    MISS_SENTRY, MISS_WORMS,
+    STATUS_HEAD + MISS_SENTRY, STATUS_HEAD + MISS_WORMS,          # the paragraphs before them don't hide them
+    "The tunnel is up.\n\nStill waiting on you for the 0.4 run:\n\nbash run.sh\n\n(it prints its log path)",
+    "Please log in to Grafana once more; the session expired.",
+    "Please approve the hold in the panel.",
+    "Let me know which of the two you want.",
+    "Tell me when the key is plugged in.",
+    "Bitte melde dich bei Sentry an, dann lege ich das Projekt an.",
+    "Sobald du eingeloggt bist, lege ich das Projekt an.",
+])
+def test_the_ask_gate_reads_requests_to_the_owner(reply: str) -> None:
+    assert sleeper.waits_on_owner(reply) in ("todo", "question")
+
+
+def test_the_two_misses_are_todos() -> None:
+    assert sleeper.waits_on_owner(MISS_SENTRY) == "todo"
+    assert sleeper.waits_on_owner(MISS_WORMS) == "todo"
+
+
+@pytest.mark.parametrize("reply", [
+    "Deployed v0.1.45 to mini1 and mini2; both watchers restarted and the turn-ends rows carry the gate field.",
+    "I ran the lint gate; next I'll run the unit tests and push.",
+    "I'll run this in a separate terminal so the play keeps its own log.",
+    "taxi-orch wrote:\n\n> Please sign in to Sentry and run the canary.\n\nForwarded it; nothing for me to do here.",
+    "The runbook says:\n\n```\nplease run ./bin/ap foo.yml\nonce you're in, type the code\n```\n\nI ran it myself; green.",
+    "Fixed and pushed. Let me know if you need anything else.",
+    "The logs tell me the job never started; I restarted it and it is running now.",
+    "When you're back the report is in docs/report.md; nothing waits on you.",
+])
+def test_the_ask_gate_leaves_reports_alone(reply: str) -> None:
+    assert sleeper.waits_on_owner(reply) == "none"
+
+
+def _gate_config(state: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    cfg = state / "gate-config.toml"
+    cfg.write_text(text)
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+
+
+def _gated_turn(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], origin_prompt: str | None,
+                reply: str = MISS_SENTRY, **stop: object) -> tuple[str, str]:
+    monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+    if origin_prompt is not None:
+        assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "UserPromptSubmit", "session_id": UUID,
+                                                  "prompt": origin_prompt}) == ("", "")
+    return turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                              "stop_hook_active": False, "last_assistant_message": reply, **stop})
+
+
+GATED_ORIGINS = {
+    "relay": "[relayed from mini2/taxi-orch via herdr-sleeper, msg 8456d1eb; not from the owner]\n\ngo on",
+    "notification": "<task-notification>\n<task-id>b1</task-id></task-notification>",
+    "ask-answer": "[the owner's answer to your ask 3]\nyes",
+    "no-prompt": None,
+}
+
+
+@pytest.mark.parametrize("origin", sorted(GATED_ORIGINS))
+def test_the_ask_gate_blocks_a_turn_the_owner_did_not_start(
+        fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], origin: str) -> None:
+    out, err = _gated_turn(monkeypatch, capsys, GATED_ORIGINS[origin])
+    assert err == ""
+    assert json.loads(out) == {"decision": "block", "reason": sleeper.ASK_GATE_REASON}
+    assert out.count("\n") == 1 and out.strip().startswith("{")            # one JSON object, nothing else
+    (row,) = _turn_rows()
+    assert row["origin"] == origin and row["gate"] == "blocked" and row["v"] == 2
+    assert "herdr-sleeper ask --question" in sleeper.ASK_GATE_REASON and "--todo" in sleeper.ASK_GATE_REASON
+
+
+@pytest.mark.parametrize("case", ["owner", "no-wait", "one-ask", "unknown-asks", "hook-active", "no-flag", "off"])
+def test_the_ask_gate_lets_the_turn_end(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str], case: str) -> None:
+    prompt: str | None = GATED_ORIGINS["relay"]
+    reply, stop = MISS_WORMS, {}
+    if case == "owner":
+        prompt = "please look at the Sentry job"
+    elif case == "no-wait":
+        reply = "Created klinikon-fleet with its alert; reported to taxi-orch."
+    elif case == "one-ask":
+        sleeper.write_json(sleeper.ASKS, {"q1": {"state": "open", "uuid": UUID, "panel": "p1", "created": 1}})
+    elif case == "unknown-asks":
+        sleeper.ensure_state_dir()
+        sleeper.ASKS.write_text("{not json")
+    elif case == "hook-active":
+        stop = {"stop_hook_active": True}
+    elif case == "off":
+        _gate_config(state, monkeypatch, "ask_gate = false\n")
+    if case == "no-flag":
+        monkeypatch.setenv("HERDR_PANE_ID", "w1:p1")
+        assert turn_hook_io(monkeypatch, capsys, {"hook_event_name": "Stop", "session_id": UUID,
+                                                  "last_assistant_message": reply}) == ("", "")
+    else:
+        assert _gated_turn(monkeypatch, capsys, prompt, reply, **stop) == ("", "")
+    (row,) = _turn_rows()
+    assert row["gate"] == ("off" if case == "off" else None)
+
+
+def test_the_ask_gate_dry_run_only_logs(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    _gate_config(state, monkeypatch, "dry_run = true\n")
+    assert _gated_turn(monkeypatch, capsys, GATED_ORIGINS["notification"]) == ("", "")
+    assert _turn_rows()[0]["gate"] == "dry-run"
+    assert "would block the turn end (notification, waits todo, no open ask) (dry run)" in sleeper.LOGFILE.read_text()
+
+
+def test_a_broken_config_blocks_nothing(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    _gate_config(state, monkeypatch, 'ask_gate = "yes"\n')
+    with pytest.raises(sleeper.ConfigError, match="ask_gate must be a boolean"):
+        sleeper.load_config()
+    assert _gated_turn(monkeypatch, capsys, GATED_ORIGINS["relay"]) == ("", "")
+    assert _turn_rows()[0]["gate"] is None
+
+
+def test_a_failing_stop_blocks_nothing(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                       capsys: pytest.CaptureFixture[str]) -> None:
+    def boom() -> int:
+        raise RuntimeError("x")
+    monkeypatch.setattr(sleeper, "open_asks_quiet", lambda *a: boom())
+    assert _gated_turn(monkeypatch, capsys, GATED_ORIGINS["relay"]) == ("", "")
+    assert _turn_rows()[0] == {"v": sleeper.TURN_SCHEMA, "at": _turn_rows()[0]["at"], "error": "RuntimeError"}
+
+
+def test_a_lost_row_still_blocks(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                 capsys: pytest.CaptureFixture[str]) -> None:
+    sleeper.ensure_state_dir()
+    with sleeper.flocked(sleeper.TURN_ENDS.with_name(sleeper.TURN_ENDS.name + ".lock")):
+        out, _ = _gated_turn(monkeypatch, capsys, GATED_ORIGINS["relay"])
+    assert json.loads(out)["decision"] == "block" and not sleeper.TURN_ENDS.exists()
+
+
+def test_the_readme_shows_the_gate_reason_as_printed() -> None:
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    assert sleeper.ASK_GATE_REASON.isascii()
+    assert json.dumps({"decision": "block", "reason": sleeper.ASK_GATE_REASON}) in readme
+
+
+def test_turn_ends_counts_what_the_gate_did(state: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    rows = [{"at": now, "name": "a", "origin": "relay", "waits": "todo", "open_asks": 0, "gate": "blocked"},
+            {"at": now, "name": "a", "origin": "no-prompt", "waits": "todo", "open_asks": 0, "gate": None},
+            {"at": now, "name": "b", "origin": "relay", "waits": "question", "open_asks": 0, "gate": "dry-run"}]
+    sleeper.TURN_ENDS.parent.mkdir(parents=True, exist_ok=True)
+    sleeper.TURN_ENDS.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=1.0, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["gate"] == {"blocked": 1, "dry-run": 1, "off": 0}
+    assert sleeper.cmd_turn_ends(types.SimpleNamespace(hours=1.0, json=False)) == 0
+    assert "ask gate: 1 sent back to file an ask, 1 would have been (dry run)" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------- Codex panes stuck after their turn (v0.1.44, B-485)

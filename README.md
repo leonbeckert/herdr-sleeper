@@ -260,7 +260,7 @@ restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
 `wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `codex_stuck` (see "A Codex pane stuck after its turn"),
-`auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
+`auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `ask_gate` (default on; see "Turn-end count and ask gate"), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
 `herdr-sleeper watch` and hooks never spawn one, but report it when it is
@@ -535,19 +535,46 @@ Live peers are left to `SendMessage`. A message that `deliver` would reject
 the tool run as if the plugin were absent. The hook never waits for the
 global lock, which a sleep transaction may hold longer than a hook may run.
 
-**Turn-end count.** Registered also as a `UserPromptSubmit` and a `Stop` hook
-(no matcher), `claude-hook` counts how often a turn ends with a reply that
-seems to wait on the owner (a question or a step for him in its last two
-paragraphs) while the session holds no open ask. It reads no transcript: the
-prompt's origin (owner, relay, ask-answer, notification) comes from the
-`UserPromptSubmit` payload, the reply from the `Stop` payload's
-`last_assistant_message`, both classified in memory. `turn-ends.jsonl` keeps
-one row per turn with the classes, the session, pane, Herdr name, turn length
-and open-ask count, never text. Both hooks print nothing, never wait on a lock
-(a held one drops the row) and leave only an error's class name. The rows are
-candidates, not confirmed misses: a question the owner asked for in his own
-chat is fine. `herdr-sleeper turn-ends [--hours N] [--json]` sums them by
-origin and session, with the range the file still holds.
+**Turn-end count and ask gate** (*v0.1.45*). Registered also as a
+`UserPromptSubmit` and a `Stop` hook (no matcher), `claude-hook` notes how
+each turn ends. It reads no transcript: the prompt's origin (owner, relay,
+ask-answer, notification; no-prompt when no prompt came since the last Stop)
+comes from the `UserPromptSubmit` payload, the reply from the `Stop` payload's
+`last_assistant_message`, both classified in memory. A reply waits on the
+owner when its last three paragraphs ask him to do something (please sign in,
+please run/open/approve/confirm, still waiting on you, run this in a separate
+terminal, once you're in, bitte melde dich an, …: a *todo*) or its last two
+ask him something (should I, which one, let me know which, a closing `?`: a
+*question*); code blocks and `>` quotes don't count.
+
+The owner's rule (2026-11-17): a session that ends its turn waiting on him
+shows as a blocked question in Herdr. While he chats with a session (his own
+message started the turn) it asks in that chat; everything else goes into
+`herdr-sleeper ask`. So when a turn ends with a reply that waits on the owner,
+the turn was **not** started by the owner in chat (relay, notification,
+ask-answer and no-prompt all count), the session holds no open ask (an unknown
+count blocks nothing), and the Stop payload's `stop_hook_active` is `false`,
+the `Stop` hook prints one JSON object and exits 0:
+
+```json
+{"decision": "block", "reason": "This reply seems to wait on the owner, but the turn wasn't started by the owner in chat and you hold no open ask, so nobody will see it. File it now with `echo CONTEXT | herdr-sleeper ask --question '...' --option '...' --option '...'` for a decision, or `echo CONTEXT | herdr-sleeper ask --todo '...'` for something only the owner can do (one decision or to-do per ask), then end your turn. If your reply does not wait on the owner, just end your turn again."}
+```
+
+Claude Code then continues the turn with that reason; the next Stop carries
+`stop_hook_active: true` and is never blocked, so a reply the classifier
+misread costs one extra step, never a loop. `ask_gate = false` turns the gate
+off (the turns are still counted); with `dry_run` the hook logs `would block
+the turn end (…) (dry run)` to `sleeper.log` instead. A config that can't be
+read, any failure, or an origin of `owner` blocks nothing.
+
+`turn-ends.jsonl` keeps one row per turn with the classes, the session, pane,
+Herdr name, turn length, open-ask count and `gate` (`blocked`, `dry-run`,
+`off`, or null when the gate didn't apply), never text. The hooks print
+nothing else, never wait on a lock (a held one drops the row, not the block;
+one Herdr call of at most 2 s keeps the Stop inside its 5 s) and leave only an
+error's class name. `herdr-sleeper turn-ends [--hours N] [--json]` sums them
+by origin and session, with what the gate did and the range the file still
+holds.
 
 ## Insomnia
 
