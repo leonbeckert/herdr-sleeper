@@ -4076,6 +4076,119 @@ def test_spawn_record_follows_a_cleared_session(fake: FakeHerdr, checkout: Path,
     assert "closed impl-1" in capsys.readouterr().out
 
 
+# ------------------------------------- a claude that reports its session id late (v0.1.46)
+
+def _late_session(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, after: float | None) -> list[float]:
+    """The spawned claude reports its session id `after` seconds of (patched) sleep, or never (None)."""
+    fake.start_reports_session = False
+    fake.start_session_appears = False
+    slept = [0.0]
+
+    def sleep(s: float) -> None:
+        slept[0] += s
+        if after is not None and slept[0] >= after:
+            for a in fake.agents:
+                if a.get("started_name") == "impl-1" and a.get("agent"):
+                    a["agent_session"] = {"value": SPAWNED_UUID}
+    monkeypatch.setattr(sleeper.time, "sleep", sleep)
+    return slept
+
+
+def _typed_prompts(fake: FakeHerdr) -> list[tuple[str, ...]]:
+    return [c for c in fake.calls if c[:2] == ("agent", "prompt") and c[3].endswith("build B-1")]
+
+
+def test_spawn_waits_for_a_session_id_that_comes_after_20_seconds(fake: FakeHerdr, checkout: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    slept = _late_session(fake, monkeypatch, after=20)
+    assert _spawn(monkeypatch, checkout, json_out=True) == 0
+    assert json.loads(capsys.readouterr().out)["prompt"] == "delivered"
+    assert 20 <= slept[0] < sleeper.SPAWN_SESSION_SECONDS and len(_typed_prompts(fake)) == 1
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    assert rec["uuid"] == SPAWNED_UUID and "prompt" not in rec
+
+
+def test_spawn_without_a_session_id_queues_the_prompt_for_the_watcher(fake: FakeHerdr, checkout: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    slept = _late_session(fake, monkeypatch, after=None)
+    assert _spawn(monkeypatch, checkout) == 3                          # started, prompt queued
+    out = capsys.readouterr().out
+    assert "first prompt" in out and "queued and typed in once the session is ready" in out
+    assert slept[0] >= sleeper.SPAWN_SESSION_SECONDS and _typed_prompts(fake) == []
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    msg_id = rec["prompt"]["id"]
+    assert rec["uuid"] is None and rec["prompt"]["body"] == "build B-1" and msg_id in out
+    assert sleeper.mail_waiting()                                      # the 5 s retries look at it too
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))                     # still no id: it waits
+    assert _typed_prompts(fake) == [] and "prompt" in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    pane = next(a for a in fake.agents if a.get("started_name") == "impl-1")
+    pane["agent_session"] = {"value": SPAWNED_UUID}                    # the session reports in
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    typed = _typed_prompts(fake)
+    assert len(typed) == 1 and typed[0][2] == pane["pane_id"] and f"msg {msg_id}" in typed[0][3]
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    assert rec["uuid"] == SPAWNED_UUID and "prompt" not in rec and sleeper.pending_mail(SPAWNED_UUID) == []
+    assert sleeper.archived(msg_id)["to"] == SPAWNED_UUID              # the turn-end gate counts it as relayed
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))                     # exactly once
+    sleeper.flush_mail(fake.agents)
+    assert len(_typed_prompts(fake)) == 1 and not sleeper.mail_waiting()
+
+
+def test_a_spawn_prompt_already_queued_is_never_typed_twice(fake: FakeHerdr, checkout: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    _late_session(fake, monkeypatch, after=None)
+    assert _spawn(monkeypatch, checkout) == 3
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    pane = next(a for a in fake.agents if a.get("started_name") == "impl-1")
+    pane["agent_session"] = {"value": SPAWNED_UUID}
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    sleeper.record_spawned("impl-1", rec)        # as if the watcher died between typing and letting go
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert len(_typed_prompts(fake)) == 1 and "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+
+
+def test_a_spawn_prompt_whose_pane_dies_first_is_dropped_and_logged(fake: FakeHerdr, checkout: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    _late_session(fake, monkeypatch, after=None)
+    assert _spawn(monkeypatch, checkout) == 3
+    msg_id = sleeper.read_json(sleeper.SPAWNED)["impl-1"]["prompt"]["id"]
+    fake.agents = [a for a in fake.agents if a.get("started_name") != "impl-1"]   # its tab closed by hand
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "spawn-prompt-dropped" in events() and _typed_prompts(fake) == []
+    assert f"first prompt (msg {msg_id}) dropped" in sleeper.LOGFILE.read_text()
+    assert "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"] and not sleeper.mail_waiting()
+
+
+def test_a_spawn_whose_agent_quits_before_its_session_id_fails(fake: FakeHerdr, checkout: Path,
+                                                              monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    _late_session(fake, monkeypatch, after=None)
+    real = fake.__call__
+
+    def herdr(*a: str, **k: Any) -> Any:
+        if a[:2] == ("pane", "get"):           # claude exits during the wait: the pane is a shell again
+            for row in fake.agents:
+                if row.get("started_name") == "impl-1":
+                    row.pop("agent", None)
+        return real(*a, **k)
+    monkeypatch.setattr(sleeper, "herdr", herdr)
+    assert _spawn(monkeypatch, checkout) == 1
+    assert "quit before it reported a session id" in capsys.readouterr().err
+    assert "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"] and "spawn-prompt-dropped" in events()
+
+
+def test_a_spawn_prompt_follows_a_moved_pane(fake: FakeHerdr, checkout: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _late_session(fake, monkeypatch, after=None)
+    assert _spawn(monkeypatch, checkout) == 3
+    pane = next(a for a in fake.agents if a.get("started_name") == "impl-1")
+    pane.update(pane_id="w1:p30", agent_session={"value": SPAWNED_UUID})   # moved, then reported its id
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    typed = _typed_prompts(fake)
+    assert len(typed) == 1 and typed[0][2] == "w1:p30"
+
+
 # ------------------------------------- the name back after a stub wake (B-244 follow-up)
 
 def _rename_not_found(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:

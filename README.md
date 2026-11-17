@@ -706,7 +706,24 @@ Steps:
 An agent that does not get ready (`agent_not_ready`: a folder-trust or login
 prompt; spawn never answers one) has its tab closed again, since nothing was
 typed into it, and logs `spawn-failed`. Exit codes: 0 started and prompted,
-3 started with the prompt queued, 1 refused or failed, 2 bad input.
+3 started with the prompt queued (also when it waits for the session id,
+below), 1 refused or failed, 2 bad input.
+
+**A late session id** (*v0.1.46*). A claude may report its session id well
+after `agent start` returns (2026-11-17 on mini2: 13–43 s, three spawns in a
+day). `spawn` waits up to 90 s for it (was 15 s, after which the prompt was
+dropped and spawn exited 1). Still none: the first prompt is kept in the
+spawn record under its message id, spawn says so and exits 3 (started, prompt
+queued, as for a session that is not idle yet), and the watcher
+(every tick, and every 5 s while it waits) moves it into the session's mailbox
+once the pane reports a session; from there it is typed in like any
+`deliver`, once the agent is idle. The id makes it go in once, even if the
+watcher stops between queueing and letting go of it. It is dropped, with a
+`spawn-prompt-dropped` event and a log line, when the pane is gone or its
+agent quit before reporting (a pane moved meanwhile is found by its agent
+name), when a `--resume` came up as another session, or after an hour without
+a session id. An agent that quits during spawn's own wait fails the spawn
+(exit 1, nothing queued).
 
 ### opencode lanes (`--kind opencode`, *v0.1.35*)
 
