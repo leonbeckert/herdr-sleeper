@@ -1031,7 +1031,7 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
 
 | Screen | Answer |
 |---|---|
-| the limit menu (its first option line together with the `/usage-credits` hint) | `Enter` on option 1, only from there; never another option (option 3 bills credits) |
+| the limit menu (its options `Stop and wait for limit to reset` and `Switch to usage credits`, the cursor on a numbered row; *v0.1.48:* not the hint above them, which 2.1.306 renamed from `/usage-credits` to `/rate-limit-options`) | `Enter` on option 1, only from there; never another option (option 3 bills credits) |
 | "Make auto mode your default permission mode?" | `No, keep bypass permissions` |
 | a feature tip (`Yes, try it` / `Not now`) | `Not now` |
 | the Claude in Chrome intro (`docs/en/chrome`, `Enter to confirm`) | `Enter` |
@@ -1049,7 +1049,15 @@ machine and with `restart_outdated` off too (`answer_dialogs`, default on):
   `account --restart`) queues `Your slot hit its usage limit; you were
   restarted on slot <x> (same transcript). Continue the task you were on.`
   A limited session left on its slot gets `Your slot's usage limit has reset`
-  once the reset of its fullest window has passed.
+  once the reset of the window that was fullest at the hit has passed
+  (*v0.1.48:* kept with the hit, so a five-hour hit no longer waits for the
+  weekly reset), or (*v0.1.48*) once a reading taken after the hit shows an
+  early reset while `resets_at` stays where it was (a free weekly reset,
+  2026-11-17): below 50 % and below the slot's reading at the hit by 25 points
+  or half of it (`levels` in `limited.json`), since an idle pane's status line
+  can still write a reading from before the hit. A slot hit again within 6 h
+  of an early reset waits for its real reset (event `limit-continue`, `why`
+  `early reset` or `reset passed`).
 - A pane whose journal row is a displaced handle of another session
   (*v0.1.16*) has no room for a second row: its live session is restarted in
   place instead (exit, then `agent start --resume` in the same pane), the

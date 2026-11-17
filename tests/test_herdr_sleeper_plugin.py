@@ -5371,6 +5371,20 @@ LIMIT_MENU = """⏺ Running the migration tests
 
  Enter to confirm · Esc to cancel
 """
+LIMIT_MENU_2_1_306 = """⏺ Running the migration tests
+  ⎿  Error: rate limited
+────────────────────────────────
+❯ /rate-limit-options
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Nov 24 at 12am
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel
+"""
+LIMIT_MENUS = (LIMIT_MENU, LIMIT_MENU_2_1_306)
 AUTO_MODE = """ Make auto mode your default permission mode?
 
  Auto mode lets Claude decide when to ask.
@@ -5380,6 +5394,9 @@ AUTO_MODE = """ Make auto mode your default permission mode?
 """
 QUOTED = ("⏺ The runbook says: Claude shows a menu\n"
           "  ❯ 1. Stop and wait for limit to reset\n  3. Switch to usage credits, /usage-credits\n" + EMPTY_SCREEN)
+QUOTED_DRAFT = ("⏺ The menu offers: 1. Stop and wait for limit to reset, 3. Switch to usage credits\n"
+                "────────────────────────────────\n"
+                "❯ Stop and wait for limit to reset after these tests\n")
 PERMISSION = """ Bash command: rm -rf build
  Do you want to proceed?
  ❯ 1. Yes
@@ -5388,9 +5405,13 @@ PERMISSION = """ Bash command: rm -rf build
 
 
 def test_match_dialog_only_the_live_menu() -> None:
-    d, sel = sleeper.match_dialog(LIMIT_MENU)
-    assert d and d.kind == "limit" and sel == "Stop and wait for limit to reset"
+    for menu in LIMIT_MENUS:                                             # the hint line is not a marker
+        d, sel = sleeper.match_dialog(menu)
+        assert d and d.kind == "limit" and sel == "Stop and wait for limit to reset"
+    moved = LIMIT_MENU_2_1_306.replace("❯ 1.", "  1.").replace("  3. Switch", "❯ 3. Switch")
+    assert sleeper.match_dialog(moved)[1].startswith("Switch to usage credits")
     assert sleeper.match_dialog(QUOTED)[0] is None                       # quoted above a composer
+    assert sleeper.match_dialog(QUOTED_DRAFT)[0] is None                 # ... with a draft in the words of option 1
     assert sleeper.match_dialog(PERMISSION)[0] is None                   # looks alike, is not
     moved = LIMIT_MENU.replace("❯ 1.", "  1.").replace("  3. Switch", "❯ 3. Switch")
     d, sel = sleeper.match_dialog(moved)
@@ -5420,6 +5441,53 @@ def test_slot_room_waits_for_the_reset_after_a_hit() -> None:
     assert sleeper.slot_room("a", stale, {"a": now - 60}, now)          # a reading newer than the hit
 
 
+def test_slot_room_sees_an_early_reset() -> None:
+    """2026-11-17: a free weekly reset read 0 % while resets_at stayed a week out."""
+    now = 1_000_000.0
+    week = now + 6 * 86400
+
+    def usage(used: float, seen: float) -> dict:
+        return {"b": {"seven_day": {"used_percentage": used, "resets_at": week}, "seen_at": seen}}
+    hits, levels = {"b": now - 600}, {"b": {"at": now - 600, "used": 100.0}}
+    assert sleeper.slot_room("b", usage(0, now - 60), hits, now, levels)          # read after the hit: room
+    assert sleeper.slot_room("b", usage(0, now - 60), hits, now)                  # level at the hit unknown
+    assert not sleeper.slot_room("b", usage(0, now - 900), hits, now, levels)     # read before the hit
+    assert not sleeper.slot_room("b", usage(70, now - 60), hits, now, levels)     # an idle pane's old reading
+    assert not sleeper.slot_room("b", usage(50, now - 60), hits, now)             # ... level unknown: below 50 %
+    low = {"b": {"at": now - 600, "used": 40.0}}                                  # a window usage.json lacks
+    assert not sleeper.slot_room("b", usage(40, now - 60), hits, now, low)        # the same reading again
+    assert not sleeper.slot_room("b", usage(20, now - 60), hits, now, low)        # half of it is the bar
+    assert sleeper.slot_room("b", usage(10, now - 60), hits, now, low)            # ... far below it: reset
+    lower = {"b": {"at": now - 600, "used": 20.0}}
+    assert sleeper.slot_room("b", usage(0, now - 60), hits, now, lower)           # a low level still resets
+    assert not sleeper.slot_room("b", usage(0, now - 60), hits, now, {"b": {"used": 0.0}})
+    again = {"b": {"at": now - 600, "used": 100.0, "early": False}}               # hit soon after an early one
+    assert not sleeper.slot_room("b", usage(0, now - 60), hits, now, again)
+    assert sleeper.slot_room("b", usage(0, now - 60), hits, week + 1, again)      # ... waits for the reset
+    sched = {"b": {"seven_day": {"used_percentage": 100, "resets_at": now - 10}, "seen_at": now - 60}}
+    at_hit = {"b": {"at": now - 600, "used": 100.0, "reset": now - 10}}
+    assert not sleeper.early_reset("b", sched, hits, now, at_hit)                 # its scheduled reset: not early
+    assert not sleeper.early_reset("b", usage(0, now - 60), hits, now, at_hit)
+    assert sleeper.slot_room("b", sched, hits, now, at_hit)
+    mixed = {"b": {"seven_day": {"used_percentage": 0, "resets_at": week},             # an expired window
+                   "five_hour": {"used_percentage": 100, "resets_at": now - 900}, "seen_at": now - 60}}
+    assert sleeper.slot_room("b", mixed, hits, now, levels)                       # ... vetoes no early reset
+    passed = {"b": {"seven_day": {"used_percentage": 40, "resets_at": now - 900}, "seen_at": now - 60}}
+    assert sleeper.slot_room("b", passed, hits, now)                              # no reset after the hit
+    for saved in (None, now - 900):                                               # ... not after an early one
+        assert not sleeper.slot_room("b", passed, hits, now, {"b": {"used": 40.0, "reset": saved, "early": False}})
+
+
+def test_slot_room_after_a_five_hour_hit_with_a_weekly_reading() -> None:
+    now = 1_000_000.0
+    usage = {"a": {"five_hour": {"used_percentage": 100, "resets_at": now + 600},
+                   "seven_day": {"used_percentage": 40, "resets_at": now + 6 * 86400}, "seen_at": now - 30}}
+    used, reset = sleeper.usage_load(usage["a"], now)
+    levels = {"a": {"at": now, "used": used, "reset": reset}}
+    assert not sleeper.slot_room("a", usage, {"a": now}, now + 300, levels)
+    assert sleeper.slot_room("a", usage, {"a": now}, now + 700, levels)           # its window reset: 40 % left
+
+
 def limit_setup(fake: FakeHerdr, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, screen: str,
                 active: str = "b", usage: dict | None = None) -> dict[str, Any]:
     fake.agents[0].update(agent_status="blocked", state_change_seq=7)
@@ -5435,7 +5503,7 @@ def limit_setup(fake: FakeHerdr, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     real = fake.__call__
 
     def keys(*argv: Any, **kw: Any) -> Any:
-        if argv[:2] == ("pane", "send-keys") and argv[3] == "enter" and fake.screen == LIMIT_MENU:
+        if argv[:2] == ("pane", "send-keys") and argv[3] == "enter" and fake.screen in LIMIT_MENUS:
             fake.agents[0].update(agent_status="idle", state_change_seq=8)   # option 1: the pane goes idle
             fake.screen = EMPTY_SCREEN
         if argv[:2] == ("agent", "start"):                                   # resumed through the launcher
@@ -5453,9 +5521,10 @@ def mailbox_bodies(fake: FakeHerdr | None = None) -> list[str]:
     return typed + queued
 
 
+@pytest.mark.parametrize("menu", LIMIT_MENUS)
 def test_limit_menu_moves_the_session_onto_the_active_slot(fake: FakeHerdr, tmp_path: Path,
-                                                          monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU,
+                                                          monkeypatch: pytest.MonkeyPatch, menu: str) -> None:
+    ctx = limit_setup(fake, tmp_path, monkeypatch, menu,
                       usage={"b": {"seven_day": {"used_percentage": 20, "resets_at": 2e9}}})
     cfg = {**sleeper.DEFAULTS, "limit_monitor": "mbp/dev-mini-setup"}
     clock = {"t": 1_000_000.0}
@@ -5471,6 +5540,49 @@ def test_limit_menu_moves_the_session_onto_the_active_slot(fake: FakeHerdr, tmp_
     assert len(mailbox_bodies(fake)) == 1 and sleeper.CONTINUE_NOTE.format(slot="b") in mailbox_bodies(fake)[0]
     assert ctx["notes"] == [] and sleeper.read_limited()["sessions"] == {}
     assert sleeper.read_limited()["hits"]["a"] == clock["t"]
+
+
+def test_limit_move_onto_a_slot_after_its_early_reset_is_recorded(fake: FakeHerdr, tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000.0
+    usage = {"b": {"seven_day": {"used_percentage": 0, "resets_at": now + 6 * 86400}, "seen_at": now - 30}}
+    limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU_2_1_306, active="b", usage=usage)
+    sleeper.write_json(sleeper.LIMITED, {"hits": {"b": now - 3600},
+                                         "levels": {"b": {"at": now - 3600, "used": 100.0, "early": True}}})
+    clock = {"t": now}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 60
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert fake.signals == [(101, signal.SIGTERM)]                       # moved from a onto b at once
+    assert sleeper.read_limited()["early"]["b"] == clock["t"]            # ... and b's early reset is known
+
+
+def test_remind_keeps_a_reset_note_when_a_later_session_restarts(fake: FakeHerdr, tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """restart_agent reads and writes limited.json itself: the reset of an earlier session in the
+    same pass is written first."""
+    now = 1_000_000.0
+    on_a = "30603f77-21a6-4a16-9f2b-77a87efbc665"
+    accounts(tmp_path, "b")
+    (sleeper.ACCOUNTS_DIR / "usage.json").write_text(json.dumps(
+        {"b": {"seven_day": {"used_percentage": 0, "resets_at": now + 6 * 86400}, "seen_at": now - 30}}))
+    sleeper.write_json(sleeper.LIMITED, {
+        "sessions": {UUID: {"slot": "b", "at": now - 3600}, on_a: {"slot": "a", "at": now - 3600}},
+        "hits": {"b": now - 3600}, "levels": {"b": {"at": now - 3600, "used": 100.0, "early": True}}})
+    agents = [{"pane_id": f"w1:p{i}", "agent": "claude", "agent_status": "idle", "agent_session": {"value": u}}
+              for i, u in enumerate((UUID, on_a))]
+
+    def restart(agent: dict, *a: Any) -> tuple[str, None]:
+        data = sleeper.read_limited()
+        data["sessions"].pop(agent["agent_session"]["value"], None)
+        sleeper.write_json(sleeper.LIMITED, data)
+        return "restarted", None
+    monkeypatch.setattr(sleeper, "restart_agent", restart)
+    monkeypatch.setattr(sleeper, "queue_note", lambda *a, **kw: None)
+    sleeper.remind_limited(agents, sleeper.DEFAULTS, now)
+    data = sleeper.read_limited()
+    assert data["sessions"] == {} and data["hits"] == {} and data["early"] == {"b": now}
 
 
 def test_limit_menu_never_presses_from_another_option(fake: FakeHerdr, tmp_path: Path,
@@ -5525,6 +5637,47 @@ def test_a_limited_session_goes_on_after_its_reset(fake: FakeHerdr, tmp_path: Pa
     sleeper.watch_tick({}, sleeper.DEFAULTS)
     assert sleeper.RESET_NOTE.format(slot="a") in "".join(mailbox_bodies(fake))
     assert sleeper.read_limited()["sessions"] == {}
+
+
+def test_a_limited_session_goes_on_after_an_early_reset(fake: FakeHerdr, tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1_000_000.0
+    week = now + 6 * 86400
+    usage = {"b": {"seven_day": {"used_percentage": 100, "resets_at": week}, "seen_at": now - 30}}
+    limit_setup(fake, tmp_path, monkeypatch, LIMIT_MENU_2_1_306, active="b", usage=usage)
+    accounts(tmp_path, "b", {101: "b"})                                  # limited on the active slot
+    clock = {"t": now}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    clock["t"] += 60
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert [c[3:] for c in fake.calls if c[:2] == ("pane", "send-keys")] == [("enter",)]
+    assert sleeper.read_limited()["levels"]["b"]["used"] == 100
+    clock["t"] += 600                                                    # an idle pane rewrites its reading
+    usage["b"]["seen_at"] = clock["t"] - 10
+    (sleeper.ACCOUNTS_DIR / "usage.json").write_text(json.dumps(usage))
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert mailbox_bodies(fake) == []
+    clock["t"] += 600                                                    # the owner's free reset
+    usage["b"] = {"seven_day": {"used_percentage": 0, "resets_at": week}, "seen_at": clock["t"] - 10}
+    (sleeper.ACCOUNTS_DIR / "usage.json").write_text(json.dumps(usage))
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert sleeper.RESET_NOTE.format(slot="b") in "".join(mailbox_bodies(fake))
+    assert fake.signals == [] and sleeper.read_limited()["hits"] == {} and sleeper.read_limited()["levels"] == {}
+    assert sleeper.read_limited()["early"]["b"] == clock["t"]
+    assert any(json.loads(ln).get("why") == "early reset" for ln in sleeper.EVENTS.read_text().splitlines())
+    notes = len(mailbox_bodies(fake))
+    fake.agents[0].update(agent_status="blocked", state_change_seq=9)    # it was a stale reading after all
+    fake.screen = LIMIT_MENU_2_1_306
+    for _ in range(2):
+        clock["t"] += 60
+        sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert sleeper.read_limited()["levels"]["b"]["early"] is False
+    clock["t"] += 600
+    usage["b"] = {"seven_day": {"used_percentage": 0, "resets_at": week}, "seen_at": clock["t"] - 10}
+    (sleeper.ACCOUNTS_DIR / "usage.json").write_text(json.dumps(usage))
+    sleeper.watch_tick({}, sleeper.DEFAULTS)
+    assert len(mailbox_bodies(fake)) == notes                            # no second early continue
 
 
 def test_one_time_dialogs_get_the_choice_that_changes_nothing(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:

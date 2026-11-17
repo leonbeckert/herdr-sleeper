@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.47"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.48"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -9164,8 +9164,13 @@ def restart_agent(agent: dict, since: float | None, window: float, old: str, new
 # onto the active slot when that one has room, and tells the session to go on. Anything else on
 # a blocked screen is left alone (an `unknown-dialog` event).
 
-LIMITED = STATE_DIR / "limited.json"   # {"sessions": {uuid: {slot, at, pane, name}}, "hits": {slot: at}, "notes": {key: at}}
+LIMITED = STATE_DIR / "limited.json"   # {"sessions": {uuid: {slot, at, pane, name}}, "hits": {slot: at},
+                                       #  "levels": {slot: {at, used, reset, early}}, "early": {slot: at},
+                                       #  "notes": {key: at}}
 USED_UP_PERCENT = 95.0                 # claude-account's USED_UP: a slot at or above this has no room
+EARLY_RESET_PERCENT = 50.0             # a reading after a hit below this, and well below the slot's
+EARLY_RESET_DROP = 25.0                # reading at the hit (this many points, or half of it), is an early reset
+EARLY_RESET_RETRY_SECONDS = 6 * 3600   # a slot hit again this soon after an early reset waits for its reset
 DIALOG_ACT_SECONDS = 20                # a dialog is answered on a later sighting, not the first one
 DIALOG_ACT_FOCUSED_SECONDS = 300       # ... and a focused pane (someone may be looking) gets 5 minutes
 LIMIT_SETTLE_SECONDS = 10              # how long after Enter the pane may take to report idle
@@ -9185,12 +9190,15 @@ class Dialog(NamedTuple):
     markers: tuple[str, ...]     # every one of these on the bottom lines of the screen
     options: tuple[str, ...]     # the menu's option texts; the selected line must start with one
     target: str | None           # the option to pick; None: just Enter (no choice on screen)
+    numbered: bool = False       # the selected line must be a numbered row (`❯ 1. …`), never a composer draft
 
 
 DIALOGS = (
-    Dialog("limit", ("Stop and wait for limit to reset", "/usage-credits"),
+    # The hint line above the menu changed between builds (`/usage-credits`, 2.1.306 `/rate-limit-options`):
+    # the option texts are the markers.
+    Dialog("limit", ("Stop and wait for limit to reset", "Switch to usage credits"),
            ("Stop and wait for limit to reset", "Wait here, then continue automatically", "Switch to usage credits"),
-           "Stop and wait for limit to reset"),
+           "Stop and wait for limit to reset", numbered=True),
     Dialog("auto-mode-default", ("Make auto mode your default permission mode?",),
            ("Yes, set auto mode as my default permission mode", "No, keep bypass permissions"),
            "No, keep bypass permissions"),
@@ -9198,18 +9206,25 @@ DIALOGS = (
     Dialog("chrome-intro", ("docs/en/chrome", "Enter to confirm"), (), None),
 )
 OPTION_LINE = re.compile(r"^\s*❯\s*(?:\d+\.\s*)?(.*\S)\s*$")
+NUMBERED_LINE = re.compile(r"^\s*❯\s*\d+\.\s")
+
+
+def selected_line(lines: list[str]) -> str | None:
+    """The last line that starts with the selection glyph (a menu's cursor, or the composer when
+    no menu is open)."""
+    for line in reversed(lines):
+        if OPTION_LINE.match(line) or line.lstrip().startswith(PROMPT_GLYPHS):
+            return line
+    return None
 
 
 def selected_option(lines: list[str]) -> str | None:
-    """The text of the last line that starts with the selection glyph (a menu's cursor, or the
-    composer when no menu is open), without its number."""
-    for line in reversed(lines):
-        m = OPTION_LINE.match(line)
-        if m:
-            return m.group(1)
-        if line.lstrip().startswith(PROMPT_GLYPHS):
-            return ""
-    return None
+    """The text of selected_line() without its glyph and number."""
+    line = selected_line(lines)
+    if line is None:
+        return None
+    m = OPTION_LINE.match(line)
+    return m.group(1) if m else ""
 
 
 def match_dialog(screen: str | None) -> tuple[Dialog | None, str | None]:
@@ -9228,6 +9243,8 @@ def match_dialog(screen: str | None) -> tuple[Dialog | None, str | None]:
             if selected:  # an intro has no options; a glyph line with text is a menu or a draft
                 return None, f"{d.kind}: unexpected selection on screen"
             return d, None
+        if d.numbered and not NUMBERED_LINE.match(selected_line(lines) or ""):
+            return None, f"{d.kind}: selection not on a numbered row"
         if selected and any(selected.startswith(o) for o in d.options):
             return d, selected
         return None, f"{d.kind}: selection not on one of its options"
@@ -9257,16 +9274,50 @@ def read_usage() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def slot_room(slot: str, usage: dict, hits: dict, now: float) -> bool:
+def early_reset(slot: str, usage: dict, hits: dict, now: float, levels: dict | None = None) -> bool:
+    """Whether a reading taken after the slot's hit shows an early reset (2026-11-17: a free weekly
+    reset read 0 % with resets_at still a week out): far below the limit and well below the
+    slot's reading at the hit, since an idle session's status line can still write a reading
+    from before the hit. Not for a hit soon after an early reset (`early` False): the last one
+    may have been such a stale reading, and the slot then waits for its reset."""
+    hit = hits.get(slot)
+    level = (levels or {}).get(slot) or {}
+    seen = (usage.get(slot) or {}).get("seen_at")
+    if not isinstance(hit, (int, float)) or level.get("early") is False:
+        return False
+    if not isinstance(seen, (int, float)) or seen <= hit:
+        return False
+    saved = level.get("reset")
+    if isinstance(saved, (int, float)) and hit < saved <= now:
+        return False  # the window's own reset passed: not early
+    entry = usage.get(slot) or {}
+    live = {w: v for w, v in entry.items()  # a window past its reset is left out, not read as 0
+            if w != "seen_at" and isinstance(v, dict) and not (isinstance(v.get("resets_at"), (int, float))
+                                                               and v["resets_at"] <= now)}
+    used = usage_load(live, now)[0]
+    bar = EARLY_RESET_PERCENT
+    if isinstance(level.get("used"), (int, float)):
+        at_hit = float(level["used"])
+        bar = min(bar, max(at_hit - EARLY_RESET_DROP, at_hit / 2))
+    return used is not None and used < bar
+
+
+def slot_room(slot: str, usage: dict, hits: dict, now: float, levels: dict | None = None) -> bool:
     """Whether a slot can take work. A slot a session hit the limit on has none until the reset
-    of its fullest window has passed (usage.json lags: its last reading may predate the hit); a
-    slot never seen has room (someone switched to it on purpose)."""
+    of the window that was fullest at the hit has passed (usage.json lags: its last reading may
+    predate the hit), or an early reset shows. A slot never seen has room (someone switched to
+    it on purpose)."""
     used, reset = usage_load(usage.get(slot), now)
     hit = hits.get(slot)
     if isinstance(hit, (int, float)):
-        if reset is None or reset <= hit:  # no reset known after the hit: wait for a fresh reading
-            fresh = isinstance((usage.get(slot) or {}).get("seen_at"), (int, float)) and usage[slot]["seen_at"] > hit
-            if not fresh:
+        if early_reset(slot, usage, hits, now, levels):
+            return True
+        level = (levels or {}).get(slot) or {}
+        if isinstance(level.get("reset"), (int, float)) and level["reset"] > hit:
+            reset = level["reset"]  # a five-hour hit is over at its reset, not the weekly one
+        fresh = isinstance((usage.get(slot) or {}).get("seen_at"), (int, float)) and usage[slot]["seen_at"] > hit
+        if reset is None or reset <= hit:  # no reset known after the hit: wait for a fresh reading,
+            if not fresh or level.get("early") is False:  # ... and its reset after an early one
                 return False
         elif reset > now:
             return False
@@ -9278,14 +9329,14 @@ def read_limited() -> dict:
         data = read_json(LIMITED)
     except SleeperError:
         data = {}
-    for key in ("sessions", "hits", "notes"):
+    for key in ("sessions", "hits", "levels", "early", "notes"):
         if not isinstance(data.get(key), dict):
             data[key] = {}
     return data
 
 
 def prune_limited(data: dict, now: float) -> None:
-    for key in ("sessions", "hits", "notes"):
+    for key in ("sessions", "hits", "levels", "early", "notes"):
         data[key] = {k: v for k, v in data[key].items()
                      if now - float((v.get("at") if isinstance(v, dict) else v) or 0) < LIMIT_KEEP_SECONDS}
 
@@ -9424,14 +9475,21 @@ def after_limit(agent: dict, uuid: object, seq: object, config: dict, now: float
     slot = session_account(pid) if present is True else None
     active = active_account()
     data = read_limited()
+    usage = read_usage()
     if slot and slot != "explicit":
+        used, reset = usage_load(usage.get(slot), now)
+        retry = now - float(data["early"].get(slot) or -math.inf) < EARLY_RESET_RETRY_SECONDS
         data["hits"][slot] = now
+        data["levels"][slot] = {"at": now, "used": used, "reset": reset, "early": not retry}
     if valid_session_id(uuid):
         data["sessions"][str(uuid)] = {"slot": slot, "at": now, "pane": pane, "name": agent.get("name")}
     prune_limited(data, now)
     write_json(LIMITED, data)
-    usage = read_usage()
-    if active and slot and slot not in ("explicit", active) and slot_room(active, usage, data["hits"], now):
+    if (active and slot and slot not in ("explicit", active)
+            and slot_room(active, usage, data["hits"], now, data["levels"])):
+        if early_reset(active, usage, data["hits"], now, data["levels"]):
+            data["early"][active] = now
+            write_json(LIMITED, data)
         fresh = wait_until_settled(pane, seq)
         if fresh is None:
             event("limit-wait", pane=pane, uuid=uuid, slot=slot, why="pane did not settle after Enter")
@@ -9443,7 +9501,7 @@ def after_limit(agent: dict, uuid: object, seq: object, config: dict, now: float
         return delegated
     slots = sorted({*usage.keys(), *(s for s in (slot, active) if s and s != "explicit")})
     slots = [s for s in slots if ACCOUNT_SLOT.fullmatch(str(s))]
-    room = [s for s in slots if slot_room(s, usage, data["hits"], now)]
+    room = [s for s in slots if slot_room(s, usage, data["hits"], now, data["levels"])]
     event("limit-wait", pane=pane, uuid=uuid, slot=slot, active=active, room=room)
     if not room and slots:
         note_monitor(slots, usage, data, config, now)
@@ -9489,18 +9547,30 @@ def remind_limited(agents: list[dict], config: dict, now: float) -> dict | None:
         slot = rec.get("slot")
         if now - float(rec.get("at") or 0) < 60 or now - RESTART_TRIED.get(uuid, -math.inf) < RESTART_COOLDOWN_SECONDS:
             continue
-        if active and slot and slot != active and slot_room(active, usage, data["hits"], now):
+        if active and slot and slot != active and slot_room(active, usage, data["hits"], now, data["levels"]):
+            if early_reset(active, usage, data["hits"], now, data["levels"]):
+                data["early"][active] = now
+                changed = True
+            if changed:  # restart_agent reads and writes limited.json itself
+                write_json(LIMITED, data)
+                changed = False
             outcome, delegated = restart_agent(agent, None, 0.0, f"account {slot}", f"account {active}", "account",
                                                config, now)
             if not outcome.startswith(("refused", "wake failed", "restart failed")):
                 return delegated  # restart_agent queued the continue note
+            data = read_limited()
             continue
-        if slot and slot_room(slot, usage, data["hits"], now):
+        if slot and slot_room(slot, usage, data["hits"], now, data["levels"]):
+            early = early_reset(slot, usage, data["hits"], now, data["levels"])
+            if early:
+                data["early"][slot] = now
             data["sessions"].pop(uuid)
             data["hits"].pop(slot, None)
+            data["levels"].pop(slot, None)
             changed = True
             queue_note(uuid, RESET_NOTE.format(slot=slot), f"limit-reset-{uuid[:8]}-{int(float(rec['at']))}")
-            event("limit-continue", uuid=uuid, slot=slot, name=rec.get("name"), why="reset passed")
+            event("limit-continue", uuid=uuid, slot=slot, name=rec.get("name"),
+                  why="early reset" if early else "reset passed")
     if changed:
         write_json(LIMITED, data)
     return None
