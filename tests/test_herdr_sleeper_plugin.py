@@ -4156,9 +4156,108 @@ def test_a_spawn_prompt_whose_pane_dies_first_is_dropped_and_logged(fake: FakeHe
     msg_id = sleeper.read_json(sleeper.SPAWNED)["impl-1"]["prompt"]["id"]
     fake.agents = [a for a in fake.agents if a.get("started_name") != "impl-1"]   # its tab closed by hand
     sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "spawn-prompt-dropped" not in events()                      # misses within 45 s are not enough
+    _later(monkeypatch, sleeper.SPAWN_PROMPT_MISS_SECONDS + 1)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
     assert "spawn-prompt-dropped" in events() and _typed_prompts(fake) == []
     assert f"first prompt (msg {msg_id}) dropped" in sleeper.LOGFILE.read_text()
     assert "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"] and not sleeper.mail_waiting()
+
+
+OTHER_UUID = "9a9a9a9a-0000-4000-8000-0000000000aa"
+
+
+def _later(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    at = time.time() + seconds
+    monkeypatch.setattr(sleeper.time, "time", lambda: at)
+
+
+def _queued_spawn(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, checkout: Path,
+                  extra: list[str] | None = None) -> tuple[dict[str, Any], str]:
+    """A claude spawn whose session id never came during spawn: (its pane row, the prompt's msg id)."""
+    _late_session(fake, monkeypatch, after=None)
+    assert _spawn(monkeypatch, checkout, extra=extra) == 3
+    pane = next(a for a in fake.agents if a.get("started_name") == "impl-1")
+    return pane, sleeper.read_json(sleeper.SPAWNED)["impl-1"]["prompt"]["id"]
+
+
+def test_a_spawn_prompt_never_goes_to_another_claude_on_a_reused_pane_id(fake: FakeHerdr, checkout: Path,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    pane, msg_id = _queued_spawn(fake, monkeypatch, checkout)
+    assert sleeper.read_json(sleeper.SPAWNED)["impl-1"]["terminal_id"] == pane["terminal_id"]
+    pane.update(terminal_id="term-other", name="other", agent_session={"value": OTHER_UUID})  # the id handed on
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    _later(monkeypatch, sleeper.SPAWN_PROMPT_MISS_SECONDS + 1)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert _typed_prompts(fake) == [] and sleeper.pending_mail(OTHER_UUID) == []
+    assert "spawn-prompt-dropped" in events() and f"first prompt (msg {msg_id}) dropped" in sleeper.LOGFILE.read_text()
+
+
+def test_a_spawn_prompt_survives_one_blank_sample(fake: FakeHerdr, checkout: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    pane, _msg_id = _queued_spawn(fake, monkeypatch, checkout)
+    kind = pane.pop("agent")                                           # Herdr lost the agent for a moment
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "missing_since" in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    pane.update(agent=kind, agent_session={"value": SPAWNED_UUID})
+    _later(monkeypatch, sleeper.SPAWN_PROMPT_MISS_SECONDS + 1)          # back before a second miss
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert len(_typed_prompts(fake)) == 1 and "spawn-prompt-dropped" not in events()
+    assert "missing_since" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+
+
+def test_a_spawn_prompt_goes_with_its_record_after_an_hour(fake: FakeHerdr, checkout: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    _pane, msg_id = _queued_spawn(fake, monkeypatch, checkout)
+    fake.agents = [a for a in fake.agents if a.get("started_name") != "impl-1"]
+    _later(monkeypatch, 2 * 3600)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))                     # prune_spawned runs before the flush
+    assert "impl-1" not in sleeper.read_json(sleeper.SPAWNED) and "spawn-record-dropped" in events()
+    dropped = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()
+               if json.loads(l)["event"] == "spawn-prompt-dropped"]
+    assert [d["reason"] for d in dropped] == ["spawn record dropped"] and dropped[0]["id"] == msg_id
+    assert f"first prompt (msg {msg_id}) dropped with its spawn record" in sleeper.LOGFILE.read_text()
+
+
+def test_a_spawn_prompt_without_a_session_id_for_an_hour_is_dropped(fake: FakeHerdr, checkout: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    _pane, msg_id = _queued_spawn(fake, monkeypatch, checkout)        # the pane lives on, no session id
+    _later(monkeypatch, 2 * 3600)
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"] and _typed_prompts(fake) == []
+    assert "reported no session id within 60 minutes" in sleeper.LOGFILE.read_text()
+
+
+def test_a_spawn_resume_that_comes_up_late_as_another_session_is_closed(fake: FakeHerdr, checkout: Path, state: Path,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    _resumable(state, checkout)
+    fake.resume_is_spawn = True
+    pane, msg_id = _queued_spawn(fake, monkeypatch, checkout, extra=["--resume", SPAWNED_UUID])
+    pane["agent_session"] = {"value": UUID}                            # not the session it was to resume
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert _typed_prompts(fake) == [] and sleeper.pending_mail(UUID) == []
+    assert ("tab", "close", "w1:t8") in fake.calls and not any(a["pane_id"] == "w1:p8" for a in fake.agents)
+    assert "impl-1" not in sleeper.read_json(sleeper.SPAWNED) and "spawn-failed" in events()
+    assert "was to resume session 5f0c1d2e but runs 20603f77" in sleeper.LOGFILE.read_text()
+
+
+def test_a_spawn_prompt_still_pending_is_not_queued_twice(fake: FakeHerdr, checkout: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    pane, msg_id = _queued_spawn(fake, monkeypatch, checkout)
+    rec = sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    pane.update(agent_session={"value": SPAWNED_UUID}, agent_status="working")   # busy: it stays queued
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert len(sleeper.pending_mail(SPAWNED_UUID)) == 1 and _typed_prompts(fake) == []
+    sleeper.record_spawned("impl-1", rec)        # as if the watcher stopped before letting go of it
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert len(sleeper.pending_mail(SPAWNED_UUID)) == 1 and "prompt" not in sleeper.read_json(sleeper.SPAWNED)["impl-1"]
+    pane["agent_status"] = "idle"
+    sleeper.watch_tick({}, dict(sleeper.DEFAULTS))
+    assert len(_typed_prompts(fake)) == 1 and sleeper.pending_mail(SPAWNED_UUID) == []
+    queued = [json.loads(l) for l in sleeper.EVENTS.read_text().splitlines()
+              if json.loads(l)["event"] == "deliver-queued"]
+    assert [q["id"] for q in queued] == [msg_id]                       # once, from the watcher
 
 
 def test_a_spawn_whose_agent_quits_before_its_session_id_fails(fake: FakeHerdr, checkout: Path,

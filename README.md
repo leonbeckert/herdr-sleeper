@@ -713,17 +713,22 @@ below), 1 refused or failed, 2 bad input.
 after `agent start` returns (2026-11-17 on mini2: 13–43 s, three spawns in a
 day). `spawn` waits up to 90 s for it (was 15 s, after which the prompt was
 dropped and spawn exited 1). Still none: the first prompt is kept in the
-spawn record under its message id, spawn says so and exits 3 (started, prompt
-queued, as for a session that is not idle yet), and the watcher
-(every tick, and every 5 s while it waits) moves it into the session's mailbox
-once the pane reports a session; from there it is typed in like any
-`deliver`, once the agent is idle. The id makes it go in once, even if the
-watcher stops between queueing and letting go of it. It is dropped, with a
-`spawn-prompt-dropped` event and a log line, when the pane is gone or its
-agent quit before reporting (a pane moved meanwhile is found by its agent
-name), when a `--resume` came up as another session, or after an hour without
-a session id. An agent that quits during spawn's own wait fails the spawn
-(exit 1, nothing queued).
+spawn record under its message id, with the pane's terminal id, and spawn
+says so and exits 3 (started, prompt queued, as for a session that is not
+idle yet). The watcher (every tick, and every 5 s while it waits) moves it
+into the session's mailbox once the pane reports a session, logs
+`deliver-queued` then, and from there it is typed in like any `deliver`, once
+the agent is idle. The id makes it go in once, even if the watcher stops
+between queueing and letting go of it. The pane counts only on the recorded
+terminal (Herdr reuses pane ids); a pane moved meanwhile, or one after a Herdr
+restart, is found by its agent name. The prompt is dropped, with a
+`spawn-prompt-dropped` event and a log line, when that agent is missed for
+45 s (pane gone, its id taken by another terminal, the agent quit), after an
+hour without a session id, or with its spawn record. A `--resume` that comes
+up as another session has its tab closed (`spawn-failed`,
+`resume-mismatch`), as spawn's own check does. An agent that quits during
+spawn's own wait ends the wait and fails the spawn (exit 1, nothing queued).
+A remote spawn's time limit grows by the 90 s (`REMOTE_SPAWN_SECONDS`, 590 s).
 
 ### opencode lanes (`--kind opencode`, *v0.1.35*)
 

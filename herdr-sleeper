@@ -4123,6 +4123,7 @@ SPAWN_SHELL_SECONDS = 20         # how long a new tab may take to show its shell
 SPAWN_BUSY_RETRIES = 3           # more `agent start` tries when a fresh pane answers agent_pane_busy
 SPAWN_BUSY_PAUSE_SECONDS = 2
 SPAWN_SESSION_SECONDS = 90       # how long spawn waits for a claude's session id (2026-11-17: 13-43 s after start)
+SPAWN_PROMPT_MISS_SECONDS = 45   # a waiting first prompt is dropped once its agent was missed this long
 SPAWNED = STATE_DIR / "spawned.json"  # session name -> who spawned it and where (close, presence)
 
 # opencode lanes (ansible-orchestration docs/macos/plan.opencode-herdr.md, Phase 4b). The policy file is
@@ -4596,28 +4597,58 @@ def waiting_spawn_prompts() -> dict[str, dict]:
             if isinstance(r.get("prompt"), dict) and MSG_ID_RE.fullmatch(str(r["prompt"].get("id")))}
 
 
-def drop_spawn_prompt(name: str, msg_id: str, why: str, uuid: str | None = None) -> None:
-    """Take a first prompt out of its spawn record (queued, or given up). Only that very prompt: a
-    record another spawn holds by now is left alone."""
+def drop_spawn_prompt(name: str, msg_id: str, why: str, uuid: str | None = None, forget: bool = False) -> None:
+    """Take a first prompt out of its spawn record: queued (uuid given: the record learns the session),
+    or given up (logged; forget drops the whole record). Only that very prompt: a record another spawn
+    holds by now is left alone."""
     with locked():
         rec = spawned_records().get(name)
         if rec is None or (rec.get("prompt") or {}).get("id") != msg_id:
             return
-        rec = {k: v for k, v in rec.items() if k != "prompt"}
+        rec = {k: v for k, v in rec.items() if k not in ("prompt", "missing_since")}
         if uuid:
             rec["uuid"] = uuid
-        record_spawned(name, rec)
+        record_spawned(name, None if forget else rec)
     if not uuid:
         event("spawn-prompt-dropped", name=name, pane=rec.get("pane"), id=msg_id, reason=why)
         say(f"spawn {name}: first prompt (msg {msg_id}) dropped: {why}")
+
+
+def mark_spawn_missing(name: str, msg_id: str, since: float | None) -> None:
+    """Set (a float) or clear (None) when a waiting prompt's agent was first missed."""
+    with locked():
+        rec = spawned_records().get(name)
+        if rec is None or (rec.get("prompt") or {}).get("id") != msg_id or rec.get("missing_since") == since:
+            return
+        rec = {k: v for k, v in rec.items() if k != "missing_since"}
+        if since is not None:
+            rec["missing_since"] = since
+        record_spawned(name, rec)
+
+
+def spawn_row(name: str, rec: dict, agents: list[dict]) -> dict | None:
+    """The agent a waiting spawn prompt belongs to, or None. Herdr reuses pane ids, so the row at the
+    recorded pane counts only on the terminal spawn recorded (identity "same"), or, with no terminal
+    on either side, under the spawn's name; a pane moved meanwhile (new id) or a Herdr restart (new
+    terminal ids) is found by the agent's name, which `spawn` made unique on this machine."""
+    kind = rec.get("kind")
+    row = next((a for a in agents if a["pane_id"] == rec.get("pane")), None)
+    if row is not None and row.get("agent") == kind:
+        same = identity({"terminal_id": rec.get("terminal_id")}, row)
+        if same == "same" or (same == "unknown" and row.get("name") == name):
+            return row
+    named = [a for a in agents if a.get("name") == name and a.get("agent") == kind]
+    return named[0] if len(named) == 1 else None
 
 
 def settle_spawn_prompts(now: float | None = None) -> None:
     """Watcher, before the mail flush: a spawn's first prompt that waits for its session id goes into
     that session's mailbox once the pane reports one, under the id spawn gave it, so the flush types it
     in like any `deliver` (queue_message never queues an id twice, nor one delivered already). The
-    record lets go of it only after it is queued. A pane whose agent is gone, a resume that came up as
-    another session, or a wait past SPAWN_RECORD_GRACE_SECONDS drops it, with a log line."""
+    record lets go of it only after it is queued. Dropped, with a log line: an agent missed for
+    SPAWN_PROMPT_MISS_SECONDS (its pane gone, the pane id taken by another terminal, the agent quit),
+    no session id within SPAWN_RECORD_GRACE_SECONDS, or a resume that came up as another session
+    (whose tab is closed, as spawn's own check does)."""
     waiting = waiting_spawn_prompts()
     if not waiting:
         return
@@ -4625,14 +4656,17 @@ def settle_spawn_prompts(now: float | None = None) -> None:
     now = time.time() if now is None else now
     for name, rec in waiting.items():
         prompt, pane = rec["prompt"], rec.get("pane")
-        row = next((a for a in agents if a["pane_id"] == pane), None)
-        if row is None:  # a moved pane gets a new id; Herdr keeps the agent's name
-            named = [a for a in agents if a.get("name") == name and a.get("agent") == rec.get("kind")]
-            row = named[0] if len(named) == 1 else None
-        if row is None or row.get("agent") != rec.get("kind"):
-            drop_spawn_prompt(name, prompt["id"], f"its pane {pane} is gone or its agent quit before it "
-                                                  "reported a session")
+        row = spawn_row(name, rec, agents)
+        if row is None:
+            since = rec.get("missing_since")
+            if not _number(since):
+                mark_spawn_missing(name, prompt["id"], now)
+            elif now - since >= SPAWN_PROMPT_MISS_SECONDS:
+                drop_spawn_prompt(name, prompt["id"], f"its pane {pane} is gone or its agent quit before it "
+                                                      f"reported a session (missed for {int(now - since)}s)")
             continue
+        if rec.get("missing_since") is not None:
+            mark_spawn_missing(name, prompt["id"], None)
         uuid = (row.get("agent_session") or {}).get("value")
         if not valid_session_id(uuid):
             try:
@@ -4644,8 +4678,13 @@ def settle_spawn_prompts(now: float | None = None) -> None:
                                                       f"{SPAWN_RECORD_GRACE_SECONDS // 60} minutes")
             continue
         if rec.get("resumed") and uuid != rec["resumed"]:
-            drop_spawn_prompt(name, prompt["id"], f"{pane} was to resume session {rec['resumed'][:8]} but runs "
-                                                  f"{uuid[:8]}")
+            # claude started another (empty) session: the work belongs to the requested one (spawn_started)
+            with contextlib.suppress(SleeperError):
+                close_tab_or_pane(row["pane_id"], row.get("tab_id") or rec.get("tab"))
+            event("spawn-failed", name=name, by=rec.get("by"), cwd=rec.get("cwd"), kind=rec.get("kind"),
+                  code="resume-mismatch")
+            drop_spawn_prompt(name, prompt["id"], f"{row['pane_id']} was to resume session {rec['resumed'][:8]} "
+                                                  f"but runs {uuid[:8]}; its tab closed", forget=True)
             continue
         with mailbox_lock(uuid, wait=False) as got:
             if not got:
@@ -4834,7 +4873,10 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
         if valid_session_id(uuid):
             break
         time.sleep(1)
-        uuid = ((herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent_session") or {}).get("value")
+        info = herdr("pane", "get", pane, check=False).get("pane") or {}
+        uuid = (info.get("agent_session") or {}).get("value")
+        if not info.get("agent"):
+            break  # no agent there any more (or no answer): the `agent list` check below decides
     resumed = spawn_resume_id(extra) if args.kind == "claude" else None
     if resumed and valid_session_id(uuid) and uuid != resumed:
         # claude started another (empty) session: the work belongs to the requested one, so nothing is typed
@@ -4850,6 +4892,8 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
            "at": dt.datetime.now().isoformat(timespec="seconds")}
     if resumed:
         rec["resumed"] = resumed
+    if made["root_pane"].get("terminal_id"):
+        rec["terminal_id"] = made["root_pane"]["terminal_id"]  # the pane id alone may be reused (identity)
     alive = True
     if not rec["uuid"]:
         # no session id yet (2026-11-17: claude reported it 13-43 s after start): the first prompt waits in
@@ -4863,16 +4907,15 @@ def spawn_started(args: argparse.Namespace, cwd: Path, body: str, extra: list[st
     with locked():
         record_spawned(args.name, rec)
     event("spawned", name=args.name, pane=pane, tab=tab, uuid=rec["uuid"], kind=args.kind, cwd=str(cwd),
-          by=sender, from_pane=from_pane, **({"resumed": resumed} if resumed else {}))
+          by=sender, from_pane=from_pane, **({"resumed": resumed} if resumed else {}),
+          **({"prompt_waits": rec["prompt"]["id"]} if rec.get("prompt") else {}))
     if not rec["uuid"]:
         if not alive:
             event("spawn-prompt-dropped", name=args.name, pane=pane, reason="agent gone before it reported a session")
             print(f"spawn: {args.name} in {pane} (tab {tab}) quit before it reported a session id; first prompt "
                   "not typed", file=sys.stderr)
             return 1
-        msg_id = rec["prompt"]["id"]
-        event("deliver-queued", id=msg_id, sender=sender, from_pane=from_pane, to=args.name, uuid=None,
-              target_state="spawning", bytes=len(body.encode()))
+        msg_id = rec["prompt"]["id"]  # deliver-queued comes from the watcher, once it is in the mailbox
         out = {"name": args.name, "pane": pane, "tab": tab, "session": None, "prompt": "queued"}
         print(json.dumps(out) if args.json else
               f"spawned {args.name} in {pane} (tab {tab}); it reports no session id after {SPAWN_SESSION_SECONDS}s, "
@@ -7407,7 +7450,8 @@ REMOTE_SECONDS = 20                 # presence, insomnia list, close: one round 
 REMOTE_HOOK_SECONDS = 6             # ListAgents waits this long at most, for all machines together
 REMOTE_WAIT_SECONDS = WAKE_TIMEOUT_MS / 1000 + 2 * DELIVER_READY_SECONDS + 120  # deliver/wake: a wake, the prompt
 # also covers an opencode lane's composer wait, first prompt and session poll (about 135 s) in place of the delivery
-REMOTE_SPAWN_SECONDS = SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + 2 * DELIVER_READY_SECONDS + 120
+REMOTE_SPAWN_SECONDS = (SPAWN_READY_MS / 1000 + SPAWN_SHELL_SECONDS + SPAWN_SESSION_SECONDS
+                        + 2 * DELIVER_READY_SECONDS + 120)
 PRESENCE_FIELDS = ("state", "name", "claude_name", "pane", "place", "kind", "cwd", "session", "slept_at",
                    "insomnia", "spawned_by", "mail_queued", "mail_oldest_s", "mail_held",
                    "closing")  # an older machine sends no mail_*, closing or place
