@@ -5434,8 +5434,11 @@ def close_session(uuid: str, target: str, by: str, force: bool, self_close_at: f
             if phase in RETIRABLE_PHASES and not info and sleeper_gone(hit):
                 done = retire_gone_row(str(key), hit, name, by, phase)
                 if done[0]:
+                    spawned_name, spawned = spawn_record_of(uuid)
+                    if spawned_name:  # recorded here: prune_spawned must not record it again as gone
+                        record_spawned(spawned_name, None)
                     record_close(uuid, name, hit.get("kind"), hit.get("cwd"), by, session_facts("asleep", hit, key),
-                                 spawn_record_of(uuid)[1], summary, note=f"its {phase} pane was gone already",
+                                 spawned, summary, note=f"its {phase} pane was gone already",
                                  claude_name=hit.get("claude_name"))
                 return done
             if phase != "asleep" or identity(hit, info) not in ("same", "restarted") \
@@ -5655,7 +5658,7 @@ def tend_self_closes(now: float | None = None) -> None:
 # gives them (`close --self --task … --how … --result …`, or a closer with `close NAME …`); a close
 # without them takes the first prompt and the last reply from the transcript, marked as such. A
 # spawned session that vanished without a close (tab closed by hand, the agent quit) is recorded once
-# it has been gone CLOSED_GONE_SECONDS. `closed` lists the records (every machine with --all);
+# it has been gone CLOSED_GONE_SECONDS and its spawn is SPAWN_RECORD_GRACE_SECONDS old. `closed` lists the records (every machine with --all);
 # `reopen` resumes one through spawn's checks (transcript present, same cwd, not live or asleep).
 # Records go after CLOSED_KEEP_DAYS once the file passes CLOSED_MAX_BYTES; transcripts are never touched.
 CLOSED = STATE_DIR / "closed.jsonl"
@@ -5678,8 +5681,15 @@ SECRET_PATTERNS = (
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}"
                r"|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})"),
 )
+# a secret-named key's value: KEY=v, key: v, "key": "v"; a value counts when it has a digit or a symbol, or
+# is 16+ characters (prose like `password: required` stays)
 SECRET_ASSIGN = re.compile(r"(?i)\b([A-Za-z0-9_]*(?:secret|token|passw(?:or)?d|api_?key|private_key|credential)"
-                           r"[A-Za-z0-9_]*)(\s*[=:]\s*)(\"[^\"\s]{6,}\"|'[^'\s]{6,}'|[^\s,;]{6,})")
+                           r"[A-Za-z0-9_]*[\"']?)(\s*[=:]\s*)(?!Bearer\b)(\"[^\"\s]{6,}\"|'[^'\s]{6,}'|"
+                           r"(?=[^\s,;]*[0-9!#$%&*+/=?@^~])[^\s,;]{6,}|[^\s,;]{16,})")
+SECRET_BEARER = re.compile(r"(?i)\b(Bearer|Basic|Authorization:)\s+[A-Za-z0-9._~+/=-]{8,}")
+SECRET_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")
+KEBAB = re.compile(r"-?(?:[A-Za-z0-9]{1,20}-){2,}[A-Za-z0-9]{1,20}")  # a path-like name (a Claude project dir)
+REDACT_SPAN = 8000   # characters of a transcript text the filter reads; the record keeps SUMMARY_MAX
 # a long run of mixed case and digits (an API key, a base64 blob); "/" breaks a run, so paths stay
 SECRET_RUN = re.compile(r"(?<![A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*[A-Z])(?=[A-Za-z0-9+_-]*[a-z])"
                         r"(?=[A-Za-z0-9+_-]*[0-9])[A-Za-z0-9+_-]{40,}={0,2}")
@@ -5689,10 +5699,13 @@ REDACTED = "[redacted]"
 def redact(text: str) -> str:
     """text with credential-looking values replaced (a key's name stays, its value goes). Commit and
     session ids (hex, uuids) are kept: they are what a result names."""
+    text = text.replace(OWNER_ANSWER_HEADER, "[owner's answer")  # only an ask panel's mail may carry it
     for pat in SECRET_PATTERNS:
         text = pat.sub(REDACTED, text)
+    text = SECRET_BEARER.sub(lambda m: f"{m.group(1)} {REDACTED}", text)
+    text = SECRET_URL.sub(lambda m: m.group(1) + REDACTED + "@", text)
     text = SECRET_ASSIGN.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
-    return SECRET_RUN.sub(REDACTED, text)
+    return SECRET_RUN.sub(lambda m: m.group(0) if KEBAB.fullmatch(m.group(0)) else REDACTED, text)
 
 
 def one_line(text: object, limit: int = SUMMARY_MAX) -> str:
@@ -5833,15 +5846,15 @@ def fallback_summary(uuid: str, kind: object, name: str | None) -> dict:
     the last message this session sent that the archive holds. Marked by summary_source."""
     if kind == "claude":
         facts = transcript_facts(transcript_for(uuid))
-        out = {k: redact(one_line(facts[src])) for k, src in (("task", "first_prompt"), ("result", "last_reply"))
-               if facts.get(src)}
+        out = {k: one_line(redact(facts[src][:REDACT_SPAN])) for k, src in (("task", "first_prompt"),
+                                                                             ("result", "last_reply")) if facts.get(src)}
         if out:
             return dict(out, summary_source="transcript")
     if name:
         sent = [m for m in archive_all() if str(m.get("from", "")).split("/")[-1] == name]
         if sent:
             last = max(sent, key=lambda m: m.get("at_ns") or 0)
-            return {"result": redact(one_line(last.get("body"))), "summary_source": "last message"}
+            return {"result": one_line(redact(str(last.get("body"))[:REDACT_SPAN])), "summary_source": "last message"}
     return {}
 
 
@@ -5883,13 +5896,13 @@ def append_closed(rec: dict) -> None:
         with closed_lock():
             # not append_private: that rotates at LOG_MAX_BYTES and takes this very lock file
             with os.fdopen(open_private(CLOSED, os.O_WRONLY | os.O_APPEND), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(rec) + "\n")  # ASCII: a lone surrogate from a transcript can't break it
             if CLOSED.stat().st_size > CLOSED_MAX_BYTES:
                 cutoff = time.time() - CLOSED_KEEP_DAYS * 86400
                 keep = [r for r in read_closed() if (_ts(r.get("at")) or 0) >= cutoff][-CLOSED_KEEP_MAX:]
                 tmp = CLOSED.with_name(CLOSED.name + ".tmp")
                 with os.fdopen(open_private(tmp, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as fh:
-                    fh.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in keep)
+                    fh.writelines(json.dumps(r) + "\n" for r in keep)
                     fh.flush()
                     full_sync(fh.fileno())
                 os.replace(tmp, CLOSED)
@@ -6120,7 +6133,7 @@ def cmd_closed(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"closed: {exc}", file=sys.stderr)
         return 2
-    if args.grep is not None and not REMOTE_ARG_RE.fullmatch(args.grep):
+    if args.grep is not None and (args.all or args.machine) and not REMOTE_ARG_RE.fullmatch(args.grep):
         print("closed: --grep takes letters, digits, spaces and ./:@=,+~%_- only", file=sys.stderr)
         return 2
     passed = ((["--since", args.since] if args.since else []) + (["--grep", args.grep] if args.grep else [])
@@ -6159,7 +6172,8 @@ def cmd_closed(args: argparse.Namespace) -> int:
     newest: set[tuple[object, object]] = set()  # reopen by name only where the name means this very record
     for i, rec in enumerate(rows):
         key = (rec.get("machine"), rec.get("name"))
-        by_name = rec.get("name") and SPAWN_NAME_RE.fullmatch(str(rec["name"])) and key not in newest \
+        by_name = not (since or args.grep) and rec.get("name") and SPAWN_NAME_RE.fullmatch(str(rec["name"])) \
+            and key not in newest \
             and not re.fullmatch(r"[0-9a-f-]{8,}", str(rec["name"]))
         newest.add(key)
         if i:

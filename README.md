@@ -960,13 +960,14 @@ echo "also do B-18" | herdr-sleeper reopen [MACHINE/]NAME|SESSION-ID [--name NEW
   header) as the task and its last reply as the result (`"transcript"`;
   codex and opencode: the last message the session sent, `"last message"`).
   Text taken from a transcript goes through a credential filter (private key
-  blocks, GitHub/GitLab/Slack/AWS/OpenAI-style tokens, `*_TOKEN=value`-like
-  assignments, 40+ character mixed-case runs); commit and session ids and
-  paths stay. Given summaries pass the agents' own Bash guardrails already.
+  blocks, GitHub/GitLab/Slack/AWS/OpenAI-style tokens, `Bearer`/`Basic`
+  values, URL passwords, `*_TOKEN=value`/`"token": "…"` assignments, 40+
+  character mixed-case runs), run before the text is cut to 500 characters;
+  commit and session ids, paths and kebab-case names stay. Given summaries pass the agents' own Bash guardrails already.
   `close NAME` on another machine sends its summary over stdin, not argv.
 - **Closed without a close.** A spawned session whose tab was closed by hand
   or whose agent quit is recorded (`closed_by: "gone"`, with when it was first
-  missed) once it has been missing for 10 minutes; one missed tick (a Herdr
+  missed) once it has been missing for 10 minutes and its spawn is an hour old; one missed tick (a Herdr
   restart, an account restart) records nothing. A sleep row retired because its
   pane is gone is recorded too. Sessions that were never spawned and vanish
   by hand are not (Herdr restarts and `/clear` make "gone" too noisy there).

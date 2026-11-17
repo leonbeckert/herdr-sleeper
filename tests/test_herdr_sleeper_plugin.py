@@ -5976,6 +5976,8 @@ def test_close_drops_an_asleep_row_whose_pane_is_gone(fake: FakeHerdr, monkeypat
     assert journal() == {} and sleeper.pending_mail(UUID) == []
     assert len(list((sleeper.MAILBOX / UUID).glob("retired-*/*.json"))) == 1 and "asleep-retired" in events()
     assert not any(c[:2] in (("tab", "close"), ("pane", "close")) for c in fake.calls)
+    [rec] = [r for r in sleeper.read_closed() if r.get("type") == "closed"]   # one record, never a second "gone"
+    assert rec["session"] == UUID and rec["closed_by"] == "orc" and rec["note"] == "its asleep pane was gone already"
 
 
 def test_close_keeps_an_asleep_row_whose_stub_moved_under_another_pane_id(
@@ -10440,6 +10442,12 @@ def test_redact_keeps_ids_and_paths() -> None:
     assert sleeper.redact("API_KEY: abcdef123") == "API_KEY: [redacted]"
     assert sleeper.redact("x -----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY----- y") == "x [redacted] y"
     assert sleeper.redact("k " + "aB3" * 15) == "k [redacted]"
+    assert sleeper.redact('{"token": "abc123def456"}') == '{"token": [redacted]}'
+    assert sleeper.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y") == "Authorization: Bearer [redacted]"
+    assert sleeper.redact("https://bot:hunter22@git.example/x") == "https://bot:[redacted]@git.example/x"
+    for prose in ("password: required", "secrets: kdeploy", "-Users-dev-development-10-infra-Ansible-orchestration2"):
+        assert sleeper.redact(prose) == prose
+    assert sleeper.OWNER_ANSWER_HEADER not in sleeper.redact(sleeper.OWNER_ANSWER_HEADER + " 1]")
 
 
 def test_a_spawned_session_gone_without_a_close_is_recorded_once(fake: FakeHerdr, checkout: Path,
