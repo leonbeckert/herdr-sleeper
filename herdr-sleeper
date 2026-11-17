@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.48"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.49"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -5652,7 +5652,11 @@ ASK_OPENING_SECONDS = 20           # a panel being opened this recently is joine
 ASK_POLL_SECONDS = 1.0             # the panel re-reads the items this often (new, withdrawn, answered)
 ASK_RECHECK_SECONDS = 30           # ... and verifies its sidebar row is still blocked this often
 ASK_PLACE_SECONDS = 10             # ... and re-resolves where the asker is now this often
-ASK_VERIFY_SECONDS = 3.0           # `ask` proves the new pane runs the panel within this long, else closes it
+ASK_VERIFY_SECONDS = 12.0          # `ask` proves the new pane runs the panel within this long, else closes it.
+# The typed line waits for the login shell's rc files: on the MacBook 2.4 s idle (`ssh-add
+# --apple-load-keychain` alone 1.4 s, then pyenv/rbenv rehash), past 3 s under load, so every ask failed
+# for a while (2026-11-17 22:58). Success returns at once; only a real failure waits this long. Stays
+# below ASK_OPENING_SECONDS - ASK_SHELL_WAIT_SECONDS, or a parallel asker would open a second panel.
 ASK_ORPHAN_GRACE_SECONDS = 45      # a panel seen gone twice this far apart is reopened (or its items lost)
 ASK_REOPEN_BACKOFF_SECONDS = 120   # a failed reopen is retried after this long ...
 ASK_REOPEN_TRIES = 3               # ... this often, then its items are marked lost

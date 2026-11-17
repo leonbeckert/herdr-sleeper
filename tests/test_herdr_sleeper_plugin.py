@@ -10273,3 +10273,9 @@ def test_codex_continue_last_look_needs_the_empty_composer_too(fake: FakeHerdr, 
     sleeper.flush_mail(fake.agents)
     assert [c for c in fake.calls if c[:2] == ("agent", "prompt")] == []
     assert ev("codex-continue-dropped")[-1]["reason"] == "the composer is not empty at the last look"
+
+
+def test_ask_verify_window_covers_a_slow_login_shell_and_stays_inside_the_opening_reservation() -> None:
+    # 2026-11-17: the MacBook's login shell needs ~2.4 s before a typed line runs; 3 s failed every ask.
+    assert sleeper.ASK_VERIFY_SECONDS >= 10
+    assert sleeper.ASK_SHELL_WAIT_SECONDS + sleeper.ASK_VERIFY_SECONDS < sleeper.ASK_OPENING_SECONDS
