@@ -1322,7 +1322,9 @@ introduces are marked.
    another pane; no insomnia claim (*v0.1.3*; unreadable claims hold every
    session); idle ≥ window; original argv safely replayable
    (`--fork-session`, `--print`, `--session-id`, positional prompts,
-   anything after `--`, options of unknown arity → refuse).
+   anything after `--`, options of unknown arity → refuse; *v0.1.56:*
+   `--plugin-dir`, `--allowed-tools`/`--disallowed-tools` replay with one
+   value, a second separate value refuses as positional input).
 2. Everything is re-checked after the journal write and immediately before
    the exit, including that `state_change_seq` and the session id have not
    moved; the exit targets the pane id, never the name; "exited" needs

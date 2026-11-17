@@ -498,6 +498,11 @@ def test_replayable_argv_strips_session_selectors() -> None:
     assert ok(["--dangerously-skip-permissions", "--chrome", "-n", "chrome-agents"])[1] is None
     assert ok(["--permission-mode", "auto", "--effort", "high", "--no-chrome"]) == \
         (["--permission-mode", "auto", "--effort", "high", "--no-chrome"], None)
+    # B-519: sessions started with a plugin dir or a tool list stayed on the old build
+    assert ok(["--plugin-dir", "/p/x", "--allowed-tools", "Bash(git:*) Edit"]) == \
+        (["--plugin-dir", "/p/x", "--allowed-tools", "Bash(git:*) Edit"], None)
+    assert ok(["--allowedTools=Bash", "--disallowed-tools", "WebFetch"])[1] is None
+    assert "positional" in ok(["--allowed-tools", "Bash", "Edit"])[1]   # several values: never a guess
 
 
 @pytest.mark.parametrize(
