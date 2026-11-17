@@ -1540,10 +1540,36 @@ def _age_seconds(stamp: object, now: float) -> float:
 CRON_SCAN: dict[str, dict] = {}  # transcript path -> {ino, offset, events}: what cron_jobs has read
 
 
+CRON_ONESHOT_GRACE_SECONDS = 600   # a one-shot fires when the REPL is idle: allow it to run late
+
+
+def oneshot_fire_time(cron: object, created: float) -> float | None:
+    """When a one-shot CronCreate (recurring: false) fires: the first local time at or after its
+    creation that matches its pinned minute, hour, day and month. None when the cron pins none
+    of those (then it counts like a recurring job)."""
+    fields = str(cron).split()
+    if len(fields) != 5 or not all(f.isdigit() for f in fields[:4]):
+        return None
+    minute, hour, day, month = (int(f) for f in fields[:4])
+    year = dt.datetime.fromtimestamp(created).year
+    for y in (year, year + 1):
+        try:
+            at = dt.datetime(y, month, day, hour, minute).timestamp()
+        except ValueError:
+            return None
+        if at >= created - 120:   # the scheduler may run a one-shot up to 90 s early
+            return at
+    return None
+
+
 def cron_jobs(path: Path, now: float) -> int:
-    """Session cron jobs still scheduled: CronCreate minus CronDelete over the whole transcript,
-    within CRON_HORIZON_SECONDS. A cron made long before the tail would otherwise be missed;
-    the watcher keeps its read offset, so each tick reads only what was appended."""
+    """Session cron jobs still scheduled, over the whole transcript within CRON_HORIZON_SECONDS. A
+    CronCreate counts until a CronDelete names its job; a one-shot (recurring: false) also ends once
+    its pinned time has passed, as it deletes itself (opf-bench, macmini-prd-muc-02/efficiency msg
+    72300ef2, 2026-11-18: five fired one-shots blocked sleep and close for a week). A CronDelete of a
+    job whose id no CronCreate result shows ends the oldest job still counted. A cron made long before
+    the tail would otherwise be missed; the watcher keeps its read offset, so each tick reads only what
+    was appended."""
     st = path.stat()
     rec = CRON_SCAN.get(str(path))
     with path.open("rb") as fh:
@@ -1552,36 +1578,63 @@ def cron_jobs(path: Path, now: float) -> int:
             if fh.read(len(rec["mark"])) != rec["mark"]:
                 rec = None  # rewritten in place, not appended to: read it again
         if rec is None or rec["ino"] != st.st_ino or st.st_size < rec["offset"]:
-            rec = {"ino": st.st_ino, "offset": 0, "events": [], "mark": b""}
+            rec = {"ino": st.st_ino, "offset": 0, "events": [], "mark": b"", "results": {}}
         fh.seek(rec["offset"])
         pos = rec["offset"]
         for line in fh:
             if not line.endswith(b"\n"):
                 break  # a line still being written: read it whole next time
             pos += len(line)
-            if b'"Cron' not in line:
+            waiting = [u for u in rec["results"] if rec["results"][u] is None]
+            if b'"Cron' not in line and not (waiting and b"tool_result" in line
+                                             and any(u.encode() in line for u in waiting)):
                 continue
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("type") != "assistant":
+            if not isinstance(entry, dict) or entry.get("isSidechain"):
                 continue
             content = (entry.get("message") or {}).get("content")
-            for b in content if isinstance(content, list) else []:
-                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in ("CronCreate", "CronDelete"):
+            blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+            if entry.get("type") == "user":
+                for b in blocks:
+                    if b.get("type") == "tool_result" and rec["results"].get(b.get("tool_use_id"), "") is None:
+                        rec["results"][b["tool_use_id"]] = json.dumps(b.get("content"))[:2000]
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            for b in blocks:
+                if b.get("type") == "tool_use" and b.get("name") in ("CronCreate", "CronDelete"):
                     # an unparseable stamp ages from now: fail closed, the job counts for the whole horizon
                     stamp = now - _age_seconds(entry.get("timestamp"), now) if entry.get("timestamp") else now
-                    rec["events"].append((stamp, 1 if b["name"] == "CronCreate" else -1))
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    if b["name"] == "CronCreate":
+                        use = str(b.get("id") or f"anon-{pos}")
+                        fire = oneshot_fire_time(inp.get("cron"), stamp) if inp.get("recurring") is False else None
+                        rec["events"].append((stamp, "create", use, fire))
+                        rec["results"][use] = None
+                    else:
+                        rec["events"].append((stamp, "delete", str(inp.get("id") or ""), None))
         fh.seek(max(0, pos - 64))
         rec["mark"] = fh.read(pos - max(0, pos - 64))  # the bytes before the offset: proof of an append
     rec["offset"] = pos
-    rec["events"] = [(t, d) for t, d in rec["events"] if now - t < CRON_HORIZON_SECONDS]
+    rec["events"] = [e for e in rec["events"] if now - e[0] < CRON_HORIZON_SECONDS]
+    kept = {e[2] for e in rec["events"] if e[1] == "create"}
+    rec["results"] = {u: r for u, r in rec["results"].items() if u in kept}
     CRON_SCAN[str(path)] = rec
-    count = 0
-    for _t, d in rec["events"]:
-        count = max(0, count + d)
-    return count
+    active: list[tuple[str, float | None]] = []   # (CronCreate tool_use id, one-shot fire time)
+    for stamp, kind, ref, fire in sorted(rec["events"], key=lambda e: e[0]):
+        active = [(u, f) for u, f in active if f is None or f + CRON_ONESHOT_GRACE_SECONDS > stamp]
+        if kind == "create":
+            active.append((ref, fire))
+            continue
+        named = [u for u in rec["results"] if ref and ref in (rec["results"][u] or "")]
+        if named:   # the job it names: ended here, or already ended (a fired one-shot)
+            active = [(u, f) for u, f in active if u not in named]
+        elif active:
+            active.pop(0)
+    return sum(1 for _u, f in active if f is None or f + CRON_ONESHOT_GRACE_SECONDS > now)
 
 
 def scheduled_work(uuid: str) -> str | None:

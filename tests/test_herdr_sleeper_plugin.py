@@ -10917,3 +10917,44 @@ def test_close_never_resolves_by_tab_label(fake: FakeHerdr) -> None:
     fake.tab_labels = {"w1:t1": "moshi"}
     with pytest.raises(sleeper.SleeperError):
         sleeper.resolve_target("moshi", fake.agents, {})
+
+
+def _cron_result(use_id: str, at: str, text: str) -> str:
+    return _line(type="user", timestamp=at, message={"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": use_id, "content": text}]})
+
+
+def _create(use_id: str, at: str, **inp: Any) -> str:
+    return _line(type="assistant", timestamp=at, message={"role": "assistant", "content": [
+        {"type": "tool_use", "id": use_id, "name": "CronCreate", "input": inp}]})
+
+
+def _pinned(seconds_from_now: float) -> str:
+    t = sleeper.dt.datetime.fromtimestamp(time.time() + seconds_from_now)
+    return f"{t.minute} {t.hour} {t.day} {t.month} *"
+
+
+def test_a_fired_one_shot_cron_no_longer_counts(fake: FakeHerdr, state: Path) -> None:
+    # opf-bench, efficiency msg 72300ef2 (2026-11-18): fired one-shots blocked sleep and close for a week
+    path = transcript(state, UUID, 0)
+    path.write_text(_create("t1", _iso(7200), cron=_pinned(-3600), prompt="x", recurring=False)
+                    + _cron_result("t1", _iso(7199), "Scheduled one-shot job ab12cd34"))
+    assert sleeper.scheduled_work(UUID) is None                                       # fired an hour ago
+    path.write_text(_create("t2", _iso(60), cron=_pinned(3600), prompt="x", recurring=False))
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"          # still pending
+    path.write_text(_create("t3", _iso(7200), cron="*/5 * * * *", prompt="x", recurring=False))
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"          # pins no time: counts
+
+
+def test_deleting_a_fired_one_shot_leaves_a_recurring_job_counted(fake: FakeHerdr, state: Path) -> None:
+    # opf-bench's workaround: CronDelete on each fired id ("no such job") must not end another job
+    path = transcript(state, UUID, 0)
+    path.write_text(_create("t1", _iso(7200), cron="7 * * * *", prompt="x")
+                    + _cron_result("t1", _iso(7199), "Scheduled recurring job rec00001")
+                    + _create("t2", _iso(7000), cron=_pinned(-3600), prompt="x", recurring=False)
+                    + _cron_result("t2", _iso(6999), "Scheduled one-shot job one00002")
+                    + _tool("CronDelete", _iso(60), id="one00002"))
+    assert sleeper.scheduled_work(UUID) == "1 session cron job(s) scheduled"
+    with path.open("a") as fh:
+        fh.write(_tool("CronDelete", _iso(30), id="rec00001"))
+    assert sleeper.scheduled_work(UUID) is None
