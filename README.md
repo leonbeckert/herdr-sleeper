@@ -419,6 +419,8 @@ session's **ask panel** and keeps working:
 echo "canary green 40 min; rollback is one play" | herdr-sleeper ask \
     --question "Deploy the gateway now or tonight?" --option now --option tonight --recommend 2
 herdr-sleeper ask --todo "Run ./bin/vault-grant 4h on mini2"   # something only the owner can do
+herdr-sleeper ask --todo "Paste the guard into the VM's root shell" --copy 'find /etc/cron.d …'
+                                                                # c copies the command exactly (--copy-file for a script)
 herdr-sleeper ask --list [--all] [--everywhere] [--json]       # --everywhere: every saved machine
 herdr-sleeper ask --inbox                                       # the same; exit 3 names an unreachable machine
 herdr-sleeper ask --withdraw ID                                 # no longer needed
@@ -436,6 +438,16 @@ herdr-sleeper ask --done ID                                     # a to-do the se
   The answers are pinned: the options (the recommended one marked ★), `?`, or
   `d`/`x` for a to-do are never paged away; on a short pane they shrink to one
   line each. `z` zooms the panel (an 80-column terminal leaves it about 22).
+- **Copy and paste** (v0.1.47): the context is wrapped and indented for reading,
+  so a command selected out of it breaks in a shell. A command the owner runs
+  elsewhere goes in `--copy` (`--copy-file`): the card shows it (a long one in
+  full under `m`) and `c` then Enter copies exactly it through OSC 52, which
+  Herdr hands to the owner's clipboard. `--copy` refuses escapes, control,
+  invisible and direction characters, so what is shown is what is copied. A
+  paste into the panel is one block (bracketed paste; a terminal without it: a
+  read with a line break and more text, and the reads right after it): its line
+  breaks are text, and only a `y` or Enter typed on its own sends. A paste whose
+  end marker never comes ends after 0.3 s of quiet.
 - **Answering:** a question takes an option number, `N NOTE` (also `N: NOTE`,
   `N) NOTE`: option N plus a note, `2 after 18:00`), free text, or `?` (talk
   it over in the session: the session is told, the item stays open). A to-do

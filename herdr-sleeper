@@ -149,7 +149,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from pathlib import Path
 
 try:
@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.46"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.47"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -5876,6 +5876,24 @@ def cmd_ask(args: argparse.Namespace) -> int:
         problem = f"at most {ASK_OPTIONS_MAX} options"
     if not problem and args.recommend is not None and not 1 <= args.recommend <= len(options):
         problem = "--recommend names an option by its number (1 = the first --option)"
+    copy = getattr(args, "copy", None)
+    copy_file = getattr(args, "copy_file", None)
+    if not problem and copy is not None and copy_file:
+        problem = "--copy and --copy-file are exclusive"
+    if not problem and copy_file:
+        try:
+            copy = Path(copy_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            problem = f"--copy-file: {exc}"
+    if not problem and copy is not None:
+        copy = copy.replace("\r\n", "\n").rstrip("\n")
+        if not copy.strip():
+            problem = "--copy is empty"
+        elif len(copy) > ASK_COPY_MAX:
+            problem = f"--copy holds at most {ASK_COPY_MAX} characters"
+        elif ANSI_SEQ.search(copy) or CONTROL_CHARS.search(copy.replace("\t", "")) or COPY_HIDDEN.search(copy):
+            problem = ("--copy may hold no escape, control, invisible or direction characters (line breaks and "
+                       "tabs are fine): the owner must read exactly what `c` copies")
     ask_re = getattr(args, "re", None)
     if not problem and ask_re is not None and not MSG_ID_RE.fullmatch(ask_re):
         problem = "--re must be a message id"
@@ -5900,6 +5918,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
            "created_ts": time.time()}
     if ask_re:  # the relayed message this ask is about: the panel shows it, `thread` links them
         rec.update(re=ask_re, thread=thread_of(ask_re))
+    if copy is not None:  # a command the owner pastes somewhere: `c` copies it exactly
+        rec["copy"] = copy
     with locked():
         asks = read_asks()
         mine = open_asks(uuid, agent_name, asks, me_pane, me_term)
@@ -6425,6 +6445,14 @@ def item_card(ask_id: str | None, rec: dict, W: int, st: Callable[[str, str], st
     return title, q, [wrapped, compact, packed]
 
 
+def input_line(buf: str, width: int) -> str:
+    """The answer being typed, on one row: a pasted block shows its size and its last line."""
+    if "\n" not in buf:
+        return fit_to("> " + buf, width)
+    lines = buf.split("\n")
+    return fit_to(f"> [{len(lines)} lines, {len(buf)} chars] {lines[-1]}", width)
+
+
 def panel_lines(v: PanelView, color: bool = True) -> list[str]:
     """The panel's screen: at most v.height lines of at most v.width columns. Never dropped: who
     asks (the identity line), the selected item's question (its first line), every answer (the
@@ -6462,8 +6490,21 @@ def panel_lines(v: PanelView, color: bool = True) -> list[str]:
         segs.append((0, q[:1]))
         if len(q) > 1:
             segs.append((5, q[1:5] + (["   …"] if len(q) > 5 else [])))
+        copy_body = ""
+        if rec.get("copy"):
+            cmd = wrap_text(paste_text(str(rec["copy"])), W - 3, "   ")
+            n_lines = str(rec["copy"]).count("\n") + 1
+            segs.append((1, [st(fit(f"Command ({n_lines} line{'s' if n_lines > 1 else ''}): c then Enter copies it "
+                                    "exactly; don't select it"), "1;33")]))
+            if len(cmd) <= 6:
+                segs.append((5, [st(ln, "33") for ln in cmd]))
+            else:  # too long for the card: a preview here, all of it at the top of the context (m pages)
+                segs.append((5, [st(ln, "33") for ln in cmd[:4]]
+                             + [st(fit(f"   … {len(cmd) - 4} more rows: read all of it with m before you copy"),
+                                   "1;33")]))
+                copy_body = "The whole command (c copies exactly this):\n" + paste_text(str(rec["copy"])) + "\n\n"
         segs.append(("answers", []))
-        body = clean_text(rec.get("context") or "")
+        body = copy_body + clean_text(rec.get("context") or "")
         about = archived(str(rec["re"])) if rec.get("re") else None
         if about:
             body += (("\n\n" if body else "")
@@ -6489,17 +6530,21 @@ def panel_lines(v: PanelView, color: bool = True) -> list[str]:
                          f"Send to {name} as your answer to item {v.pending.get('slot')} «{qshort}»:", W)],
                          *[st(ln, "1") for ln in wrap_text(f"«{clean_text(v.pending.get('shown'))}»", W, "   ",
                                                           "   ")[:3]],
+                         *([fit(f"   ({str(v.pending.get('shown')).count(chr(10)) + 1} lines in all)")]
+                           if "\n" in str(v.pending.get("shown") or "") else []),
                          fit("y or Enter sends it · n or Esc goes back")]))
     elif rec and ask_kind(rec) == TODO:
         segs.append((1, wrap_text(f"{TODO_DONE} done · {TODO_CANT} REASON can't · or a note; Enter, then y or Enter",
                                   W)[:2]))
-        segs.append((6, [st(fit("Tab next item · m more context · s go to the session · z zoom"), "2")]))
+        segs.append((6, [st(fit(("c copy · " if rec.get("copy") else "")
+                                + "Tab next item · m more context · s go to the session · z zoom"), "2")]))
     else:
         n = len(rec.get("options") or []) if rec else 0
         segs.append((1, wrap_text((f"1-{n} (or 2 NOTE) or your own words" if n else "your answer")
                                   + f" · {ASK_TALK} talk; Enter, then y or Enter", W)[:2]))
-        segs.append((6, [st(fit("Tab next item · m more context · s go to the session · z zoom"), "2")]))
-    segs.append((0, [fit("> " + v.buf)]))
+        segs.append((6, [st(fit(("c copy · " if rec and rec.get("copy") else "")
+                                + "Tab next item · m more context · s go to the session · z zoom"), "2")]))
+    segs.append((0, [input_line(v.buf, W)]))
 
     def size(parts: list[tuple[object, list[str]]], ans: list[str]) -> int:
         return sum(len(ans) if p == "answers" else len(ls) for p, ls in parts if p != "ctx")
@@ -6584,7 +6629,7 @@ def ask_answer(rec: dict, line: str) -> tuple[str, str, bool] | None:
         return "open", head + ("not decided yet: the owner wants to talk this over with you in your session "
                                "first. Keep working; this ask stays open in the panel until they answer it there "
                                "or you withdraw it."), True
-    m = ANSWER_RE.fullmatch(text)
+    m = ANSWER_RE.fullmatch(text) if "\n" not in text else None  # a pasted block is own words
     if m and 1 <= int(m.group(1)) <= len(options):
         n, note = int(m.group(1)), (m.group(2) or "").strip()
         return "answered", head + f"option {n}: {options[n - 1]}" + (f" (note: {note})" if note else ""), False
@@ -6624,6 +6669,18 @@ def kick_delivery(uuid: str, sender: str) -> None:
 
 
 SENT, GONE, BUSY = "sent", "gone", "busy"
+
+
+def copy_to_clipboard(out: Any, text: str) -> str:
+    """Put an ask's command into the owner's clipboard: OSC 52 to the panel's terminal, which Herdr
+    hands to the client machine's clipboard (pbcopy on the MacBook), also from a mini's panel.
+    Exact bytes, unlike a selection of the wrapped, indented rows the panel shows."""
+    import base64
+    out.write("\x1b]52;c;" + base64.b64encode(text.encode()).decode() + "\x07")
+    out.flush()
+    lines = text.count("\n") + 1
+    return (f"Copied the command ({lines} line{'s' if lines > 1 else ''}, {len(text)} characters) to your "
+            "clipboard: paste it where the item says.")
 
 
 def send_answer(ask_id: str, state: str, body: str, keep_open: bool,
@@ -6748,36 +6805,131 @@ def panel_notify(items: list[tuple[str, dict]], reminder: bool = False) -> None:
               "--sound", "request", check=False)
 
 
+PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
+ASK_PASTE_MAX = 8000   # characters one answer may hold (a pasted block); typed text stays at 2000
+ASK_COPY_MAX = 8000    # characters of an ask's --copy command
+PASTE_IDLE_SECONDS = 0.3   # a paste (or a lone Esc) that goes quiet this long is complete
+BURST_GAP_SECONDS = 0.05   # a read this soon after a burst belongs to it: pasted, not typed
+# What --copy may not hold besides escapes and control characters: invisible or reordering
+# characters would make the copied command differ from what the owner reads.
+COPY_HIDDEN = re.compile("[\u200b-\u200f\u202a-\u202e\u2028\u2029\u2060-\u2069\ufeff]")
+
+
+class Paste(str):
+    """A pasted block, delivered as one key: its newlines are text, never Enter (owner 2026-11-17: a
+    paste kept only its last line, and a pasted `y` or blank line could send an answer by itself)."""
+
+
+class BurstKey(str):
+    """A key that arrived together with others in one read: pasted, not typed. It types and stages
+    like any key, but it never confirms a send."""
+
+
+def paste_text(text: str) -> str:
+    """A pasted block as plain text: line ends as \n, tabs as spaces, no escapes or control characters."""
+    text = ANSI_SEQ.sub("", text.replace("\r\n", "\n").replace("\r", "\n")).replace("\t", "    ")
+    return CONTROL_CHARS.sub("", BIDI_CHARS.sub("", text))
+
+
 class TtyKeys:
     """The panel's keyboard: cbreak (no line discipline, no echo, no ctrl-c signal), so the panel
     keeps what is typed across redraws. get() returns one key: a character, or ENTER, BS, KILL,
-    NEXT, PREV, REDRAW, ESC; None on timeout. EOFError when the terminal is gone. A Ctrl-D is a
-    plain key here (no line discipline), never an end of input."""
+    NEXT, PREV, REDRAW, ESC, or a Paste (a whole pasted block); None on timeout. EOFError when the
+    terminal is gone. A Ctrl-D is a plain key here (no line discipline), never an end of input.
+    Bracketed paste is on: a terminal marks a paste, and the panel takes it whole. A terminal that
+    doesn't: a read that carries a line break and more text is a paste too, and keys that arrive
+    several in one read are BurstKeys, which never confirm a send."""
 
     def __init__(self, fd: int) -> None:
         import codecs
         self.fd, self.queue = fd, []
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.carry = ""            # the start of a paste marker split across two reads
+        self.paste: str | None = None  # inside a marked paste: what came so far
+        self.last_burst = 0.0      # monotonic time of the last read that brought several keys or a paste
         self.saved = termios.tcgetattr(fd)
         attrs = termios.tcgetattr(fd)
         attrs[0] = (attrs[0] | termios.ICRNL) & ~(termios.INLCR | termios.IGNCR | termios.IXON)
         attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
         attrs[6][termios.VMIN], attrs[6][termios.VTIME] = 1, 0
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        self._mode("\x1b[?2004h")
+
+    def _mode(self, seq: str) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            sys.stdout.write(seq)
+            sys.stdout.flush()
 
     def close(self) -> None:
+        self._mode("\x1b[?2004l")
         with contextlib.suppress(termios.error, OSError):
             termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+
+    def feed(self, text: str) -> list[str]:
+        """Keys for one read's text, with paste markers and a paste split across reads handled."""
+        text, self.carry = self.carry + text, ""
+        out: list[str] = []
+        while text:
+            if self.paste is not None:
+                end = text.find(PASTE_END)
+                if end < 0:
+                    keep = next((n for n in range(len(PASTE_END) - 1, 0, -1) if text.endswith(PASTE_END[:n])), 0)
+                    self.paste += text[:len(text) - keep]
+                    self.carry = text[len(text) - keep:]
+                    if len(self.paste) > ASK_PASTE_MAX * 4:  # a runaway paste: keep its start
+                        self.paste = self.paste[:ASK_PASTE_MAX * 4]
+                    return out
+                out.append(Paste(paste_text(self.paste + text[:end])))
+                self.paste, text = None, text[end + len(PASTE_END):]
+                continue
+            start = text.find(PASTE_START)
+            chunk = text if start < 0 else text[:start]
+            if start < 0:
+                keep = next((n for n in range(len(PASTE_START) - 1, 0, -1) if text.endswith(PASTE_START[:n])), 0)
+                if keep and keep < len(text):
+                    chunk, self.carry = text[:len(text) - keep], text[len(text) - keep:]
+                elif keep:
+                    chunk, self.carry = "", text
+            out += self.chunk_keys(chunk)
+            if start < 0:
+                return out
+            self.paste, text = "", text[start + len(PASTE_START):]
+        return out
+
+    @classmethod
+    def chunk_keys(cls, chunk: str) -> list[str]:
+        if not chunk:
+            return []
+        if chunk in ("\r\n", "\n\n"):
+            return ["ENTER"]  # one Enter from a terminal that sends CR LF (ICRNL makes it two \n)
+        body = chunk.replace("\r\n", "\n").replace("\r", "\n")
+        if "\n" in body[:-1] and body.strip("\n") and not body.startswith("\x1b"):
+            return [Paste(paste_text(chunk))]  # an unmarked paste: a line break with more text after it
+        keys = cls.tokens(chunk)
+        return [BurstKey(k) for k in keys] if len(keys) > 1 else keys
+
+    def flush(self) -> list[str]:
+        """What a quiet terminal leaves: a paste whose end marker never came (a dropped client, a
+        terminal reset) ends here, and a held-back Esc is an Esc after all."""
+        if self.paste is not None:
+            got, self.paste, self.carry = self.paste + self.carry, None, ""
+            return [Paste(paste_text(got))]
+        got, self.carry = self.carry, ""
+        return self.tokens(got)
 
     def get(self, timeout: float) -> str | None:
         import select
         if not self.queue:
+            waiting = self.paste is not None or bool(self.carry)
             try:
-                ready, _w, _x = select.select([self.fd], [], [], timeout)
+                ready, _w, _x = select.select([self.fd], [], [], min(timeout, PASTE_IDLE_SECONDS) if waiting
+                                              else timeout)
             except InterruptedError:
                 return None
             if not ready:
-                return None
+                if waiting:
+                    self.queue += self.flush()
+                return self.queue.pop(0) if self.queue else None
             try:
                 data = os.read(self.fd, 1024)
             except InterruptedError:
@@ -6786,7 +6938,13 @@ class TtyKeys:
                 raise EOFError from exc
             if not data:
                 raise EOFError
-            self.queue += self.tokens(self.decoder.decode(data))
+            now = time.monotonic()
+            got = self.feed(self.decoder.decode(data))
+            if now - self.last_burst < BURST_GAP_SECONDS:  # the rest of a paste a read boundary cut off
+                got = [k if isinstance(k, (Paste, BurstKey)) else BurstKey(k) for k in got]
+            if len(got) > 1 or any(isinstance(k, (Paste, BurstKey)) for k in got) or self.paste is not None:
+                self.last_burst = now
+            self.queue += got
         return self.queue.pop(0) if self.queue else None
 
     @staticmethod
@@ -6975,9 +7133,20 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
         if key is None:
             continue
         rec = dict(items).get(cur) or items[0][1]
+        if isinstance(key, Paste):  # a pasted block joins the answer whole; it never sends by itself
+            add = key[:max(0, ASK_PASTE_MAX - len(buf))]
+            buf += add
+            note = ("Not sent: your paste starts a new answer. " if pending else "") + (
+                f"Pasted {add.count(chr(10)) + 1} lines; Enter, then y or Enter sends it." if "\n" in add.strip()
+                else "")
+            if len(add) < len(key):
+                note += f" Cut at {ASK_PASTE_MAX} characters."
+            pending, shown = None, ()
+            continue
         if pending:  # the confirm step: y or Enter sends, n/Esc goes back, any other key starts anew
             go = pending
-            if key in ("y", "Y") or (key == "ENTER" and not buf):
+            typed = not isinstance(key, BurstKey)  # a key that came with others was pasted: it never sends
+            if typed and (key in ("y", "Y") or (key == "ENTER" and not buf)):
                 pending, shown = None, ()
                 focused = pane_has_focus(pane)
                 status, note = send_answer(go["id"], go["state"], go["body"], go["keep"], focused)
@@ -7007,7 +7176,7 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
                 out.flush()
             continue
         if key != "ENTER":
-            if len(key) == 1 and len(buf) < 2000:
+            if len(key) == 1 and len(buf) < (2000 if "\n" not in buf else ASK_PASTE_MAX):
                 buf += key
                 if not shown:
                     continue  # a redraw is due: it shows the buffer
@@ -7021,6 +7190,9 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
             continue
         if text.lower() == "m":
             page, note = page + 1, ""
+            continue
+        if text.lower() == "c" and rec.get("copy"):
+            note = copy_to_clipboard(out, str(rec["copy"]))
             continue
         if text.lower() == "z":
             with contextlib.suppress(SleeperError):
@@ -11234,6 +11406,10 @@ def main(argv: list[str] | None = None) -> int:
     akp.add_argument("--todo", help="instead of a question: something only the owner can do, one line (they "
                                     "answer done, can't, or a note)")
     akp.add_argument("--option", action="append", help="an answer the owner can pick (repeat, up to 9)")
+    akp.add_argument("--copy", help="a command the owner pastes somewhere (a shell, a VM): the panel shows it and "
+                     "`c` copies it exactly into the owner's clipboard; never put it only in the context, a copied "
+                     "wrapped row breaks it")
+    akp.add_argument("--copy-file", help="like --copy, read from a file (a multi-line script)")
     akp.add_argument("--recommend", type=int, help="the option you recommend, by number (1 = first)")
     akp.add_argument("--re", help="the relayed message this ask is about (the ask tab shows it)")
     akp.add_argument("--withdraw", metavar="ID", help="close your own open ask")

