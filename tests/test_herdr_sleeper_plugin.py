@@ -14,6 +14,7 @@ import os
 import shlex
 import signal
 import stat
+import subprocess
 import sys
 import time
 import types
@@ -629,7 +630,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
                       "poll_seconds": 60, "notify": True, "wake_on_focus": True, "dry_run": False,
-                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [],
+                      "watcher": "plugin", "max_live": 0, "pressure_idle_hours": 0.5, "wake_refuse_from": [], "never_show": [],
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
                       "answer_dialogs": True, "limit_monitor": "", "codex_stuck": True, "auto_resume": True,
                       "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": [], "ask_gate": True,
@@ -11065,3 +11066,190 @@ def test_panel_ctrl_u_at_the_confirm_step_clears_the_staged_answer(
     _sync_delivery(monkeypatch)
     assert _panel(fake, monkeypatch, "wrong\r", "\x15", "ok\r", "y") == 0
     assert prompts(fake)[-1][3].endswith("A: note: ok")
+
+
+def test_a_hit_on_another_machine_opens_a_view_tab_after_the_owners_tab(ssh: FakeSsh,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, ...]] = []
+    moved: list[tuple[str, dict]] = []
+    ws_label = ["ao"]
+
+    def fake_herdr(*args: str, **_k: object) -> dict:
+        calls.append(args)
+        if args[:2] == ("workspace", "get"):
+            return {"workspace": {"label": ws_label[0]}}
+        if args[:2] == ("tab", "create"):
+            return {"tab": {"tab_id": "w1:t9"}, "root_pane": {"pane_id": "w1:p9"}}
+        if args[:2] == ("tab", "list"):
+            return {"tabs": [{"tab_id": "w1:t1"}, {"tab_id": "w1:t3"}, {"tab_id": "w1:t7"}, {"tab_id": "w1:t9"}]}
+        return {}
+    monkeypatch.setattr(sleeper, "herdr", fake_herdr)
+    monkeypatch.setattr(sleeper, "herdr_socket", lambda m, p, **_k: moved.append((m, p)) or {})
+    monkeypatch.setenv("HERDR_PLUGIN_CONTEXT_JSON", json.dumps({"workspace_id": "w1", "tab_id": "w1:t3"}))
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("HERDR_TAB_ID", raising=False)
+    hit = {"machine": "dev2", "pane": "w2:p1", "place": "ao › far tab;rm -rf", "name": None, "session": UUID}
+    assert sleeper.view_open(hit) == ""
+    create = next(c for c in calls if c[:2] == ("tab", "create"))
+    assert create[create.index("--label") + 1] == "view:dev2/far-tab-rm-rf" and "--focus" in create
+    assert moved == [("tab.move", {"tab_id": "w1:t9", "insert_index": 2})]       # right after the owner's tab
+    run = next(c for c in calls if c[:2] == ("pane", "run"))
+    assert run[2] == "w1:p9" and run[3].startswith("exec ") and run[3].endswith(f" view dev2 w2:p1 {UUID}")
+    for refused in ("parked", "ao-agents", "agents"):
+        ws_label[0], calls[:] = refused, []
+        assert "doesn't open in" in sleeper.view_open(hit)
+        assert not any(c[:2] == ("tab", "create") for c in calls)
+    ws_label[0] = "ao"
+    assert "not a saved machine" in sleeper.view_open({**hit, "machine": "dev9"})
+    assert "not a saved machine" in sleeper.view_open({**hit, "machine": ["dev2"]})            # no crash
+    assert "no session id" in sleeper.view_open({**hit, "session": "x; rm"})
+    monkeypatch.setenv("HERDR_TAB_ID", "w1:t1")                                     # inherited: context wins
+    moved.clear()
+    assert sleeper.view_open(hit) == "" and moved[0][1]["insert_index"] == 2
+    calls.clear()
+
+    def broken_run(*args: str, **k: object) -> dict:
+        if args[:2] == ("pane", "run"):
+            raise sleeper.HerdrError("pane run failed")
+        return fake_herdr(*args, **k)
+    monkeypatch.setattr(sleeper, "herdr", broken_run)
+    assert "the view tab failed" in sleeper.view_open(hit)
+    assert ("tab", "close", "w1:t9") in calls                                       # no empty tab left behind
+
+
+def test_rows_carry_the_machine_asked_never_one_they_name(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    row = {"machine": "mbp", "pane": "w1:p1", "session": UUID, "hits": 1}
+    monkeypatch.setattr(sleeper, "remote_sleeper", lambda label, argv, **_k: subprocess.CompletedProcess(
+        argv, 0, json.dumps([row, "junk"]), ""))
+    rows, problems = sleeper.machines_search("needle")
+    assert [r["machine"] for r in rows] == ["dev2"] and not problems
+
+
+def test_a_view_attaches_only_to_the_session_the_search_found(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    answer: list[object] = []
+
+    def fake_herdr(*args: str, **_k: object) -> dict:
+        if isinstance(answer[0], Exception):
+            raise answer[0]
+        return {"pane": answer[0]}
+    monkeypatch.setattr(sleeper, "herdr", fake_herdr)
+    held = {"terminal_id": "term_abc123", "agent": "claude", "agent_session": {"value": UUID}}
+    answer[:] = [held]
+    assert sleeper.view_target("dev2", "w2:p1", UUID) == ("herdr-dev2", "term_abc123", "claude")
+    answer[:] = [{**held, "agent_session": {"value": "11111111-2222-3333-4444-555555555555"}}]
+    with pytest.raises(sleeper.SleeperError, match="another session"):
+        sleeper.view_target("dev2", "w2:p1", UUID)                                  # a reused pane id
+    answer[:] = [sleeper.HerdrError("gone", "pane_not_found")]
+    with pytest.raises(sleeper.SleeperError, match="no longer on dev2"):
+        sleeper.view_target("dev2", "w2:p1", UUID)
+    answer[:] = [{**held, "terminal_id": "term_x; rm -rf ~"}]
+    with pytest.raises(sleeper.SleeperError, match="no terminal"):
+        sleeper.view_target("dev2", "w2:p1", UUID)
+    for label, pane in (("dev9", "w2:p1"), ("dev2", "-oProxyCommand=x"), (None, "w2:p1")):
+        with pytest.raises(sleeper.SleeperError, match="not a session on a saved machine"):
+            sleeper.view_target(label, pane, UUID)
+
+
+def test_a_view_ends_when_its_session_closes_sleeps_is_replaced_or_its_machine_is_gone(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    answers: list[object] = []
+
+    def fake_herdr(*args: str, **_k: object) -> dict:
+        got = answers.pop(0)
+        if isinstance(got, Exception):
+            raise got
+        return {"pane": got}
+    monkeypatch.setattr(sleeper, "herdr", fake_herdr)
+    gone = sleeper.view_watch("dev2", "w2:p1", "term_abc123", "claude")
+    answers[:] = [{"terminal_id": "term_abc123", "agent": "claude"}]
+    assert gone() == ""
+    answers[:] = [{"terminal_id": "term_abc123", "agent": "sleeper"}]
+    assert gone() == "the session went to sleep"
+    answers[:] = [{"terminal_id": "term_fff999", "agent": "claude"}]
+    assert gone() == "the session was replaced"
+    answers[:] = [sleeper.HerdrError("pane w2:p1 not found", "pane_not_found")]
+    assert gone() == "the session closed"
+    answers[:] = [sleeper.HerdrError("timed out"), sleeper.HerdrError("timed out")]
+    assert gone() == "" and gone() == "dev2 doesn't answer"                       # one miss is no verdict
+    gone = sleeper.view_watch("dev2", "w2:p1", "term_abc123", "claude")
+    answers[:] = [sleeper.HerdrError("herdr: command not found"), ValueError("odd")]
+    assert gone() == "" and gone() == "dev2 doesn't answer"                       # not "closed"; no dead watcher
+    asleep = sleeper.view_watch("dev2", "w2:p1", "term_abc123", "sleeper")
+    answers[:] = [{"terminal_id": "term_abc123", "agent": "sleeper"}]
+    assert asleep() == ""                                                          # a stub viewed as a stub
+
+
+def _relay_in_a_pty(argv: list[str], idle: float, gone_after: float | None = None,
+                    typing: float = 0) -> tuple[str, str]:
+    """view_relay in a fresh Python process (no forking a threaded pytest worker) whose stdin/stdout are a pty:
+    (its printed result, its whole output). It only runs view_relay (no state, no config) and gets no
+    HERDR_* variables, so the no_real_processes guard's worry (a live server, the real state) can't apply."""
+    script = (
+        "import importlib.machinery, importlib.util, os, sys, time\n"
+        "loader = importlib.machinery.SourceFileLoader('hs', os.environ['HS_RELAY_SCRIPT'])\n"
+        "spec = importlib.util.spec_from_loader('hs', loader); m = importlib.util.module_from_spec(spec)\n"
+        "loader.exec_module(m); t0 = time.monotonic(); after = float(sys.argv[3])\n"
+        "gone = lambda: 'the session closed' if after >= 0 and time.monotonic() - t0 > after else ''\n"
+        "reason, code = m.view_relay(sys.argv[4:], gone, idle=float(sys.argv[2]), every=0.2)\n"
+        "os.write(1, f'\\r\\nRESULT {reason}|{code}\\r\\n'.encode())\n")
+    master, slave = os.openpty()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")} | {"HS_RELAY_SCRIPT": str(SCRIPT)}
+    proc = subprocess.Popen([sys.executable, "-c", script, "-", str(idle),
+                             str(-1 if gone_after is None else gone_after), *argv],
+                            stdin=slave, stdout=slave, stderr=slave, start_new_session=True, env=env)
+    import select as _select
+    import termios as _termios
+    before = _termios.tcgetattr(slave)
+    out = b""
+    started = time.monotonic()
+    while time.monotonic() - started < 20 and proc.poll() is None:
+        if typing and time.monotonic() - started < typing:
+            os.write(master, b"x")                                                 # a keystroke every 0.3 s
+        ready, _, _ = _select.select([master], [], [], 0.3)
+        if ready:
+            try:
+                out += os.read(master, 4096)
+            except OSError:
+                break
+    proc.wait(timeout=10)
+    while _select.select([master], [], [], 0.2)[0]:              # what is left; the slave stays open: no EOF
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    after = _termios.tcgetattr(slave)
+    os.close(slave)
+    os.close(master)
+    assert after == before                                                         # the terminal mode restored
+    text = out.decode(errors="replace")
+    return (text.split("RESULT ", 1)[1].splitlines()[0].strip() if "RESULT " in text else ""), text
+
+
+def test_the_view_relay_copies_output_and_ends_on_idle_on_gone_and_when_its_command_ends() -> None:
+    result, text = _relay_in_a_pty(["/bin/sh", "-c", "echo READY; stty size; sleep 30"], idle=1)
+    assert "READY" in text and result == "no input for 1 seconds|-15"           # idle ends it: TERM stops ssh
+    started = time.monotonic()
+    result, _ = _relay_in_a_pty(["/bin/sh", "-c", "sleep 30"], idle=1, typing=3)
+    assert result.startswith("no input for 1 seconds|") and time.monotonic() - started >= 3.5   # keys kept it
+    result, _ = _relay_in_a_pty(["/bin/sh", "-c", "sleep 30"], idle=60, gone_after=0.5)
+    assert result.startswith("the session closed|")
+    result, text = _relay_in_a_pty(["/bin/sh", "-c", "echo BYE; exit 3"], idle=60)
+    assert "BYE" in text and result == "|3"                                        # the attach ended by itself
+
+
+def test_never_show_keeps_a_machine_out_of_search_and_views(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeper.CONFIG_FILE.write_text('machine = "dev1"\nexclude = []\nnever_show = ["dev2"]\n')
+    asked: list[str] = []
+    monkeypatch.setattr(sleeper, "remote_sleeper", lambda label, argv, **_k: asked.append(label))
+    assert sleeper.machines_search("needle") == ([], []) and asked == []          # not even asked
+    with pytest.raises(sleeper.SleeperError, match="never shows dev2"):
+        sleeper.view_target("dev2", "w2:p1", UUID)
+    assert "never shows dev2" in sleeper.view_open({"machine": "dev2", "pane": "w2:p1", "session": UUID})
+    sleeper.CONFIG_FILE.write_text('machine = "dev1"\nexclude = []\nnever_show = "dev2"\n')
+    assert sleeper.never_shown("dev2")                                              # a single string is a list
+    sleeper.CONFIG_FILE.write_text('machine = "dev1"\nexclude = []\nnever_show = [3]\n')
+    with pytest.raises(sleeper.ConfigError):
+        sleeper.never_shown("dev2")                                                 # broken: refused, not shown

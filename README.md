@@ -259,7 +259,7 @@ loops. An npm/bun install shows only its runtime to `lsof`, so it is never
 restarted. With claude-account's launcher (see "Subscription slots") a session
 on another slot than the active one is restarted the same way, already
 2 minutes after it went idle; event `restarted` with `kind` `account`),
-`wake_refuse_from` (see Messages below), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `codex_stuck` (see "A Codex pane stuck after its turn"),
+`wake_refuse_from` (see Messages below), `never_show` (see the search's view tab), `answer_dialogs` and `limit_monitor` (see "Subscription slots"), `codex_stuck` (see "A Codex pane stuck after its turn"),
 `auto_resume`, `auto_resume_max_age` and `auto_resume_exclude` (see "Auto-resume after a network or API error"), `ask_gate` (default on; see "Turn-end count and ask gate"), `ask_mirror` (default on: open asks on the owner's phone through moshi-hook), `dry_run` (the watcher and `scan` log `would sleep (dry run)` once per idle stretch
 instead of sleeping), `watcher` (`"plugin"`, the default: hooks spawn and
 heal the watcher; `"external"`: a service manager runs
@@ -1051,11 +1051,34 @@ herdr-sleeper search-view-open         # the popup (plugin action `search`; bind
   be found is named in one `not searched:` line.
 - **The popup.** Type the words, Enter; a number goes to that session's pane
   (`herdr agent focus`; a sleeper shows its stub, Enter there wakes it); Enter on
-  its own searches again, q closes. A session on another machine: Herdr's API
-  focuses that machine's pane (`herdr --machine LABEL agent focus`) but can't switch
-  the owner's window to that machine (tested 2026-11-18, v0.1.54), so the popup
-  focuses it there, copies its tab label (else its name) to the clipboard (OSC 52) and
-  says the keys for Herdr's Goto picker: `prefix+g`, `/`, paste, Enter (*v0.1.59*).
+  its own searches again, q closes.
+- **A session on another machine opens in a view tab** (*v0.1.61*). Herdr's API can't
+  switch the owner's window to another machine (upstream #5589, not planned), and a
+  session's process can't move between machines. So the popup opens a tab
+  `view:<machine>/<tab label or name>` right after the owner's tab, in the workspace
+  they're in, focused. The tab runs `herdr-sleeper view MACHINE PANE`:
+  - It attaches over SSH to the saved machine's target (`ssh -tt … herdr terminal
+    attach <terminal>`) under a small terminal relay that carries keystrokes, output
+    and the window size.
+  - Nothing moves: input is shared with every other client of that session. While
+    the view is open, the session takes the view's size, and it gets its own size
+    back when the view closes.
+  - The tab closes itself after 15 minutes without a keystroke, when the session
+    closes, sleeps or is replaced, or when its machine misses two checks (30 s each).
+    The owner leaves by closing the tab; `prefix+q` inside it would detach their own
+    client.
+  - A view never opens in a `parked` or `…agents` workspace. The Goto handoff
+    (*v0.1.59*: focus there, tab label in the clipboard, `prefix+g`, `/`, paste)
+    remains the fallback when no view can open.
+  - The `view:` label is the marker that presence, layout's mover and placement
+    measures skip.
+  - Config `never_show = ["mbp"]` (a list of saved machine labels): this machine
+    never searches those machines and never opens a view of their sessions; an
+    unreadable config refuses the view. It is a local backstop. The boundary stays
+    with what each machine's keys allow (the MacBook relay's allowlist refuses both
+    `search` and Herdr's own `--machine` forwarding). Rows always carry the machine
+    that was asked, never one they name themselves, and a view checks that the pane
+    still holds the session the search found.
 - **Other machines.** Each saved machine runs `search --here --json` over the same
   SSH as `presence`, in parallel (30 s at most); the words cross only in the
   `presence` argument form (letters, digits, spaces and `./:@=,+~%_-`). A machine

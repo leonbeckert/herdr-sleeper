@@ -137,10 +137,13 @@ import hashlib
 import json
 import math
 import os
+import pty
 import re
+import select
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -148,6 +151,7 @@ import termios
 import threading
 import time
 import traceback
+import tty
 from collections.abc import Callable, Iterator
 from typing import Any, NamedTuple
 from pathlib import Path
@@ -158,7 +162,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.60"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.61"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -253,6 +257,7 @@ DEFAULTS = {
     "pressure_idle_hours": 0.5,  # the shorter window for early sleep (over max_live, or memory pressure)
     "watcher": "plugin",         # "external": a service manager runs `watch`; hooks never spawn one
     "wake_refuse_from": [],      # senders whose messages never wake a sleeper (they wait in the mailbox)
+    "never_show": [],            # saved machines whose sessions this one never shows: no search, no view tab
     "restart_outdated": False,   # idle claude sessions on an older build: sleep + wake onto the installed one
     "machine": "",               # this machine's label on the others (dev1); default: the short hostname
     "machine_aliases": [],       # former labels still accepted: "old=new" (this machine's or a saved one's)
@@ -782,7 +787,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
         raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
-    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude"):
+    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude", "never_show"):
         v = values[key]
         if isinstance(v, str):
             v = [v]
@@ -6435,10 +6440,11 @@ def search_rows(term: str) -> list[dict]:
 
 def machines_search(term: str) -> tuple[list[dict], list[str]]:
     """Every enabled saved machine's rows, asked in parallel. A machine whose key can't run `search` (the
-    MacBook seen from a mini: its relay knows only deliver, presence and the like) is named, not retried."""
+    MacBook seen from a mini: its relay knows only deliver, presence and the like) is named, not retried.
+    A machine in config `never_show` is not asked at all."""
     try:
-        labels = sorted(saved_machines())
-    except SleeperError as exc:
+        labels = sorted(m for m in saved_machines() if not never_shown(m))
+    except (SleeperError, ConfigError) as exc:
         return [], [str(exc)]
     results: dict[str, list[dict] | str] = {}
 
@@ -6450,7 +6456,8 @@ def machines_search(term: str) -> tuple[list[dict], list[str]]:
                 results[label] = f"{label}: not searchable from here ({one_line(last, 120)})"
                 return
             got = json.loads(done.stdout or "[]")
-            results[label] = [dict(r, machine=r.get("machine") or label) for r in got if isinstance(r, dict)]
+            # the machine asked, never the one a row names: a machine must not point a view at a third one
+            results[label] = [dict(r, machine=label) for r in got if isinstance(r, dict)]
         except Exception as exc:  # one machine must not cost the others their rows
             results[label] = str(exc)
     threads = [threading.Thread(target=ask, args=(label,), daemon=True) for label in labels]
@@ -6607,6 +6614,282 @@ def search_elsewhere(r: dict, out: Any = None) -> str:
             "paste, Enter.")
 
 
+# A row on another machine opens in a view tab (v0.1.60, owner 2026-11-18 ask 64e3b8de, layout msg 7f7400aa):
+# Herdr can't switch the window to another machine (#5589), and a session's process can't move between
+# machines, so the tab shows the session over SSH (`herdr terminal attach`, shared input, nothing moves) and
+# closes itself: no input for VIEW_IDLE_SECONDS, the session closed, slept or replaced, its machine gone.
+# The tab is labelled `view:<machine>/<name>` (layout's marker: presence, the mover and the placement
+# measure skip it) and opens right after the owner's tab, never in a parked or agents workspace.
+VIEW_IDLE_SECONDS = 15 * 60
+VIEW_CHECK_SECONDS = 30
+VIEW_LABEL_PREFIX = "view:"
+VIEW_REFUSED_WORKSPACE = re.compile(r"(?i)parked|(?:.*[-_ ])?agents")
+TERMINAL_RE = re.compile(r"term_[0-9a-f]{6,40}")
+VIEW_SESSION_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+VIEW_NOTE_SECONDS = 10
+
+
+def herdr_socket(method: str, params: dict, timeout: float = HERDR_TIMEOUT) -> dict:
+    """One raw socket API request (for methods the CLI lacks, like tab.move): its `result`, else HerdrError."""
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not path:
+        raise HerdrError(f"{method}: no HERDR_SOCKET_PATH")
+    buf = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(path)
+            conn.sendall((json.dumps({"id": "herdr-sleeper", "method": method, "params": params}) + "\n").encode())
+            while b"\n" not in buf and len(buf) < 4 << 20:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        reply = json.loads(buf.split(b"\n", 1)[0] or b"{}")
+    except (OSError, ValueError) as exc:
+        raise HerdrError(f"{method}: {exc}")
+    if not isinstance(reply, dict) or "error" in reply:
+        raise HerdrError(f"{method} failed: {(reply or {}).get('error') if isinstance(reply, dict) else reply}")
+    result = reply.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def never_shown(label: str) -> bool:
+    """Whether config `never_show` names this saved machine (a mini never shows the MacBook's sessions: a
+    co-admin reads the minis). An unreadable config raises ConfigError: no view is opened on a guess."""
+    return canonical_label(label) in {canonical_label(m) for m in load_config()[0]["never_show"]}
+
+
+def view_label(r: dict) -> str:
+    """The view tab's label: `view:<machine>/<tab label or name>`, plain characters only, never a bare number."""
+    name = re.sub(r"[^A-Za-z0-9._@]+", "-", search_goto_text(r)).strip("-")[:40] or "session"
+    return f"{VIEW_LABEL_PREFIX}{machine_label(r.get('machine'))}/{name}"
+
+
+def view_open(r: dict) -> str:
+    """Open a row on another machine in a view tab after the owner's tab: "" when it opened, else why not."""
+    machine, pane, session = r.get("machine"), str(r.get("pane") or ""), str(r.get("session") or "")
+    label = machine_label(machine) if isinstance(machine, str) else None
+    if not label or label not in saved_machines():
+        return f"{ui_label(machine)} is not a saved machine here"
+    if never_shown(label):
+        return f"this machine never shows {label}'s sessions (config never_show)"
+    if not REMOTE_TARGET_RE.fullmatch(pane):
+        return "it has no pane to show"
+    if not VIEW_SESSION_RE.fullmatch(session):
+        return "it has no session id to check the pane against"
+    ctx: dict = {}
+    with contextlib.suppress(ValueError):  # the plugin context first: an inherited env can name another pane
+        raw = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+        ctx = raw if isinstance(raw, dict) else {}
+    ws = ctx.get("workspace_id") or os.environ.get("HERDR_WORKSPACE_ID")
+    here = ctx.get("tab_id") or os.environ.get("HERDR_TAB_ID")
+    if not isinstance(ws, str) or not ws:
+        return "there is no workspace to open it in"
+    ws_label = ui_label((herdr("workspace", "get", ws).get("workspace") or {}).get("label")) or ""
+    if VIEW_REFUSED_WORKSPACE.fullmatch(ws_label):
+        return f"a view doesn't open in {ws_label!r}; go to one of your own workspaces first"
+    made = herdr("tab", "create", "--workspace", ws, "--label", view_label(r), "--focus")
+    tab, root = (made.get("tab") or {}).get("tab_id"), (made.get("root_pane") or {}).get("pane_id")
+    try:
+        if not isinstance(tab, str) or not isinstance(root, str):
+            raise SleeperError("Herdr made no usable tab")
+        with contextlib.suppress(Exception):  # placement is a nicety: the tab works anyway
+            order = [t.get("tab_id") for t in herdr("tab", "list", "--workspace", ws).get("tabs") or []]
+            if here in order:
+                herdr_socket("tab.move", {"tab_id": tab, "insert_index": order.index(here) + 1})
+        herdr("pane", "run", root,
+              "exec " + shlex.join([os.path.realpath(sys.argv[0]), "view", label, pane, session]))
+    except Exception as exc:  # never leave an empty view tab behind: layout's mover skips view: tabs
+        if isinstance(tab, str):
+            herdr("tab", "close", tab, check=False)
+        return f"the view tab failed ({one_line(str(exc), 120)})"
+    return ""
+
+
+def view_watch(label: str, pane: str, term: str, started_as: str | None) -> Callable[[], str]:
+    """A check for the view's relay: why the view should end now ("" while the session is there)."""
+    misses = [0]
+
+    def gone() -> str:
+        try:
+            got = herdr("--machine", label, "pane", "get", pane, timeout=20).get("pane")
+            if not isinstance(got, dict):
+                raise SleeperError("no pane in the answer")
+        except HerdrError as exc:
+            if exc.code == "pane_not_found":
+                return "the session closed"
+            misses[0] += 1
+            return f"{label} doesn't answer" if misses[0] >= 2 else ""
+        except Exception:  # anything else is a miss, never a dead watcher
+            misses[0] += 1
+            return f"{label} doesn't answer" if misses[0] >= 2 else ""
+        misses[0] = 0
+        if got.get("terminal_id") != term:
+            return "the session was replaced"
+        if got.get("agent") == "sleeper" and started_as != "sleeper":
+            return "the session went to sleep"
+        return ""
+    return gone
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _end_child(pid: int) -> int:
+    """Stop the view's ssh (TERM, then KILL after 3 s) and return its exit code."""
+    for sig in (None, signal.SIGTERM, signal.SIGKILL):
+        if sig is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, sig)
+        deadline = time.monotonic() + (0 if sig is None else 3)
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                return os.waitstatus_to_exitcode(status)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    return -9
+
+
+def view_relay(argv: list[str], gone: Callable[[], str], idle: float = VIEW_IDLE_SECONDS,
+               every: float = VIEW_CHECK_SECONDS) -> tuple[str, int]:
+    """Run argv on a terminal of its own and copy between it and ours: keystrokes in (they count as activity),
+    output out, window size along. Ends when argv ends, after `idle` seconds without a keystroke, or when
+    gone() (asked every `every` seconds) names a reason. Returns (reason or "", argv's exit code)."""
+    pid, fd = pty.fork()
+    if pid == 0:  # the child: argv on the new terminal
+        try:
+            os.execv(argv[0], argv)
+        finally:
+            os._exit(127)
+
+    def resize(*_: object) -> None:
+        with contextlib.suppress(OSError):
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+
+    def hangup(*_: object) -> None:  # the tab was closed: end the attach cleanly
+        raise SystemExit(0)
+    verdict = {"why": ""}
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.wait(every):
+            why = gone()
+            if why:
+                verdict["why"] = why
+                return
+    resize()
+    saved = termios.tcgetattr(0)
+    old_winch, old_hup = signal.getsignal(signal.SIGWINCH), signal.getsignal(signal.SIGHUP)
+    reason, last = "", time.monotonic()
+    try:
+        signal.signal(signal.SIGWINCH, resize)
+        signal.signal(signal.SIGHUP, hangup)
+        threading.Thread(target=watch, daemon=True).start()
+        tty.setraw(0)
+        while True:
+            if verdict["why"]:
+                reason = verdict["why"]
+                break
+            if time.monotonic() - last > idle:
+                reason = (f"no input for {round(idle / 60)} minutes" if idle >= 60
+                          else f"no input for {int(idle)} seconds")
+                break
+            ready, _, _ = select.select([0, fd], [], [], 1.0)
+            if 0 in ready:
+                data = os.read(0, 4096)
+                if not data:
+                    break
+                last = time.monotonic()
+                _write_all(fd, data)
+            if fd in ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:  # EIO: argv ended and closed its terminal
+                    data = b""
+                if not data:
+                    break
+                _write_all(1, data)
+    finally:
+        signal.signal(signal.SIGHUP, old_hup)
+        signal.signal(signal.SIGWINCH, old_winch)
+        stop.set()
+        with contextlib.suppress(termios.error):
+            termios.tcsetattr(0, termios.TCSAFLUSH, saved)
+        code = _end_child(pid)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    return reason, code
+
+
+def view_target(label: str | None, pane: str, session: str) -> tuple[str, str, str | None]:
+    """(SSH target, terminal id, agent) of the pane the search found, else SleeperError: the machine must be
+    saved, and the pane must still hold that session (a closed session's pane id can be reused)."""
+    target = saved_machines().get(label or "")
+    if not label or not target or not REMOTE_TARGET_RE.fullmatch(pane) or not VIEW_SESSION_RE.fullmatch(session):
+        raise SleeperError(f"{label} {pane}: not a session on a saved machine")
+    if never_shown(label):
+        raise SleeperError(f"this machine never shows {label}'s sessions (config never_show)")
+    try:
+        info = herdr("--machine", label, "pane", "get", pane, timeout=20).get("pane")
+    except HerdrError as exc:
+        if exc.code == "pane_not_found":
+            raise SleeperError(f"that session is no longer on {label} (closed since the search)")
+        raise SleeperError(f"{label} didn't answer ({one_line(str(exc), 120)})")
+    info = info if isinstance(info, dict) else {}
+    held = info.get("agent_session")
+    if not isinstance(held, dict) or held.get("value") != session:
+        raise SleeperError(f"that pane on {label} holds another session now (the one found has closed)")
+    term = info.get("terminal_id")
+    if not isinstance(term, str) or not TERMINAL_RE.fullmatch(term):
+        raise SleeperError(f"{label} has no terminal for that session (it may have closed)")
+    agent = info.get("agent")
+    return target, term, agent if isinstance(agent, str) else None
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    """`view MACHINE PANE SESSION`: the command in a view tab (the search opens it): attach to that session on
+    MACHINE, then close the tab. Problems stay on screen until Enter, so the owner sees why it didn't open.
+    search_guard and the terminal check keep an agent from running it by accident; they are no boundary
+    (an agent with a pty and SSH could attach directly). The boundary is what each machine's keys allow."""
+    refused = search_guard("view")
+    if refused is not None:
+        return refused
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("view: needs a terminal; the search opens it in a tab of its own", file=sys.stderr)
+        return 2
+    label, pane, problem, note, code = machine_label(args.machine), args.pane, "", "", 0
+    try:
+        target, term, agent = view_target(label, pane, args.session)
+        started = time.monotonic()
+        reason, code = view_relay([SSH_BIN, "-tt", "-a", "-x", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                   "-o", "ClearAllForwardings=yes", "-o", "ServerAliveInterval=15",
+                                   "-o", "ServerAliveCountMax=3", target, f"herdr terminal attach {term}"],
+                                  view_watch(label or "", pane, term, agent))
+        if code == 255:  # ssh's own failure (unreachable, refused), however long it took
+            problem = f"the connection to {label} failed (ssh exit 255)"
+        elif not reason and code != 0 and time.monotonic() - started < 5:
+            problem = f"the connection to {label} ended at once (ssh exit {code})"
+        elif reason and not reason.startswith("no input"):
+            note = reason
+    except (SleeperError, ConfigError) as exc:
+        problem = str(exc)
+    with contextlib.suppress(EOFError, KeyboardInterrupt, OSError):
+        if problem:
+            input(f"\nview: {problem}. Enter closes this tab. ")
+        elif note:  # why it ended, briefly; the tab closes by itself
+            print(f"\r\nview ended: {note}. This tab closes in {VIEW_NOTE_SECONDS} s (Enter: now).", flush=True)
+            select.select([0], [], [], VIEW_NOTE_SECONDS)
+    own = os.environ.get("HERDR_PANE_ID")
+    if own:
+        herdr("pane", "close", own, check=False)
+    return 1 if problem else 0
+
+
 def cmd_search_view(_args: argparse.Namespace) -> int:
     """The `search` popup: type a word, get the running sessions that mention it on every machine, newest
     hit first, numbered; a number goes to that pane (a sleeper shows its stub: Enter there wakes it),
@@ -6641,7 +6924,8 @@ def cmd_search_view(_args: argparse.Namespace) -> int:
                 out.append(note)
             for n, r in reversed(list(enumerate(shown, 1))):
                 out += [""] + search_block(n, r, width)
-            out += ["", "a number goes to that session · Enter searches again · q closes"]
+            out += ["", "a number goes to that session (one on another machine opens in a view tab; close the tab "
+                    "to leave) · Enter searches again · q closes"]
             print(("\033[H\033[2J" if tty else "") + "\n".join(out), flush=True)
             if not tty:
                 return 0
@@ -6653,7 +6937,12 @@ def cmd_search_view(_args: argparse.Namespace) -> int:
             elif re.fullmatch(r"[0-9]{1,4}", got) and 1 <= int(got) <= len(shown):
                 hit = shown[int(got) - 1]
                 if machine_label(hit.get("machine")):
-                    input(search_elsewhere(hit) + " ")
+                    try:
+                        why = view_open(hit)
+                    except Exception as exc:  # a row from another machine must not crash the popup
+                        why = one_line(str(exc), 120) or type(exc).__name__
+                    if why:  # no view tab: the Goto picker still gets there
+                        input(f"No view tab: {why}. " + search_elsewhere(hit) + " ")
                     return 0
                 failed = search_focus(hit)
                 if not failed:
@@ -13016,6 +13305,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("search-view", help="the search as a popup (the plugin pane)").set_defaults(fn=cmd_search_view)
     sub.add_parser("search-view-open", help="open the search popup (the plugin action)"
                    ).set_defaults(fn=cmd_search_view_open)
+    vwp = sub.add_parser("view", help="show a session on another machine in this terminal (the search's view tab)")
+    vwp.add_argument("machine")
+    vwp.add_argument("pane")
+    vwp.add_argument("session", help="the session id the search found; a pane holding another one is refused")
+    vwp.set_defaults(fn=cmd_view)
     rop = sub.add_parser("reopen", help="resume a closed session from its record (`closed`): its machine, cwd, "
                                         "workspace and name; an optional note on stdin goes into its first prompt")
     rop.add_argument("target", help="its name, Claude name or session id (MACHINE/NAME for another machine)")
