@@ -6456,6 +6456,20 @@ def test_ask_copy_refuses_hidden_characters_and_a_long_command_is_readable_in_fu
     assert "The whole command (c copies exactly this):" in screen
 
 
+def test_ask_copy_that_prompts_for_a_secret_must_name_it(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    # owner 2026-11-18 (ask e53e13af): a bare "BECOME password:" got the wrong password
+    for bare in ("ssh worms 'sudo systemctl restart gw'", "ansible-playbook -i inv site.yml -K",
+                 "ansible-playbook site.yml --ask-vault-pass", "gpg --decrypt secrets.gpg"):
+        assert _ask(monkeypatch, todo="run it", copy=bare) == 2, bare
+        assert "names none" in capsys.readouterr().err
+    named = ("echo '>>> BECOME password = sudo password of user klinikon on the Worms VM'\n"
+             "ansible-playbook -i inv site.yml -K")
+    for fine in (named, "./bin/ap playbooks/x.yml -K", "ssh ops@h 'sudo -n true'", "vault-fill req.yml",
+                 "echo pseudo-sudo"):
+        assert _ask(monkeypatch, todo="run it", copy=fine) == 0, fine
+
+
 def test_panel_switches_items_with_tab_and_hash(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
                                                capsys: pytest.CaptureFixture[str]) -> None:
     assert _ask(monkeypatch) == 0

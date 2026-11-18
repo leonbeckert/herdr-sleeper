@@ -163,7 +163,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.66"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.67"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7364,6 +7364,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
         elif ANSI_SEQ.search(copy) or CONTROL_CHARS.search(copy.replace("\t", "")) or COPY_HIDDEN.search(copy):
             problem = ("--copy may hold no escape, control, invisible or direction characters (line breaks and "
                        "tabs are fine): the owner must read exactly what `c` copies")
+        elif (hit_secret := COPY_SECRET_PROMPT_RE.search(copy)) and not COPY_SECRET_NAMED_RE.search(copy):
+            problem = (f"--copy will prompt the owner for a secret ({hit_secret.group(0).split()[0]}…) but names "
+                       "none: print one line right before the prompt saying which secret, whose and where, e.g. "
+                       "echo '>>> BECOME password = sudo password of user klinikon on the Worms VM' "
+                       "(owner 2026-11-18)")
     ask_re = getattr(args, "re", None)
     if not problem and ask_re is not None and not MSG_ID_RE.fullmatch(ask_re):
         problem = "--re must be a message id"
@@ -8918,6 +8923,15 @@ def panel_notify(items: list[tuple[str, dict]], reminder: bool = False) -> None:
 PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"
 ASK_PASTE_MAX = 8000   # characters one answer may hold (a pasted block); typed text stays at 2000
 ASK_COPY_MAX = 8000    # characters of an ask's --copy command
+# A copied command that will prompt the owner for a secret (owner 2026-11-18, after typing a wrong
+# password into a bare "BECOME password:"): it must print a `>>>` line naming which one before it.
+# Tools that name their prompts themselves (bin/ap, vault-fill, a `read` with a prompt) don't match.
+COPY_SECRET_PROMPT_RE = re.compile(
+    r"(?<![\w./-])sudo(?![\w-])(?!(?:\s+-[A-Za-z]+)*?\s+-[A-Za-z]*n(?![\w-]))"
+    r"|(?<![\w-])ansible(?:-playbook|-pull|-console)?(?![\w-])[^\n;&|]*?\s"
+    r"(?:-K|--ask-become-pass(?:word)?|-k|--ask-pass|-J|--ask-vault-pass(?:word)?|--vault-id\s+\S*@prompt)(?![\w-])"
+    r"|(?<![\w./-])(?:gpg2?|passwd|ssh-keygen)(?![\w-])")
+COPY_SECRET_NAMED_RE = re.compile(r">>>")
 PASTE_IDLE_SECONDS = 0.3   # a paste (or a lone Esc) that goes quiet this long is complete
 BURST_GAP_SECONDS = 0.05   # a read this soon after a burst belongs to it: pasted, not typed
 # What --copy may not hold besides escapes and control characters: invisible or reordering
