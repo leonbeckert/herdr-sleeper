@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.57"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.58"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -968,7 +968,7 @@ def rss_mb(pane: str) -> int:
     if not pids:
         return 0
     try:
-        out = subprocess.run([PS, "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([PS, "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True, errors="replace", timeout=10).stdout
         return sum(int(x) for x in out.split() if x.isdigit()) // 1024
     except (OSError, ValueError, subprocess.SubprocessError):
         return 0
@@ -984,7 +984,7 @@ def process_table() -> dict[int, tuple[int, str]]:
     """pid -> (ppid, executable name) for every process; {} when ps fails (callers fail closed).
     Names only (`comm`): argument vectors can carry secrets and are not read here."""
     try:
-        out = subprocess.run([PS, "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True,
+        out = subprocess.run([PS, "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True, errors="replace",
                              timeout=15, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -1729,7 +1729,7 @@ def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | No
         if a["pane_id"] != except_pane and (a.get("agent_session") or {}).get("value") == uuid:
             return f"pane {a['pane_id']}"
     try:
-        ps = subprocess.run([PS, "-eo", "pid=,args="], capture_output=True, text=True, timeout=15, check=True).stdout
+        ps = subprocess.run([PS, "-eo", "pid=,args="], capture_output=True, text=True, errors="replace", timeout=15, check=True).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise SleeperError(f"cannot verify session liveness: ps failed ({exc})")
     for line in ps.splitlines():
@@ -1861,7 +1861,7 @@ def waking_alive(entry: dict) -> bool | None:
     except OSError:
         return None
     try:
-        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True,
+        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True, errors="replace",
                              timeout=10, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -10201,7 +10201,7 @@ def process_is_watcher(pid: int) -> bool:
     """Does pid run `… herdr-sleeper watch`? Matched as argv tokens, so a reused pid running
     `cargo watch` or `fswatch` is not taken for the watcher (and never gets our SIGTERM)."""
     try:
-        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([PS, "-p", str(pid), "-o", "args="], capture_output=True, text=True, errors="replace", timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     toks = out.split()
@@ -10443,7 +10443,7 @@ def active_account() -> str | None:
 
 def process_start(pid: int) -> float | None:
     try:
-        out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+        out = subprocess.run([PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, errors="replace", timeout=10,
                              env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"}, check=False).stdout.strip()
         return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y")) if out else None
     except (OSError, ValueError, subprocess.SubprocessError):

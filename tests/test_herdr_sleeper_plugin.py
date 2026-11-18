@@ -10958,3 +10958,17 @@ def test_deleting_a_fired_one_shot_leaves_a_recurring_job_counted(fake: FakeHerd
     with path.open("a") as fh:
         fh.write(_tool("CronDelete", _iso(30), id="rec00001"))
     assert sleeper.scheduled_work(UUID) is None
+
+
+REAL_PROCESS_TABLE = sleeper.process_table   # the fixture replaces it; this test needs the real one
+
+
+def test_a_process_name_that_is_not_utf8_does_not_break_the_table(tmp_path: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    # macmini-prd-muc-02/mbeg-orch msg 7d8a65df (2026-11-18): byte 0xff in one comm crashed every deliver
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"#!/bin/sh\nprintf '  1     0 launchd\\n 42     1 /bin/na\\377me\\n 43     1 claude\\n'\n")
+    fake_ps.chmod(0o755)
+    monkeypatch.setattr(sleeper, "PS", str(fake_ps))
+    table = REAL_PROCESS_TABLE()
+    assert table[43] == (1, "claude") and table[42][0] == 1 and table[1] == (0, "launchd")
