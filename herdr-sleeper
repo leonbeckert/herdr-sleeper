@@ -162,7 +162,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.62"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.63"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -11735,6 +11735,10 @@ CODEX_ERROR_CELL = "■"                         # Codex starts an error cell wi
 CODEX_LIMIT_TEXT = re.compile(r"You['’]ve hit your usage limit")
 CODEX_RETRY_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AaPp][Mm])\b")
 CODEX_LIMIT_FALLBACK_SECONDS = 5 * 3600        # no reset time on screen: Codex's short window
+# A reset time on screen that passed at most this long ago is stale text (Codex says "try again at 1:23 PM"
+# once more at 1:23 PM), not tomorrow's: retry soon instead (dev-mini-setup msg 566727b9).
+CODEX_JUST_PASSED_SECONDS = 30 * 60
+CODEX_RETRY_STEPS = ((120, 120), (420, 300), (math.inf, 600))  # (passed less than, retry after) in seconds
 CODEX_MENU_HINTS = ("enter select", "esc back")
 CODEX_OPTION_LINE = re.compile(r"^\s*›\s*\d+\.\s+(.*\S)\s*$")
 CODEX_RESET_NOTE = "Your Codex usage limit has reset. Continue the task you were on."
@@ -11782,9 +11786,30 @@ def codex_stuck_screen(screen: str | None) -> tuple[str | None, str | None]:
     return "dialog", re.split(r"\s{2,}", options[-1])[0] if options else None
 
 
+def codex_shown_passed(shown: str | None, first: float) -> float | None:
+    """How many seconds before `first` today's occurrence of the time on screen was, when it was at
+    most CODEX_JUST_PASSED_SECONDS ago (a stale "try again at" at or just after the reset), else None."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2}) ([AP]M)", shown or "")
+    if not m or not 1 <= int(m.group(1)) <= 12 or int(m.group(2)) > 59:
+        return None
+    hour = int(m.group(1)) % 12 + (12 if m.group(3) == "PM" else 0)
+    seen = dt.datetime.fromtimestamp(first)
+    # today's and yesterday's occurrence (11:59 PM seen at 00:01), in real seconds (DST: Codex review)
+    for day in (seen, seen - dt.timedelta(days=1)):
+        passed = first - day.replace(hour=hour, minute=int(m.group(2)), second=0, microsecond=0).timestamp()
+        if 0 <= passed <= CODEX_JUST_PASSED_SECONDS:
+            return passed
+    return None
+
+
 def codex_reset_time(shown: str | None, first: float) -> float:
     """When a usage limit first seen at `first` lifts: the next occurrence of the time on screen
-    ("2:34 AM", this machine's local time) after `first`; no time shown: 5 h after `first`."""
+    ("2:34 AM", this machine's local time) after `first`; no time shown: 5 h after `first`. A time
+    that passed at most CODEX_JUST_PASSED_SECONDS ago is stale text, not tomorrow: a retry after 2,
+    5 or 10 minutes, the longer the further past it is (CODEX_RETRY_STEPS)."""
+    passed = codex_shown_passed(shown, first)
+    if passed is not None:
+        return first + next(delay for below, delay in CODEX_RETRY_STEPS if passed < below)
     m = re.fullmatch(r"(\d{1,2}):(\d{2}) ([AP]M)", shown or "")
     if not m or not 1 <= int(m.group(1)) <= 12 or int(m.group(2)) > 59:
         return first + CODEX_LIMIT_FALLBACK_SECONDS
@@ -11950,10 +11975,11 @@ def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: 
     pane, seq = agent["pane_id"], agent.get("state_change_seq")
     uuid = (agent.get("agent_session") or {}).get("value")
     incident = data["limits"].get(pane)
+    previous = None
     if (isinstance(incident, dict) and incident.get("continue_id") and incident.get("continue_seq") != seq
             and incident["continue_id"] in recently_delivered()):
         end_codex_limit(pane, incident, data, "hit the limit again after the continue")
-        incident = None
+        previous, incident = incident, None
     if not valid_session_id(uuid):
         note_skip(pane, "Codex usage limit, but the pane reports no session id (no mail possible)")
         return
@@ -11962,17 +11988,27 @@ def codex_limit(agent: dict, shown: str | None, first: float, where: str, data: 
             note_skip(pane, "would report a Codex usage limit (dry run)")
             return
         reset = codex_reset_time(shown, first)
-        waiters = mail_waiters(str(uuid))
+        # the same reset time shown again after our continue, now just past: a retry. The monitor and
+        # the senders already told hear nothing new; a sender who wasn't told yet still is.
+        retry = bool(previous and previous.get("shown") == shown and codex_shown_passed(shown, first) is not None)
+        told_before = set(previous.get("told") or []) if retry and previous else set()
+        waiters = [w for w in mail_waiters(str(uuid)) if w[0] not in told_before]
         incident = {"uuid": uuid, "seq": seq, "first": first, "at": now, "shown": shown, "reset": reset,
-                    "name": agent.get("name"), "told": [t for t, _ in waiters]}
+                    "name": agent.get("name"), "told": sorted(told_before) + [t for t, _ in waiters],
+                    **({"retry": True} if retry else {})}
         data["limits"][pane] = incident
         when = dt.datetime.fromtimestamp(reset).strftime("%a %H:%M")
         target = config["limit_monitor"]
         event("codex-limit", pane=pane, name=agent.get("name"), uuid=uuid, place=where, shown=shown,
-              reset=when, monitor=target or None, told=incident["told"])
-        say(f"codex usage limit in {pane} ({agent.get('name') or '-'}); continue at {when}")
+              reset=when, monitor=None if retry else target or None, told=incident["told"],
+              **({"retry": True} if retry else {}))
+        say(f"codex usage limit in {pane} ({agent.get('name') or '-'}); continue at {when}"
+            + (" (the reset time on screen just passed: a retry)" if retry else ""))
+        if retry:
+            target = None
         head = f"{where} ({agent.get('name') or pane}, pane {pane})"
-        reset_text = (f"the screen says try again at {shown}" if shown
+        reset_text = (f"the screen still says try again at {shown}, which just passed, so a retry" if retry
+                      else f"the screen says try again at {shown}" if shown
                       else "the screen shows no reset time, so 5 h after it was seen")
         if target:
             send_note(target, f"{head}: a Codex pane stopped at its usage limit; Herdr shows it "

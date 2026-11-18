@@ -9985,7 +9985,8 @@ def test_codex_reset_time_is_the_next_occurrence_after_first_seen() -> None:
     assert sleeper.codex_reset_time("2:34 AM", at(16, 1, 35)) == at(16, 2, 34)   # the night of 2026-11-16
     assert sleeper.codex_reset_time("2:34 AM", at(15, 23, 50)) == at(16, 2, 34)  # before midnight: tomorrow
     assert sleeper.codex_reset_time("2:34 AM", at(16, 0, 5)) == at(16, 2, 34)    # after midnight: today
-    assert sleeper.codex_reset_time("2:34 AM", at(16, 2, 34)) == at(17, 2, 34)   # not after it: next day
+    assert sleeper.codex_reset_time("2:34 AM", at(16, 2, 34)) == at(16, 2, 36)   # at the reset minute: stale, retry
+    assert sleeper.codex_reset_time("2:34 AM", at(16, 3, 10)) == at(17, 2, 34)   # past by more than 30 min: next day
     assert sleeper.codex_reset_time("12:05 AM", at(15, 22, 0)) == at(16, 0, 5)
     assert sleeper.codex_reset_time("12:30 PM", at(16, 9, 0)) == at(16, 12, 30)
     assert sleeper.codex_reset_time("11:59 PM", at(16, 23, 0)) == at(16, 23, 59)
@@ -10140,6 +10141,71 @@ def test_codex_limit_hit_again_after_the_continue_is_a_new_incident(fake: FakeHe
     assert [r["shown"] for r in ev("codex-limit")] == ["2:34 AM", "7:30 AM"]
     assert ev("codex-limit-end")[0]["why"] == "hit the limit again after the continue"
     assert len(ctx["notes"]) == 2 and len(mailbox_bodies(fake)) == 1
+
+
+def test_codex_reset_time_at_or_just_after_the_shown_time_retries_with_backoff() -> None:
+    # dev-mini-setup msg 566727b9: "try again at 1:23 PM" shown again at 13:23 rolled over to the next day
+    def at(h: int, m: int, sec: int = 0) -> float:
+        return dt.datetime(2026, 11, 18, h, m, sec).timestamp()
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 23, 20)) == at(13, 25, 20)  # 2 min
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 25, 30)) == at(13, 30, 30)  # 5 min
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 30, 40)) == at(13, 40, 40)  # 10 min
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 53)) == at(14, 3)           # still 30 min past: 10 min
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 54)) == dt.datetime(2026, 11, 19, 13, 23).timestamp()
+    assert sleeper.codex_reset_time("1:23 PM", at(13, 22)) == at(13, 23)          # still ahead: unchanged
+    # yesterday's occurrence counts too (Codex review): 11:59 PM seen at 00:00:30 is 90 s past, not 24 h ahead
+    assert sleeper.codex_reset_time("11:59 PM", dt.datetime(2026, 11, 19, 0, 0, 30).timestamp()) \
+        == dt.datetime(2026, 11, 19, 0, 2, 30).timestamp()
+
+
+def test_codex_reset_time_counts_real_seconds_across_a_dst_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Europe/Berlin skips 02:00-03:00 on 2026-03-29: 1:50 AM seen at 03:05 is 15 minutes past
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    time.tzset()
+    try:
+        seen = dt.datetime(2026, 3, 29, 3, 5).timestamp()
+        assert sleeper.codex_shown_passed("1:50 AM", seen) == 15 * 60
+        assert sleeper.codex_reset_time("1:50 AM", seen) == seen + 600
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+
+
+def test_codex_limit_shown_again_at_its_reset_minute_is_a_quiet_retry(fake: FakeHerdr,
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 34, 5).timestamp()
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(mailbox_bodies(fake)) == 1                                 # the continue went in
+    fake.agents[0].update(state_change_seq=9)                            # ... and hit the limit again, same text
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    first, again = ev("codex-limit")
+    assert again["shown"] == "2:34 AM" and again.get("retry") is True and again["monitor"] is None
+    assert again["reset"] == dt.datetime.fromtimestamp(sleeper.read_codex_stuck()["limits"]["w1:p1"]["reset"]).strftime("%a %H:%M")
+    reset = sleeper.read_codex_stuck()["limits"]["w1:p1"]["reset"]
+    assert reset - dt.datetime(2026, 11, 16, 2, 34).timestamp() < 15 * 60   # minutes, not a day
+    assert len(ctx["notes"]) == 1                                         # no second note to the monitor
+    ctx["clock"]["t"] = reset + 5
+    sleeper.watch_tick({}, MONITOR_CFG)
+    assert len(mailbox_bodies(fake)) == 2                                 # the retry's continue
+
+
+def test_codex_limit_first_seen_just_after_its_time_still_notifies(fake: FakeHerdr,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    # no earlier incident with that time: a short wait, but the monitor hears of it as usual
+    ctx = codex_setup(fake, monkeypatch, codex_limit_ansi())
+    ctx["clock"]["t"] = dt.datetime(2026, 11, 16, 2, 40).timestamp()
+    for _ in range(2):
+        sleeper.watch_tick({}, MONITOR_CFG)
+        ctx["clock"]["t"] += 30
+    [hit] = ev("codex-limit")
+    assert "retry" not in hit and hit["monitor"] and len(ctx["notes"]) == 1
+    assert sleeper.read_codex_stuck()["limits"]["w1:p1"]["reset"] < dt.datetime(2026, 11, 16, 3, 0).timestamp()
 
 
 def test_codex_limit_continue_waiting_is_withdrawn_when_the_screen_changes(
