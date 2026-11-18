@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.58"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.59"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -5755,9 +5755,15 @@ SECRET_PATTERNS = (
 )
 # a secret-named key's value: KEY=v, key: v, "key": "v"; a value counts when it has a digit or a symbol, or
 # is 16+ characters (prose like `password: required` stays)
-SECRET_ASSIGN = re.compile(r"(?i)\b([A-Za-z0-9_]*(?:secret|token|passw(?:or)?d|api_?key|private_key|credential)"
-                           r"[A-Za-z0-9_]*[\"']?)(\s*[=:]\s*)(?!Bearer\b)(\"[^\"\s]{6,}\"|'[^'\s]{6,}'|"
+# Key names are bounded ({0,40}): an unbounded [A-Za-z0-9_]* backtracked quadratically over a long word like
+# "tokentoken…" (Codex review of v0.1.54 search: a 256 KiB message took over 30 s). A quoted value may hold
+# spaces (a passphrase), up to 200 characters.
+SECRET_ASSIGN = re.compile(r"(?i)\b([A-Za-z0-9_]{0,40}(?:secret|token|passw(?:or)?d|api_?key|private_key|credential)"
+                           r"[A-Za-z0-9_]{0,40}[\"']?)(\s*[=:]\s*)(?!Bearer\b)(\"[^\"\n]{6,200}\"|'[^'\n]{6,200}'|"
                            r"(?=[^\s,;]*[0-9!#$%&*+/=?@^~])[^\s,;]{6,}|[^\s,;]{16,})")
+# a secret-named command-line flag's value: --password abc123, --api-key=…, --token "a b"; not a flag after it
+SECRET_FLAG = re.compile(r"(?i)(--?[A-Za-z0-9_-]{0,30}(?:secret|token|passw(?:or)?d|api[_-]?key)[A-Za-z0-9_-]{0,30}"
+                         r"(?:=|\s+))(?!-)(\"[^\"\n]{1,200}\"|'[^'\n]{1,200}'|[^\s\"'<>|;&]{4,})")
 SECRET_BEARER = re.compile(r"(?i)\b(Bearer|Basic|Authorization:)\s+[A-Za-z0-9._~+/=-]{8,}")
 SECRET_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")
 KEBAB = re.compile(r"-?(?:[A-Za-z0-9]{1,20}-){2,}[A-Za-z0-9]{1,20}")  # a path-like name (a Claude project dir)
@@ -5777,6 +5783,7 @@ def redact(text: str) -> str:
     text = SECRET_BEARER.sub(lambda m: f"{m.group(1)} {REDACTED}", text)
     text = SECRET_URL.sub(lambda m: m.group(1) + REDACTED + "@", text)
     text = SECRET_ASSIGN.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = SECRET_FLAG.sub(lambda m: m.group(1) + REDACTED, text)
     return SECRET_RUN.sub(lambda m: m.group(0) if KEBAB.fullmatch(m.group(0)) else REDACTED, text)
 
 
@@ -6295,7 +6302,7 @@ def cmd_closed_view(_args: argparse.Namespace) -> int:
             got = input("> ").strip().lower()
             if got in ("q", "quit", "exit"):
                 return 0
-            if got.isdigit() and int(got) in targets:
+            if re.fullmatch(r"[0-9]{1,4}", got) and int(got) in targets:
                 if input(f"reopen {targets[int(got)]}? [y/N] ").strip().lower() == "y":
                     code = cmd_reopen(argparse.Namespace(target=targets[int(got)], name=None, workspace=None,
                                                          sender="closed-sessions", machine=None, json=False,
@@ -6397,7 +6404,9 @@ def search_transcript(path: Path, kind: str, term: str) -> dict:
     out: dict = {"hits": hits}
     if last:
         rec, (who, text) = last
-        # redact before cutting (as the closed-session records do): a token cut in half would slip the filter
+        # redact the whole message before cutting (as the closed-session records do): a cut, even a wide window,
+        # can separate a value from what marks it (a PEM header, a `password=` label). Linear since the key
+        # names are bounded (1.2 MB in 0.1 s); only the newest hit of a session is redacted.
         flat = redact(" ".join(CONTROL_CHARS.sub(" ", text).split()))
         start = max(0, flat.casefold().find(needle) - SEARCH_SNIPPET // 3)  # -1: the hit was redacted away
         cut = flat[start:start + SEARCH_SNIPPET]
@@ -6461,6 +6470,26 @@ def machines_search(term: str) -> tuple[list[dict], list[str]]:
     return rows, problems
 
 
+def search_everywhere(term: str, others: bool = True) -> tuple[list[dict], list[str]]:
+    """This machine's rows and (others) every saved machine's, asked at the same time; newest hit first."""
+    remote: dict[str, Any] = {"rows": [], "problems": []}
+
+    def ask() -> None:
+        try:
+            remote["rows"], remote["problems"] = machines_search(term)
+        except Exception as exc:  # never lose this machine's rows over the others
+            remote["problems"] = [f"other machines: {exc}"]
+    t = threading.Thread(target=ask, daemon=True)
+    if others:
+        t.start()
+    rows = search_rows(term)
+    if others:
+        t.join(SEARCH_SECONDS + 2)
+        if t.is_alive():
+            remote["problems"] = [f"other machines: no answer within {SEARCH_SECONDS}s"]
+    return sorted(rows + list(remote["rows"]), key=_search_order), list(remote["problems"])
+
+
 def search_term_problem(term: str) -> str | None:
     if not term.strip():
         return "give a word to search for"
@@ -6512,15 +6541,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"search: {problem}", file=sys.stderr)
         return 2
     try:
-        rows = search_rows(term)
+        rows, problems = search_everywhere(term, others=not args.here)
     except (SleeperError, ConfigError) as exc:
         print(f"search: {exc}", file=sys.stderr)
         return 1
-    problems: list[str] = []
-    if not args.here:
-        more, problems = machines_search(term)
-        rows += more
-    rows.sort(key=_search_order)
     if args.json:
         for p in problems:
             print(f"WARNING: {p}", file=sys.stderr)
@@ -6555,6 +6579,34 @@ def search_focus(r: dict) -> str:
     return ""
 
 
+def search_goto_text(r: dict) -> str:
+    """What to type into Herdr's Goto picker (prefix+g, `/` searches names and tabs) to find the row's session:
+    its tab label as the sidebar shows it, else its name unless that is a sleeper's made-up `wake-…` name
+    (Herdr doesn't know it), else ""; printable characters only (the labels come from another machine)."""
+    tab = ui_label(str(r.get("place") or "").rpartition(PLACE_SEP)[2]) or ""
+    name = ui_label(r.get("name")) or ""
+    if re.fullmatch(r"wake-[A-Za-z0-9]+-[A-Za-z0-9]+", name):
+        name = ""
+    return (tab or name)[:80]
+
+
+def search_elsewhere(r: dict, out: Any = None) -> str:
+    """A row on another machine: Herdr's API can focus that machine's pane but not switch the owner's window
+    to that machine (owner's test 2026-11-18, to-do ask 0975a7e1: the window stayed). So focus it there (that
+    machine then shows that tab once selected), put its name into the clipboard, and say the keys for the
+    Goto picker, which lists every connected machine's agents."""
+    failed = search_focus(r)
+    text = search_goto_text(r)
+    where = f"{ui_place(r)} runs on {r.get('machine')}: Herdr can't switch your window to another machine from here."
+    if failed:
+        where += f" Focusing it there failed too ({failed})."
+    if not text:
+        return where + " It has no tab label or name to search for; find it in the sidebar. Enter closes this."
+    copy_to_clipboard(out or sys.stdout, text)
+    return (f"{where} Copied {text!r} to your clipboard. Close this with Enter, then press ctrl+b g, then /, "
+            "paste, Enter.")
+
+
 def cmd_search_view(_args: argparse.Namespace) -> int:
     """The `search` popup: type a word, get the running sessions that mention it on every machine, newest
     hit first, numbered; a number goes to that pane (a sleeper shows its stub: Enter there wakes it),
@@ -6578,9 +6630,8 @@ def cmd_search_view(_args: argparse.Namespace) -> int:
                     term = ""
                     continue
                 print(f"searching for {term!r} …", flush=True)
-                rows = search_rows(term)
-                more, problems = machines_search(term)
-                rows, skipped = search_split(sorted(rows + more, key=_search_order))
+                rows, problems = search_everywhere(term)
+                rows, skipped = search_split(rows)
                 note = "\n".join([f"WARNING: {p}" for p in problems] + ([skipped] if skipped else []))
             width = max(40, shutil.get_terminal_size((100, 30)).columns - 6)
             shown = rows[:SEARCH_VIEW_ROWS]
@@ -6599,8 +6650,12 @@ def cmd_search_view(_args: argparse.Namespace) -> int:
                 return 0
             if not got:
                 term = ""
-            elif got.isdigit() and 1 <= int(got) <= len(shown):
-                failed = search_focus(shown[int(got) - 1])
+            elif re.fullmatch(r"[0-9]{1,4}", got) and 1 <= int(got) <= len(shown):
+                hit = shown[int(got) - 1]
+                if machine_label(hit.get("machine")):
+                    input(search_elsewhere(hit) + " ")
+                    return 0
+                failed = search_focus(hit)
                 if not failed:
                     return 0
                 input(f"{failed}; Enter to go back ")

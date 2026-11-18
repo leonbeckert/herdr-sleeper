@@ -10972,3 +10972,51 @@ def test_a_process_name_that_is_not_utf8_does_not_break_the_table(tmp_path: Path
     monkeypatch.setattr(sleeper, "PS", str(fake_ps))
     table = REAL_PROCESS_TABLE()
     assert table[43] == (1, "claude") and table[42][0] == 1 and table[1] == (0, "launchd")
+
+
+def test_a_hit_on_another_machine_hands_over_to_the_goto_picker(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    ran: list[list[str]] = []
+    monkeypatch.setattr(sleeper.subprocess, "run", lambda argv, **_k: ran.append(argv) or types.SimpleNamespace(
+        returncode=0, stdout='{"result": {}}', stderr=""))
+    out = io.StringIO()
+    note = sleeper.search_elsewhere({"machine": "dev2", "pane": "w2:p1", "place": "ao › far-tab", "name": None}, out)
+    assert ran == [[sleeper.HERDR_BIN, "--machine", "dev2", "agent", "focus", "w2:p1"]]   # that machine shows it
+    assert "\x1b]52;c;" + __import__("base64").b64encode(b"far-tab").decode() in out.getvalue()
+    assert "ctrl+b g" in note and "'far-tab'" in note and "dev2 › ao › far-tab" in note
+    assert sleeper.search_goto_text({"name": "opf-c45", "place": "agents › x"}) == "x"           # the tab Goto shows
+    assert sleeper.search_goto_text({"name": "wake-w2-p1", "place": None}) == ""                # made-up sleeper name
+    assert sleeper.search_goto_text({"name": "real", "place": None}) == "real"
+    assert sleeper.search_goto_text({"name": None, "place": "ao › a\x1b]0;x\x07b\nc"}) == "a]0;xbc"  # printable only
+    monkeypatch.setattr(sleeper.subprocess, "run", lambda argv, **_k: types.SimpleNamespace(
+        returncode=1, stdout="", stderr="machine dev2 is offline"))
+    out = io.StringIO()
+    note = sleeper.search_elsewhere({"machine": "dev2", "pane": "w2:p1", "place": None, "name": "wake-w2-p1"}, out)
+    assert "Focusing it there failed too" in note and "offline" in note and "find it in the sidebar" in note
+    assert out.getvalue() == ""                                                                  # nothing copied
+
+
+def test_redact_takes_passphrases_and_password_flags() -> None:
+    for text, gone in (('password: "correct horse battery staple"', "horse"),
+                       ("mysql --password abc123def456 -h db", "abc123def456"),
+                       ("tool --api-key=zz99yy88 run", "zz99yy88"),
+                       ("cli --token 'a b c d'", "a b c d")):
+        assert gone not in sleeper.redact(text), text
+    assert sleeper.redact("docker login --password-stdin < f") == "docker login --password-stdin < f"
+    assert "required" in sleeper.redact("password: required")                 # prose stays
+
+
+def test_redact_and_search_stay_linear_on_huge_messages(state: Path) -> None:
+    started = time.monotonic()
+    sleeper.redact("token" * 52_000)                                          # 256 KiB, one word
+    assert time.monotonic() - started < 5
+    path = state / "projects" / "proj" / f"{UUID}.jsonl"
+    path.write_text(_claude_lines(_said("assistant", ("token " * 200_000) + "needle here")))
+    started = time.monotonic()
+    got = sleeper.search_transcript(path, "claude", "needle")
+    assert got["hits"] == 1 and "needle here" in got["snippet"] and time.monotonic() - started < 5
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 300                                 # 9.6 KB key body
+    path.write_text(_claude_lines(_said("assistant", f"-----BEGIN PRIVATE KEY-----\n{body}\nneedle")))
+    assert "MIIEvQ" not in sleeper.search_transcript(path, "claude", "needle")["snippet"]
+    path.write_text(_claude_lines(_said("assistant", "password=" + "q" * 9000 + " needle")))
+    assert "qqqq" not in sleeper.search_transcript(path, "claude", "needle")["snippet"]

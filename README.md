@@ -1038,15 +1038,20 @@ herdr-sleeper search-view-open         # the popup (plugin action `search`; bind
   Tool calls, tool output, reasoning, Claude Code's own records and Codex's setup
   messages are left out. Any case; the words as one phrase. Plain-ASCII words
   filter the transcript's lines as bytes first, so ~300 MB of transcripts take
-  about a second. opencode sessions are not searched yet.
+  about a second. The filter compares bytes, so `ß` is not found by `ss` and a JSON escape (`\/`,
+  `\u0041`) not by its character; Claude and Codex write neither escape. opencode sessions are
+  not searched yet.
 - **A row.** `machine › workspace › tab`, the name, kind and state, the number of
   hits, the newest one's time and a snippet around it (who said it, the credential
   filter of the closed-session records applied). A session whose transcript can't
   be found is named in one `not searched:` line.
 - **The popup.** Type the words, Enter; a number goes to that session's pane
-  (`herdr agent focus`, through `herdr --machine LABEL` for another machine's; a
-  sleeper shows its stub, Enter there wakes it); Enter on its own searches again,
-  q closes.
+  (`herdr agent focus`; a sleeper shows its stub, Enter there wakes it); Enter on
+  its own searches again, q closes. A session on another machine: Herdr's API
+  focuses that machine's pane (`herdr --machine LABEL agent focus`) but can't switch
+  the owner's window to that machine (tested 2026-11-18, v0.1.54), so the popup
+  focuses it there, copies its tab label (else its name) to the clipboard (OSC 52) and
+  says the keys for Herdr's Goto picker: `prefix+g`, `/`, paste, Enter (*v0.1.59*).
 - **Other machines.** Each saved machine runs `search --here --json` over the same
   SSH as `presence`, in parallel (30 s at most); the words cross only in the
   `presence` argument form (letters, digits, spaces and `./:@=,+~%_-`). A machine
