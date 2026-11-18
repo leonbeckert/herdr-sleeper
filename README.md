@@ -475,7 +475,11 @@ herdr-sleeper ask --done ID                                     # a to-do the se
   takes `d` (done), `x REASON` (can't or won't), or a note. Every answer is
   confirmed: the confirm line names the item number, its question and the
   answer, and a single `y` or Enter sends it (`2`, Enter, `y`: three keys); a
-  stray `1` meant for a Claude menu next door is never sent on its own. A
+  stray `1` meant for a Claude menu next door is never sent on its own. At the
+  confirm step nothing typed is lost: typing on adds to the answer (after a
+  space), Esc or Backspace bring it back to edit, only Ctrl-U clears it.
+  Option-Backspace and Ctrl-W delete the last word; a plain Esc while typing
+  clears the input, an Option key combination never does. A
   single Ctrl-D does nothing; only a terminal that is gone ends the panel.
   `s` focuses the session's pane, re-resolved live; a sleeping session is not
   focused (that would wake it). Session text is shown without escape, control

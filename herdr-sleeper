@@ -158,7 +158,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.59"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.60"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7706,7 +7706,7 @@ def panel_lines(v: PanelView, color: bool = True) -> list[str]:
                                                           "   ")[:3]],
                          *([fit(f"   ({str(v.pending.get('shown')).count(chr(10)) + 1} lines in all)")]
                            if "\n" in str(v.pending.get("shown") or "") else []),
-                         fit("y or Enter sends it · n or Esc goes back")]))
+                         fit("y or Enter sends it · Esc edits it · typing on adds to it")]))
     elif rec and ask_kind(rec) == TODO:
         segs.append((1, wrap_text(f"{TODO_DONE} done · {TODO_CANT} REASON can't · or a note; Enter, then y or Enter",
                                   W)[:2]))
@@ -8417,13 +8417,25 @@ class TtyKeys:
         out: list[str] = []
         i = 0
         names = {"\r": "ENTER", "\n": "ENTER", "\x7f": "BS", "\x08": "BS", "\x15": "KILL", "\x03": "KILL",
-                 "\t": "NEXT", "\x0c": "REDRAW"}
+                 "\t": "NEXT", "\x0c": "REDRAW", "\x17": "WORD_BS"}
         while i < len(text):
             ch = text[i]
+            if ch == "\x1b" and text[i + 1:i + 2] in ("\x7f", "\x08"):
+                out.append("WORD_BS")   # Option+Backspace (Esc then Backspace): the last word, not the input
+                i += 2
+                continue
+            if ch == "\x1b" and text[i + 1:i + 2] not in ("", "[", "O", "\x1b") and text[i + 1].isprintable():
+                i += 2                  # Option+letter (Esc then a key, e.g. Option+arrow as Esc b/f): no clear
+                continue
             if ch == "\x1b":
                 m = re.match(r"\x1b\[[0-9;]*([A-Za-z~])|\x1bO([A-Za-z])", text[i:])
                 if m:
                     final = m.group(1) or m.group(2)
+                    kitty = re.fullmatch(r"\x1b\[(?:127|8);(\d+)u", m.group(0))  # kitty keys: Backspace + mods
+                    if kitty and (int(kitty.group(1)) - 1) & 6:                   # Alt or Ctrl held
+                        out.append("WORD_BS")
+                        i += m.end()
+                        continue
                     out += {"A": ["PREV"], "B": ["NEXT"], "Z": ["PREV"]}.get(final, [])
                     i += m.end()
                     continue
@@ -8599,16 +8611,19 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
             continue
         rec = dict(items).get(cur) or items[0][1]
         if isinstance(key, Paste):  # a pasted block joins the answer whole; it never sends by itself
+            if pending:  # pasted at the confirm step: it adds to the staged answer, never replaces it
+                buf = str(pending.get("typed") or "")
+                buf += ("\n" if "\n" in key else " ") if buf and key[:1] not in (" ", "\n") else ""
             add = key[:max(0, ASK_PASTE_MAX - len(buf))]
             buf += add
-            note = ("Not sent: your paste starts a new answer. " if pending else "") + (
+            note = ("Not sent yet: your paste was added to your answer. " if pending else "") + (
                 f"Pasted {add.count(chr(10)) + 1} lines; Enter, then y or Enter sends it." if "\n" in add.strip()
                 else "")
             if len(add) < len(key):
                 note += f" Cut at {ASK_PASTE_MAX} characters."
             pending, shown = None, ()
             continue
-        if pending:  # the confirm step: y or Enter sends, n/Esc goes back, any other key starts anew
+        if pending:  # the confirm step: y or Enter sends; Esc/Backspace edit it; typing on adds to it
             go = pending
             typed = not isinstance(key, BurstKey)  # a key that came with others was pasted: it never sends
             if typed and (key in ("y", "Y") or (key == "ENTER" and not buf)):
@@ -8620,9 +8635,18 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
                 else:
                     woke = status == SENT and not go["keep"]
                 continue
-            pending, shown, note = None, (), "Not sent; answer again."
-            if key in ("n", "N", "ESC", "KILL", "ENTER", "BS"):
+            # Never throw the staged text away (owner 2026-11-18: typing on after Enter deleted it): it
+            # comes back into the input, and a typed key continues it after a space. Ctrl+U clears.
+            pending, shown, note = None, (), ""
+            if key == "KILL":
+                buf, note = "", "Not sent; cleared."
                 continue
+            buf = str(go.get("typed") or "")
+            if key in ("ESC", "BS", "ENTER"):
+                note = "Not sent; edit your answer, then Enter."
+                continue
+            if len(key) == 1 and not key.isspace() and buf and not buf[-1].isspace():
+                buf += " "
         if key in ("NEXT", "PREV"):
             i = ids.index(cur) if cur in ids else 0
             cur, page, pending = ids[(i + (1 if key == "NEXT" else -1)) % len(ids)], 0, None
@@ -8639,6 +8663,10 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
                 buf = buf[:-1]
                 out.write("\b \b")
                 out.flush()
+            continue
+        if key == "WORD_BS":   # Option+Backspace or Ctrl+W: the last word and the spaces after it
+            buf = re.sub(r"\S*\s*$", "", buf, count=1) if buf.strip() else ""
+            shown = ()
             continue
         if key != "ENTER":
             if len(key) == 1 and len(buf) < (2000 if "\n" not in buf else ASK_PASTE_MAX):
@@ -8688,7 +8716,7 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
             continue
         state, body, keep = got_answer
         pending = {"id": cur, "slot": rec.get("slot"), "state": state, "body": body, "keep": keep,
-                   "shown": body.split("\nA: ", 1)[-1]}
+                   "shown": body.split("\nA: ", 1)[-1], "typed": text}
         note = ""
 
 

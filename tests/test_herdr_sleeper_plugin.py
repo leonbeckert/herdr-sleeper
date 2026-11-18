@@ -11020,3 +11020,48 @@ def test_redact_and_search_stay_linear_on_huge_messages(state: Path) -> None:
     assert "MIIEvQ" not in sleeper.search_transcript(path, "claude", "needle")["snippet"]
     path.write_text(_claude_lines(_said("assistant", "password=" + "q" * 9000 + " needle")))
     assert "qqqq" not in sleeper.search_transcript(path, "claude", "needle")["snippet"]
+
+
+def test_option_backspace_deletes_a_word_and_option_keys_never_clear_the_input() -> None:
+    assert sleeper.TtyKeys.tokens("\x1b\x7f") == ["WORD_BS"]          # Option+Backspace
+    assert sleeper.TtyKeys.tokens("\x1b\x08") == ["WORD_BS"]
+    assert sleeper.TtyKeys.tokens("\x17") == ["WORD_BS"]              # Ctrl+W
+    assert sleeper.TtyKeys.tokens("\x1b[127;3u") == ["WORD_BS"]       # kitty protocol: Alt+Backspace
+    assert sleeper.TtyKeys.tokens("\x1b[127;1u") == []
+    assert sleeper.TtyKeys.tokens("\x1bb\x1bf") == []                 # Option+Left/Right: nothing, no clear
+    assert sleeper.TtyKeys.tokens("\x1b") == ["ESC"]                  # a plain Esc still clears
+    assert sleeper.TtyKeys.tokens("\x1b[A") == ["PREV"]
+
+
+def test_panel_option_backspace_takes_back_one_word(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    _sync_delivery(monkeypatch)
+    assert _panel(fake, monkeypatch, "x tomorrow morning", "\x1b\x7f", "late\r", "y") == 0
+    (rec,) = _asks().values()
+    assert rec["state"] == "declined" and "can't or won't do it: tomorrow late" in prompts(fake)[-1][3]
+
+
+def test_panel_typing_on_after_enter_adds_to_the_staged_answer(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    _sync_delivery(monkeypatch)
+    # Enter stages "x it is down"; typing on continues it instead of starting anew; Enter, y sends both
+    assert _panel(fake, monkeypatch, "x it is down\r", "s", "ince noon\r", "y") == 0
+    assert "can't or won't do it: it is down since noon" in prompts(fake)[-1][3]
+
+
+def test_panel_esc_at_the_confirm_step_brings_the_text_back_and_ctrl_u_clears(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="check the canary") == 0
+    _sync_delivery(monkeypatch)
+    assert _panel(fake, monkeypatch, "looks fine\r", "\x1b", "\x7f\x7f\x7f\x7fgood\r", "y") == 0
+    assert "note: looks good" in prompts(fake)[-1][3]
+
+
+def test_panel_ctrl_u_at_the_confirm_step_clears_the_staged_answer(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="check it again") == 0
+    _sync_delivery(monkeypatch)
+    assert _panel(fake, monkeypatch, "wrong\r", "\x15", "ok\r", "y") == 0
+    assert prompts(fake)[-1][3].endswith("A: note: ok")
