@@ -163,7 +163,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.65"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.66"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -270,6 +270,9 @@ DEFAULTS = {
     "auto_resume_exclude": [],   # pane ids or names auto-resume never types into (the sleep exclude does not count)
     "ask_gate": True,            # a turn that ends waiting on the owner without an ask covering it is sent back
     "ask_mirror": True,          # every open ask also goes to the owner's phone as a Moshi question (moshi-hook ask)
+    "mail_only": False,          # the watcher only types queued mail in and tends `close --self` (a host that
+                                 # never sleeps: the EX44 agents VM); no sleep, reconcile, dialogs, asks
+    "untrusted": [],             # saved machines whose terminal is never attached here (`view` refuses them)
 }
 
 
@@ -788,7 +791,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
         raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
-    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude", "never_show"):
+    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude", "never_show", "untrusted"):
         v = values[key]
         if isinstance(v, str):
             v = [v]
@@ -799,7 +802,7 @@ def load_config() -> tuple[dict, dict[str, str]]:
     if unknown:
         raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
     for key in ("notify", "wake_on_focus", "dry_run", "restart_outdated", "answer_dialogs", "auto_resume",
-                "codex_stuck", "ask_gate", "ask_mirror"):
+                "codex_stuck", "ask_gate", "ask_mirror", "mail_only"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
     if not isinstance(values["machine"], str) or (values["machine"] and not MACHINE_RE.fullmatch(values["machine"])):
@@ -6830,6 +6833,9 @@ def view_relay(argv: list[str], gone: Callable[[], str], idle: float = VIEW_IDLE
 def view_target(label: str | None, pane: str, session: str) -> tuple[str, str, str | None]:
     """(SSH target, terminal id, agent) of the pane the search found, else SleeperError: the machine must be
     saved, and the pane must still hold that session (a closed session's pane id can be reused)."""
+    if label and canonical_label(label) in {canonical_label(m) for m in load_config()[0]["untrusted"]}:
+        # a raw terminal stream can't be filtered: a hostile machine's escapes would reach this one
+        raise SleeperError(f"{label} is untrusted here (config `untrusted`): its terminal is never attached")
     target = saved_machines().get(label or "")
     if not label or not target or not REMOTE_TARGET_RE.fullmatch(pane) or not VIEW_SESSION_RE.fullmatch(session):
         raise SleeperError(f"{label} {pane}: not a session on a saved machine")
@@ -9845,6 +9851,90 @@ def remote_target_problem(target: str) -> str | None:
             "session id ([A-Za-z0-9_.:@-], not starting with '-')")
 
 
+REMOTE_OUTPUT_LIMIT = 4 * 1024 * 1024  # bytes per stream from another machine; more ends the SSH
+REMOTE_ROWS_LIMIT = 5000               # entries per JSON list from another machine (a flood of `{}` rows)
+# Terminal controls another machine's text must never carry to this one's terminal (OSC 52 clipboard writes,
+# cursor moves, a fake row): C0 except tab and newline, DEL and C1, raw or as a JSON \u escape.
+REMOTE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+REMOTE_JSON_CONTROL_RE = re.compile(r"\\u00(?:[01][0-9a-fA-F]|7[fF]|[89][0-9a-fA-F])")
+
+
+def remote_text(text: str) -> str:
+    """Another machine's output with its terminal controls (raw and JSON-escaped) shown as U+FFFD."""
+    return REMOTE_JSON_CONTROL_RE.sub(r"\\ufffd", REMOTE_CONTROL_RE.sub("\ufffd", text))
+
+
+def remote_json_clean(value: Any) -> Any:
+    """Decoded JSON from another machine: every string without controls (JSON's short escapes \\r, \\b,
+    \\f decode to them too), every list at most REMOTE_ROWS_LIMIT long (else OverflowError)."""
+    if isinstance(value, str):
+        return REMOTE_CONTROL_RE.sub("\ufffd", value)
+    if isinstance(value, list):
+        if len(value) > REMOTE_ROWS_LIMIT:
+            raise OverflowError(f"more than {REMOTE_ROWS_LIMIT} entries in a list")
+        return [remote_json_clean(v) for v in value]
+    if isinstance(value, dict):
+        if len(value) > REMOTE_ROWS_LIMIT:
+            raise OverflowError(f"more than {REMOTE_ROWS_LIMIT} keys in an object")
+        return {remote_json_clean(k): remote_json_clean(v) for k, v in value.items()}
+    return value
+
+
+def remote_stdout(text: str) -> str:
+    """Another machine's stdout made safe: JSON is decoded, cleaned and encoded again, other text stripped."""
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return remote_text(text)
+    return json.dumps(remote_json_clean(value), ensure_ascii=False) + ("\n" if text.endswith("\n") else "")
+
+
+def run_bounded(argv: list[str], stdin: str, timeout: float, limit: int | None = None
+                ) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True) that reads at most `limit` bytes per stream:
+    a peer that sends more is killed and refused (a hostile machine must not fill this one's memory)."""
+    limit = REMOTE_OUTPUT_LIMIT if limit is None else limit
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out: dict[str, bytes] = {}
+    over: list[str] = []
+
+    def drain(name: str, stream: Any) -> None:
+        buf = bytearray()
+        while chunk := stream.read(65536):
+            if len(buf) + len(chunk) > limit:
+                over.append(name)
+                proc.kill()
+                break
+            buf += chunk
+        out[name] = bytes(buf)
+
+    def feed() -> None:  # in a thread: a peer that doesn't read its stdin must not outlast the timeout
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.write(stdin.encode("utf-8"))
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.close()
+
+    readers = [threading.Thread(target=drain, args=(n, s), daemon=True)
+               for n, s in (("stdout", proc.stdout), ("stderr", proc.stderr))]
+    readers.append(threading.Thread(target=feed, daemon=True))
+    for t in readers:
+        t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for t in readers:
+            t.join(5)
+    if over:
+        raise OverflowError(f"more than {limit} bytes on {over[0]}")
+    return subprocess.CompletedProcess(argv, proc.returncode,
+                                       out.get("stdout", b"").decode("utf-8", "replace"),
+                                       out.get("stderr", b"").decode("utf-8", "replace"))
+
+
 def remote_sleeper(label: str, argv: list[str], stdin: str = "", timeout: float = REMOTE_SECONDS,
                    connect_timeout: int = 10) -> subprocess.CompletedProcess:
     """`herdr-sleeper ARGV` on a saved machine. BatchMode (an agent can't answer a prompt), no tty,
@@ -9861,15 +9951,19 @@ def remote_sleeper(label: str, argv: list[str], stdin: str = "", timeout: float 
                            "control characters are refused)")
     command = " ".join(shlex.quote(a) for a in ["herdr-sleeper", *argv])
     try:
-        done = subprocess.run([SSH_BIN, "-T", "-a", "-x", "-o", "BatchMode=yes", "-o",
-                               f"ConnectTimeout={connect_timeout}", "-o", "ClearAllForwardings=yes",
-                               machines[label], command],
-                              input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout)
+        done = run_bounded([SSH_BIN, "-T", "-a", "-x", "-o", "BatchMode=yes", "-o",
+                            f"ConnectTimeout={connect_timeout}", "-o", "ClearAllForwardings=yes",
+                            machines[label], command], stdin, timeout)
     except subprocess.TimeoutExpired:
         raise SleeperError(f"{label}: no answer within {int(timeout)}s")
+    except OverflowError as exc:
+        raise SleeperError(f"{label}: answer refused, {exc}")
     except OSError as exc:
         raise SleeperError(f"{label}: cannot run ssh: {exc}")
+    try:
+        done.stdout, done.stderr = remote_stdout(done.stdout), remote_text(done.stderr)
+    except OverflowError as exc:
+        raise SleeperError(f"{label}: answer refused, {exc}")
     if done.returncode == 255:
         last = (done.stderr.strip().splitlines() or ["no detail"])[-1]
         raise SleeperError(f"{label}: SSH to {machines[label]} failed: {last}")
@@ -9959,7 +10053,8 @@ def routed(cmd: str, args: argparse.Namespace) -> int | None:
 def clean_presence_row(row: dict, label: str) -> dict:
     """A remote presence row reduced to the known fields as strings (or None), whatever version
     or shape the other machine sends."""
-    out = {k: (None if row.get(k) is None else str(row.get(k))) for k in PRESENCE_FIELDS}
+    out = {k: (None if row.get(k) is None else " ".join(remote_text(str(row.get(k))).split())[:512])
+           for k in PRESENCE_FIELDS}
     out["state"] = out["state"] or "unknown"
     out["pane"] = out["pane"] or "?"
     out["machine"] = label
@@ -12903,6 +12998,11 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     mail_refusal re-reads fresh state; an auto-resume note queued in sleep_tick goes in here), then
     pending `close --self` wishes (after the flush: mail typed in cancels them)."""
     agents = list_agents()
+    if config["mail_only"]:  # a host that never sleeps: mail and the sessions' own close wishes, nothing else
+        flush_mail_safely(agents)
+        if not STOP["requested"]:
+            tend_self_closes()
+        return
     if STALLED and config["auto_resume"]:
         try:  # outside the lock: a probe can take seconds
             refresh_gate(time.time())

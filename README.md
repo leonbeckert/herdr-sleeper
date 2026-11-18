@@ -1100,6 +1100,9 @@ herdr-sleeper search-view-open         # the popup (plugin action `search`; bind
     `search` and Herdr's own `--machine` forwarding). Rows always carry the machine
     that was asked, never one they name themselves, and a view checks that the pane
     still holds the session the search found.
+  - Config `untrusted = ["agents-prd-fsn1-01"]` (*v0.1.66*): a view never attaches
+    those machines' terminals. A raw terminal stream can't be filtered, and a host
+    next to untrusted code could send escapes (OSC 52 writes the clipboard).
 - **Other machines.** Each saved machine runs `search --here --json` over the same
   SSH as `presence`, in parallel (30 s at most); the words cross only in the
   `presence` argument form (letters, digits, spaces and `./:@=,+~%_-`). A machine
@@ -1111,6 +1114,13 @@ herdr-sleeper search-view-open         # the popup (plugin action `search`; bind
   (`HERDR_SLEEPER_SEARCH_AS_AGENT=1` for a test). Nothing is stored.
 
 ## Other machines
+
+*v0.1.66:* everything another machine answers is treated as hostile. At most 4 MiB
+per stream (more ends the SSH), JSON is decoded and every string loses its terminal
+controls (C0 but tab and newline, DEL, C1; `\r`, `\b`, `\f` and `\u001b`
+escapes included) and every list stops at 5000 entries; other text loses them too.
+`mail_only = true` makes the watcher only type queued mail in and tend `close
+--self`, for a host whose sessions never sleep.
 
 Herdr's saved SSH machines (`herdr machine list`) extend `deliver`, `wake`,
 `close`, `presence`, `insomnia list` and `spawn` to another machine:

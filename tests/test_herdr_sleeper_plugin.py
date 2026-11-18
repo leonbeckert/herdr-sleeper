@@ -636,7 +636,7 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
                       "restart_outdated": False, "machine": "", "machine_aliases": [],
                       "answer_dialogs": True, "limit_monitor": "", "codex_stuck": True, "auto_resume": True,
                       "auto_resume_max_age_hours": 24.0, "auto_resume_exclude": [], "ask_gate": True,
-                      "ask_mirror": True}
+                      "ask_mirror": True, "mail_only": False, "untrusted": []}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
@@ -1636,6 +1636,27 @@ def test_watch_tick_sleeps_only_after_window(fake: FakeHerdr, state: Path,
     clock["t"] += 3700
     sleeper.watch_tick(clocks, config)
     assert journal()["w1:p1"]["phase"] == "asleep"                # now a full quiet hour has passed
+
+
+def test_mail_only_watcher_delivers_mail_and_nothing_else(fake: FakeHerdr, state: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = state / "config.toml"
+    cfg.write_text('idle = "1m"\nmail_only = true\n')
+    monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
+    calls: list[str] = []
+    monkeypatch.setattr(sleeper, "flush_mail", lambda agents: calls.append("mail"))
+    monkeypatch.setattr(sleeper, "tend_self_closes", lambda: calls.append("close-self"))
+    for name in ("sleep_tick", "reap_lost_asks", "tend_ask_mirrors", "refresh_gate"):
+        monkeypatch.setattr(sleeper, name, lambda *a, _n=name, **k: pytest.fail(f"{_n} ran in mail_only"))
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(sleeper.time, "time", lambda: clock["t"])
+    config, _src = sleeper.load_config()
+    assert config["mail_only"] is True
+    clocks: dict[str, Any] = {}
+    for _ in range(2):
+        sleeper.watch_tick(clocks, config)
+        clock["t"] += 3600
+    assert calls == ["mail", "close-self"] * 2 and journal() == {} and clocks == {}
 
 
 def _three_idle_agents(fake: FakeHerdr, state: Path) -> dict[str, Any]:
@@ -4499,6 +4520,60 @@ def test_remote_failures_raise(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) ->
     ssh.bin.write_text("#!/bin/sh\nsleep 5\n")
     with pytest.raises(sleeper.SleeperError, match="no answer within 1s"):
         sleeper.remote_sleeper("dev2", ["presence"], timeout=1)
+
+
+def test_remote_output_loses_its_terminal_controls(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    # A hostile machine (the EX44 agents VM sits next to MR CI code) must not reach this terminal:
+    # OSC 52 writes the clipboard, CSI moves the cursor, raw or JSON-escaped, on stdout or stderr.
+    osc52 = "\x1b]52;c;cm0gLXJmIH4=\x07"
+    rows = [{"state": "idle", "name": "x" + osc52, "pane": "w1:p1\nfake\trow", "cwd": "/\x9b2J" + "y" * 900}]
+    ssh.reply(stdout=json.dumps(rows), stderr=osc52)
+    done = sleeper.remote_sleeper("dev2", ["presence", "--json"])
+    assert "\x1b" not in done.stdout + done.stderr and "\\u001b" not in done.stdout and "\\u009b" not in done.stdout
+    row = sleeper.clean_presence_row(json.loads(done.stdout)[0], "dev2")
+    assert row["name"].startswith("x\ufffd]52;") and row["pane"] == "w1:p1 fake row"
+    assert "\x9b" not in row["cwd"] and len(row["cwd"]) == 512
+    assert sleeper.relay_remote("presence", "dev2", ["presence"]) == 0
+    out = capsys.readouterr()
+    assert not sleeper.REMOTE_CONTROL_RE.search(out.out.replace("\n", "") + out.err)
+    ssh.reply(stdout="ok\n", stderr="bad\x1b[2J\n", rc=255)
+    with pytest.raises(sleeper.SleeperError) as exc:
+        sleeper.remote_sleeper("dev2", ["presence"])
+    assert "\x1b" not in str(exc.value)
+
+
+def test_remote_output_is_bounded(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "REMOTE_OUTPUT_LIMIT", 1000)
+    ssh.bin.write_text("#!/bin/sh\nyes flood\n")          # never ends on its own
+    started = time.monotonic()
+    with pytest.raises(sleeper.SleeperError, match="answer refused, more than 1000 bytes on stdout"):
+        sleeper.remote_sleeper("dev2", ["presence"])
+    assert time.monotonic() - started < 10
+    ssh.bin.write_text("#!/bin/sh\nexec sleep 30\n")        # never reads its stdin
+    with pytest.raises(sleeper.SleeperError, match="no answer within 1s"):
+        sleeper.remote_sleeper("dev2", ["deliver", "x"], "b" * 1_000_000, timeout=1)
+
+
+def test_remote_json_is_cleaned_after_decoding_and_capped(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    # JSON's short escapes decode to controls: \\r rewrites a line, \\b and \\f move the cursor.
+    ssh.reply(stdout='[{"name": "a\\rb\\bc\\fd", "nested": {"x\\r": ["e\\u001b"]}}]\n')
+    done = sleeper.remote_sleeper("dev2", ["search", "--json"])
+    assert json.loads(done.stdout) == [{"name": "a\ufffdb\ufffdc\ufffdd", "nested": {"x\ufffd": ["e\ufffd"]}}]
+    monkeypatch.setattr(sleeper, "REMOTE_ROWS_LIMIT", 3)
+    ssh.reply(stdout=json.dumps([{}] * 4))
+    with pytest.raises(sleeper.SleeperError, match="answer refused, more than 3 entries"):
+        sleeper.remote_sleeper("dev2", ["presence", "--json"])
+    ssh.reply(stdout=json.dumps({"rows": [[1, 2, 3, 4]]}))
+    with pytest.raises(sleeper.SleeperError, match="more than 3 entries"):
+        sleeper.remote_sleeper("dev2", ["ask", "--list", "--json"])
+
+
+def test_view_never_attaches_an_untrusted_machine(ssh: FakeSsh, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "herdr", lambda *a, **k: pytest.fail("no pane lookup for an untrusted machine"))
+    sleeper.CONFIG_FILE.write_text('machine = "dev1"\nexclude = []\nuntrusted = ["dev2"]\n')
+    with pytest.raises(sleeper.SleeperError, match="dev2 is untrusted here"):
+        sleeper.view_target("dev2", "w2:p1", UUID)
 
 
 def test_deliver_to_another_machine_carries_sender_machine_and_a_fixed_id(
