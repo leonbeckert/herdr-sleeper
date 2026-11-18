@@ -139,6 +139,7 @@ import math
 import os
 import pty
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -162,7 +163,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.64"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.65"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -8445,6 +8446,10 @@ def copy_to_clipboard(out: Any, text: str, shown: str | None = None) -> str:
 
 
 RAN_SENDER = "owner-ran"   # the sender of a `ran` report: the command's result, never the owner's word
+RAN_LEDGER = STATE_ROOT / "ran.json"   # ask id -> {at, ts, code}: what `ran` ran on this machine (any Herdr session)
+RAN_LEDGER_DAYS = 30
+# A command that takes its target down: ssh then ends with 255 because the connection drops, not because it failed
+RAN_TAKES_DOWN_RE = re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b")
 RAN_TAIL_LINES = 30        # lines of the command's output a report carries (after redaction)
 RAN_TAIL_BYTES = 64000     # bytes of output kept while it runs
 RAN_LINE_MAX = 300         # characters per reported line
@@ -8617,6 +8622,69 @@ def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
     return exit_code_of(status), bytes(tail)
 
 
+@contextlib.contextmanager
+def ran_ledger_lock() -> Iterator[None]:
+    """One `ran` at a time reads and writes the ledger (concurrent pastes: Codex review 2026-11-18)."""
+    RAN_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(RAN_LEDGER.with_name(RAN_LEDGER.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _ran_ledger() -> dict:
+    try:
+        ledger = read_json(RAN_LEDGER)
+    except (SleeperError, OSError):
+        return {}
+    cut = time.time() - RAN_LEDGER_DAYS * 86400
+    return {k: v for k, v in ledger.items() if isinstance(v, dict) and float(v.get("ts") or 0) >= cut}
+
+
+def ran_reserve(ask_id: str, again: bool = False) -> tuple[dict | None, str]:
+    """Under the lock: this machine's earlier run of the ask's command, or none and the start is
+    recorded (again: record it regardless, the owner said yes), with the token ran_finish needs.
+    Best effort: a ledger that can't be read or written never stops the command."""
+    token = secrets.token_hex(6)
+    try:
+        with ran_ledger_lock():
+            ledger = _ran_ledger()
+            prev = ledger.get(ask_id)
+            if isinstance(prev, dict) and not again:
+                return prev, ""
+            runs = int(prev.get("runs") or 0) if isinstance(prev, dict) else 0
+            ledger[ask_id] = {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "ts": time.time(),
+                              "code": None, "runs": runs + 1, "token": token}
+            write_json(RAN_LEDGER, ledger)
+    except (SleeperError, OSError):
+        pass
+    return None, token
+
+
+def ran_finish(ask_id: str, token: str, code: int) -> None:
+    """Under the lock: the exit code of the run ran_reserve recorded, if no later run replaced it."""
+    with contextlib.suppress(SleeperError, OSError):
+        with ran_ledger_lock():
+            ledger = _ran_ledger()
+            if isinstance(ledger.get(ask_id), dict) and ledger[ask_id].get("token") == token:
+                ledger[ask_id]["code"] = code
+                write_json(RAN_LEDGER, ledger)
+
+
+def ran_confirm(question: str, tty: str = "/dev/tty") -> bool:
+    """Ask on the terminal itself (stdin is the heredoc): only a typed yes runs it again. Separate
+    read and write streams: a text stream opened r+ on a tty is not seekable and fails."""
+    try:
+        with open(tty, "w") as out, open(tty) as inp:
+            out.write(question)
+            out.flush()
+            return inp.readline().strip().lower() in ("y", "yes")
+    except OSError:
+        return False
+
+
 def cmd_ran(args: argparse.Namespace) -> int:
     """Run the command a panel copied (stdin, a heredoc) in the owner's shell, then report its exit
     status (and its last lines when it failed or the ask asked for them) to the session that asked.
@@ -8636,6 +8704,19 @@ def cmd_ran(args: argparse.Namespace) -> int:
         return 2
     targets = [t for t in args.targets if sender_ok(t)]
     ok_id = bool(args.ask_id and ASK_ID_RE.fullmatch(args.ask_id))
+    # Run once (minis-offline msg 4bdcadeb, 2026-11-18): a to-do's c copies the same command each
+    # time, and an open to-do whose report never arrived (its asker's machine was off) took both
+    # minis down a second time. The same ask's command ran here before: ask first, no is nothing run.
+    prev, token = ran_reserve(args.ask_id) if ok_id else (None, "")
+    if prev:
+        done = (f"exit {prev['code']}" if prev.get("code") is not None else "it did not finish")
+        if not ran_confirm(f"[herdr-sleeper ran: the command of ask {args.ask_id} already ran here at "
+                           f"{prev.get('at')} ({done}). Run it again? Type yes to run it, anything else "
+                           "stops: "):
+            print("[herdr-sleeper ran: not run again; if the to-do is done, answer it in its panel]",
+                  file=sys.stderr)
+            return 2
+        _prev, token = ran_reserve(args.ask_id, again=True)
     with contextlib.suppress(OSError):  # the heredoc is read: the command gets the terminal back
         tty_fd = os.open("/dev/tty", os.O_RDWR)
         os.dup2(tty_fd, 0)
@@ -8654,6 +8735,8 @@ def cmd_ran(args: argparse.Namespace) -> int:
     except OSError as exc:
         code, raw = 127, f"could not run {shell}: {exc}".encode()
     took = int(time.monotonic() - started)
+    if ok_id:
+        ran_finish(args.ask_id, token, code)
     took_s = f"{took // 60} min {took % 60} s" if took >= 60 else f"{took} s"
     if not ok_id or not targets:
         print(f"\n[herdr-sleeper ran: exit {code}; no session to report to; answer the to-do in its panel]",
@@ -8667,10 +8750,17 @@ def cmd_ran(args: argparse.Namespace) -> int:
     if code > 128:
         with contextlib.suppress(ValueError):
             sig = f" ({signal.Signals(code - 128).name})"
-    verdict = (f"It worked: if that was all of the to-do, close it (`herdr-sleeper ask --done {args.ask_id}`)."
-               if code == 0 else
-               f"It failed: withdraw the to-do (`herdr-sleeper ask --withdraw {args.ask_id}`) and ask a new one "
-               "with the fix if the owner still has a step.")
+    if code == 0:
+        verdict = f"It worked: if that was all of the to-do, close it (`herdr-sleeper ask --done {args.ask_id}`)."
+    elif code == 255 and RAN_TAKES_DOWN_RE.search(script):
+        verdict = ("Uncertain: ssh ends with 255 both when it can't connect and when the machine it shuts "
+                   "down or reboots drops the connection, and this command names a shutdown or reboot. Check "
+                   f"that machine first (off, or back after a reboot), then close the to-do (`herdr-sleeper ask "
+                   f"--done {args.ask_id}`) or withdraw it and ask again. Never leave it open: the panel offers "
+                   "the same command again.")
+    else:
+        verdict = (f"It failed: withdraw the to-do (`herdr-sleeper ask --withdraw {args.ask_id}`) and ask a new one "
+                   "with the fix if the owner still has a step.")
     body = (f"The command of your ask {args.ask_id} ran on {machine} in {cwd}{where}, pasted from its panel: exit "
             f"{code}{sig} after {took_s}. {verdict}")
     if code != 0 or args.output:

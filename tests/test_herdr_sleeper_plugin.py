@@ -86,6 +86,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         if isinstance(base, Path) and (base == live or base.parent == live):
             monkeypatch.setattr(sleeper, name, d / base.name if base != live else d)
     assert "SPAWNED" in vars(sleeper) and sleeper.SPAWNED.parent == d and sleeper.INSOMNIA.parent == d
+    monkeypatch.setattr(sleeper, "RAN_LEDGER", d / "ran.json")   # in STATE_ROOT, not a session's dir
     monkeypatch.setattr(sleeper, "LEGACY_STATE_DIR", tmp_path / "legacy")
     # Herdr's machine catalog lives outside the plugin dir: never read the live one
     monkeypatch.setattr(sleeper, "MACHINES_CATALOG", tmp_path / "herdr-client" / "endpoints.json")
@@ -11358,7 +11359,8 @@ def test_ran_tail_drops_escapes_keeps_redraws_last_state_and_redacts() -> None:
 
 
 def _ran(monkeypatch: pytest.MonkeyPatch, script: str, targets: list[str], deliver_rc: int = 3,
-         output: bool = False, ask_id: str | None = "abcd1234") -> tuple[int, list[tuple[list[str], str]]]:
+         output: bool = False, ask_id: str | None = "abcd1234",
+         fresh: bool = True) -> tuple[int, list[tuple[list[str], str]]]:
     """cmd_ran with the script on stdin, the command run without a pty, deliver stubbed."""
     import io
     import subprocess as sp
@@ -11372,10 +11374,21 @@ def _ran(monkeypatch: pytest.MonkeyPatch, script: str, targets: list[str], deliv
         return real_run(argv, **kw)
 
     monkeypatch.setattr(sleeper.subprocess, "run", fake_run)
-    monkeypatch.setattr(sleeper.os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("no tty in tests")))
-    monkeypatch.setattr(sleeper, "run_on_pty", lambda argv: (
-        real_run(argv, capture_output=True, check=False).returncode % 256,
-        real_run(argv, capture_output=True, check=False).stdout))
+    real_open = sleeper.os.open
+
+    def no_tty_open(path: Any, *a: Any, **k: Any) -> int:
+        if str(path) == "/dev/tty":
+            raise OSError("no tty in tests")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(sleeper.os, "open", no_tty_open)
+    def once(argv: list[str]) -> tuple[int, bytes]:
+        done = real_run(argv, capture_output=True, check=False)
+        return done.returncode % 256, done.stdout
+
+    monkeypatch.setattr(sleeper, "run_on_pty", once)
+    if fresh:   # each call a first run unless the test is about running again
+        sleeper.RAN_LEDGER.unlink(missing_ok=True)
     monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(script))
     monkeypatch.setenv("SHELL", "/bin/sh")
     code = sleeper.cmd_ran(types.SimpleNamespace(probe=False, output=output, ask_id=ask_id, targets=targets))
@@ -11437,6 +11450,75 @@ def test_ran_runs_a_command_at_the_copy_limit_and_refuses_more(
     assert code == 0 and len(sent) == 1
     code, sent = _ran(monkeypatch, body + "xx\n", ["mini2/x"])
     assert code == 2 and sent == []
+
+
+def test_ran_asks_before_running_the_same_asks_command_again(
+        state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # minis-offline msg 4bdcadeb: an open to-do's c ran the minis' shutdown a second time
+    mark = tmp_path / "count"
+    questions: list[str] = []
+    answer = {"yes": False}
+    monkeypatch.setattr(sleeper, "ran_confirm", lambda q: questions.append(q) or answer["yes"])
+    code, sent = _ran(monkeypatch, f"echo x >> {mark}\n", ["mini2/x"], fresh=False)
+    assert code == 0 and len(sent) == 1 and questions == []
+    code, sent = _ran(monkeypatch, f"echo x >> {mark}\n", ["mini2/x"], fresh=False)
+    assert code == 2 and sent == [] and mark.read_text().count("x") == 1          # refused: nothing ran
+    assert "already ran here at" in questions[0] and "(exit 0)" in questions[0]
+    assert "not run again" in capsys.readouterr().err
+    answer["yes"] = True
+    code, sent = _ran(monkeypatch, f"echo x >> {mark}\n", ["mini2/x"], fresh=False)
+    assert code == 0 and len(sent) == 1 and mark.read_text().count("x") == 2      # a typed yes runs it
+    assert sleeper.read_json(sleeper.RAN_LEDGER)["abcd1234"]["runs"] == 2
+    code, _sent = _ran(monkeypatch, f"echo x >> {mark}\n", ["mini2/x"], ask_id="beef0001", fresh=False)
+    assert code == 0 and len(questions) == 2                                       # another ask: no question
+
+
+def test_ran_reads_255_after_a_shutdown_as_probably_done(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _code, sent = _ran(monkeypatch, "echo ssh ops@m sudo shutdown -h now; exit 255\n", ["mini2/x"])
+    assert "Uncertain" in sent[0][1] and "Check" in sent[0][1] and "It failed" not in sent[0][1]
+    _code, sent = _ran(monkeypatch, "echo ssh ops@m true; exit 255\n", ["mini2/x"], ask_id="beef0002")
+    assert "It failed" in sent[0][1]
+
+
+def test_ran_confirm_asks_on_a_real_terminal() -> None:
+    # Codex review: open("/dev/tty", "r+") raised (not seekable), so every repeat was refused unasked
+    for typed, want in ((b"yes\n", True), (b"y\n", True), (b"no\n", False), (b"\n", False)):
+        master, slave = os.openpty()
+        try:
+            os.write(master, typed)
+            assert sleeper.ran_confirm("again? ", tty=os.ttyname(slave)) is want
+            assert b"again? " in os.read(master, 1024)
+        finally:
+            os.close(master)
+            os.close(slave)
+    assert sleeper.ran_confirm("again? ", tty="/nonexistent/tty") is False
+
+
+def test_ran_reserve_lets_one_of_concurrent_pastes_run(state: Path) -> None:
+    import threading
+    results: list[dict | None] = []
+    gate = threading.Barrier(8)
+
+    def paste() -> None:
+        gate.wait()
+        results.append(sleeper.ran_reserve("cafe0001")[0])
+
+    threads = [threading.Thread(target=paste) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(None) == 1 and len(results) == 8
+    sleeper.ran_reserve("cafe0002")               # another ask: kept next to the first
+    ledger = sleeper.read_json(sleeper.RAN_LEDGER)
+    assert set(ledger) == {"cafe0001", "cafe0002"} and ledger["cafe0001"]["runs"] == 1
+    # overlapping approved runs: the first to finish never writes its code onto the later run
+    _p, first = sleeper.ran_reserve("cafe0003")
+    _p, second = sleeper.ran_reserve("cafe0003", again=True)
+    sleeper.ran_finish("cafe0003", first, 255)
+    assert sleeper.read_json(sleeper.RAN_LEDGER)["cafe0003"]["code"] is None
+    sleeper.ran_finish("cafe0003", second, 0)
+    assert sleeper.read_json(sleeper.RAN_LEDGER)["cafe0003"]["code"] == 0
 
 
 def test_ran_probe_answers_without_reading_stdin() -> None:
