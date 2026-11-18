@@ -162,7 +162,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.63"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.64"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -8641,7 +8641,13 @@ def cmd_ran(args: argparse.Namespace) -> int:
         os.dup2(tty_fd, 0)
         os.close(tty_fd)
     shell = os.environ.get("SHELL") or "/bin/sh"
-    cwd = os.getcwd()
+    try:
+        cwd, where = os.getcwd(), ""
+    except FileNotFoundError:  # the owner's shell sits in a deleted folder: run from home instead
+        cwd = os.path.expanduser("~")
+        os.chdir(cwd)
+        where = " (the shell's folder no longer existed)"
+        print(f"[herdr-sleeper ran: this shell's folder was deleted; running in {cwd}]", file=sys.stderr)
     started = time.monotonic()
     try:
         code, raw = run_on_pty([shell, "-c", script])
@@ -8665,7 +8671,7 @@ def cmd_ran(args: argparse.Namespace) -> int:
                if code == 0 else
                f"It failed: withdraw the to-do (`herdr-sleeper ask --withdraw {args.ask_id}`) and ask a new one "
                "with the fix if the owner still has a step.")
-    body = (f"The command of your ask {args.ask_id} ran on {machine} in {cwd}, pasted from its panel: exit "
+    body = (f"The command of your ask {args.ask_id} ran on {machine} in {cwd}{where}, pasted from its panel: exit "
             f"{code}{sig} after {took_s}. {verdict}")
     if code != 0 or args.output:
         tail = ran_tail(raw)

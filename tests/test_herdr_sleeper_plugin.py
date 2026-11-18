@@ -11415,6 +11415,20 @@ def test_ran_tries_each_target_and_always_runs_the_command(
     assert code == 0 and mark.exists() and sent == []
 
 
+def test_ran_in_a_deleted_folder_runs_from_home_and_reports(
+        state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # worms-usage-read msg 4a49781c: os.getcwd() raised FileNotFoundError and nothing ran
+    gone, home, mark = tmp_path / "gone", tmp_path / "home", tmp_path / "mark"
+    gone.mkdir()
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    code, sent = _ran(monkeypatch, f"pwd > {mark}\n", ["mini2/x"])
+    assert code == 0 and mark.read_text().strip() == str(home.resolve())
+    assert f"in {home} (the shell's folder no longer existed)" in sent[0][1]
+
+
 def test_ran_runs_a_command_at_the_copy_limit_and_refuses_more(
         state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     body = "true #" + "x" * (sleeper.ASK_COPY_MAX - 6)
