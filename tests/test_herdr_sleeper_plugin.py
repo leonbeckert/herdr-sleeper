@@ -14,6 +14,7 @@ import os
 import shlex
 import signal
 import stat
+import shutil
 import subprocess
 import sys
 import time
@@ -6299,9 +6300,11 @@ def test_ask_copy_shows_the_command_and_c_copies_it_exactly(
     capsys.readouterr()
     assert _panel(fake, monkeypatch, "c\r") == 1
     raw = capsys.readouterr().out
-    assert "\x1b]52;c;" + base64.b64encode(cmd.encode()).decode() + "\x07" in raw
+    wrapped = sleeper.copy_text(ask_id, rec)  # with its report-back; runs as is where herdr-sleeper is missing
+    assert cmd in wrapped and "\x1b]52;c;" + base64.b64encode(wrapped.encode()).decode() + "\x07" in raw
     screen = _screen(raw)
-    assert "Command (1 line): c then Enter copies it exactly" in screen and "c copy · Tab next item" in screen
+    assert "Command (1 line): c then Enter copies it with its report-back" in screen
+    assert "c copy · Tab next item" in screen
     assert "Copied the command (1 line, " in screen
     assert _asks()[ask_id]["state"] == "open" and not prompts(fake)   # copying answers nothing
     script = tmp_path / "guard.sh"
@@ -11253,3 +11256,190 @@ def test_never_show_keeps_a_machine_out_of_search_and_views(ssh: FakeSsh, monkey
     sleeper.CONFIG_FILE.write_text('machine = "dev1"\nexclude = []\nnever_show = [3]\n')
     with pytest.raises(sleeper.ConfigError):
         sleeper.never_shown("dev2")                                                 # broken: refused, not shown
+
+
+def test_copy_wraps_the_command_in_ran_unless_plain(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess as sp
+    assert _ask(monkeypatch, todo="run the fill", copy="cd /tmp && echo \"$HOME\" 'x'\nls") == 0
+    ((ask_id, rec),) = _asks().items()
+    text = sleeper.copy_text(ask_id, rec)
+    first, *body, last = text.split("\n")
+    assert f"then herdr-sleeper ran {ask_id} " in first and first.endswith(f"<<'HS_RAN_{ask_id}'")
+    assert body == ["cd /tmp && echo \"$HOME\" 'x'", "ls"] and last == f"HS_RAN_{ask_id}"
+    # the shell hands the heredoc over exactly: nothing expanded, quotes kept
+    ran = " ".join(["herdr-sleeper", "ran", ask_id, *map(sleeper.shlex.quote, sleeper.copy_targets(rec))])
+    assert f"{rec['machine']}/{rec['uuid']}" in ran   # the session id first: stable whatever its name
+    cat_form = text.replace("herdr-sleeper ran --probe >/dev/null 2>&1", "true", 1).replace(ran, "cat", 1)
+    out = sp.run(["/bin/sh", "-c", cat_form], capture_output=True, text=True)
+    assert out.stdout == "cd /tmp && echo \"$HOME\" 'x'\nls\n"
+    # without herdr-sleeper on the PATH the command still runs, as a plain paste would
+    bare = sp.run(["/bin/sh", "-c", text.replace("</dev/tty", "</dev/null").replace("echo \"$HOME\" 'x'\nls",
+                   "echo plain-$((1+1))")], capture_output=True, text=True, env={"PATH": "/bin:/usr/bin"})
+    assert bare.stdout == "plain-2\n"
+    assert sleeper.copy_text(ask_id, dict(rec, copy_plain=True)) == rec["copy"]
+    # a line equal to the delimiter makes it longer
+    assert f"<<'HS_RAN_{ask_id}_'" in sleeper.copy_text(ask_id, dict(rec, copy=f"x\nHS_RAN_{ask_id}\ny"))
+
+
+def test_ran_tail_drops_escapes_keeps_redraws_last_state_and_redacts() -> None:
+    raw = (b"\x1b[32mok\x1b[0m line\r\nprogress 10%\rprogress 100%\r\n"
+           b"token=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD\r\n\r\n")
+    tail = sleeper.ran_tail(raw)
+    assert tail.splitlines()[:2] == ["ok line", "progress 100%"]
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD" not in tail and "[redacted]" in tail
+    assert sleeper.ran_tail(b"".join(b"l%d\n" % i for i in range(100))).splitlines()[0] == "l70"
+
+
+def _ran(monkeypatch: pytest.MonkeyPatch, script: str, targets: list[str], deliver_rc: int = 3,
+         output: bool = False, ask_id: str | None = "abcd1234") -> tuple[int, list[tuple[list[str], str]]]:
+    """cmd_ran with the script on stdin, the command run without a pty, deliver stubbed."""
+    import io
+    import subprocess as sp
+    sent: list[tuple[list[str], str]] = []
+    real_run = sp.run
+
+    def fake_run(argv: list[str], **kw: Any) -> Any:
+        if "deliver" in argv:
+            sent.append((argv, kw["input"]))
+            return types.SimpleNamespace(returncode=deliver_rc, stdout="", stderr="no such session")
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(sleeper.subprocess, "run", fake_run)
+    monkeypatch.setattr(sleeper.os, "open", lambda *a, **k: (_ for _ in ()).throw(OSError("no tty in tests")))
+    monkeypatch.setattr(sleeper, "run_on_pty", lambda argv: (
+        real_run(argv, capture_output=True, check=False).returncode % 256,
+        real_run(argv, capture_output=True, check=False).stdout))
+    monkeypatch.setattr(sleeper.sys, "stdin", io.StringIO(script))
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    code = sleeper.cmd_ran(types.SimpleNamespace(probe=False, output=output, ask_id=ask_id, targets=targets))
+    return code, sent
+
+
+def test_ran_reports_a_failure_with_its_last_lines(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    code, sent = _ran(monkeypatch, "echo done-here; exit 4\n", ["mini2/langfuse-iac"])
+    assert code == 4
+    ((argv, body),) = sent
+    assert argv[-6:] == ["deliver", "mini2/langfuse-iac", "--from", "owner-ran", "--re", "abcd1234"]
+    assert "The command of your ask abcd1234 ran on" in body and "exit 4" in body and "It failed" in body
+    assert "the owner ran" not in body.lower()   # it says what ran, not who: anyone can run `ran`
+    assert body.rstrip().endswith("done-here")
+
+
+def test_ran_keeps_a_success_output_with_the_owner_unless_the_ask_wants_it(
+        state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _code, sent = _ran(monkeypatch, "echo private-result\n", ["mini2/x"])
+    assert "exit 0" in sent[0][1] and "private-result" not in sent[0][1] and "--copy-output" in sent[0][1]
+    _code, sent = _ran(monkeypatch, "echo wanted-result\n", ["mini2/x"], output=True)
+    assert sent[0][1].rstrip().endswith("wanted-result")
+
+
+def test_ran_tries_each_target_and_always_runs_the_command(
+        state: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    mark = tmp_path / "ran"
+    code, sent = _ran(monkeypatch, f"touch {mark}; exit 1\n", ["mini2/uuid-gone", "mini2/x"], deliver_rc=1)
+    assert code == 1 and mark.exists() and [a[-5] for a, _b in sent] == ["mini2/uuid-gone", "mini2/x"]
+    assert "could not report it (no such session)" in capsys.readouterr().err
+    mark.unlink()
+    # a target it can't use, or no ask id: the command still runs, without a report
+    code, sent = _ran(monkeypatch, f"touch {mark}\n", ["bad target;rm"])
+    assert code == 0 and mark.exists() and sent == []
+    mark.unlink()
+    code, sent = _ran(monkeypatch, f"touch {mark}\n", [], ask_id=None)
+    assert code == 0 and mark.exists() and sent == []
+
+
+def test_ran_runs_a_command_at_the_copy_limit_and_refuses_more(
+        state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    body = "true #" + "x" * (sleeper.ASK_COPY_MAX - 6)
+    assert len(body) == sleeper.ASK_COPY_MAX
+    code, sent = _ran(monkeypatch, body + "\n", ["mini2/x"])           # the heredoc adds a newline
+    assert code == 0 and len(sent) == 1
+    code, sent = _ran(monkeypatch, body + "xx\n", ["mini2/x"])
+    assert code == 2 and sent == []
+
+
+def test_ran_probe_answers_without_reading_stdin() -> None:
+    assert sleeper.cmd_ran(types.SimpleNamespace(probe=True, output=False, ask_id=None, targets=[])) == 0
+
+
+def test_copy_targets_skip_names_ran_cannot_address(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = {"machine": "mbp", "uuid": "0b1c2d3e-0000-4000-8000-000000000001", "asker": "fix the thing", "copy": "ls"}
+    assert sleeper.copy_targets(rec) == ["mbp/0b1c2d3e-0000-4000-8000-000000000001"]
+    assert sleeper.copy_text("abcd1234", dict(rec, uuid=None, asker="?x y")) == "ls"   # nowhere to report: bare
+
+
+def test_copy_falls_back_when_herdr_sleeper_has_no_ran(tmp_path: Path) -> None:
+    import subprocess as sp
+    rec = {"machine": "mbp", "uuid": None, "asker": "orch", "copy": "echo ran-$((2+3))"}
+    text = sleeper.copy_text("abcd1234", rec).replace("</dev/tty", "</dev/null")
+    old = tmp_path / "herdr-sleeper"   # an older herdr-sleeper: `ran` is an invalid choice, exit 2
+    old.write_text("#!/bin/sh\necho \"invalid choice: '$1'\" >&2\nexit 2\n")
+    old.chmod(0o755)
+    for shell in ("/bin/sh", "/bin/bash", "/bin/zsh"):
+        if not Path(shell).exists():
+            continue
+        out = sp.run([shell, "-c", text], capture_output=True, text=True,
+                     env={"PATH": f"{tmp_path}:/bin:/usr/bin"})
+        assert out.stdout == "ran-5\n" and "no herdr-sleeper here" in out.stderr, shell
+
+
+def test_ran_tail_redacts_what_command_output_shows() -> None:
+    samples = {
+        "PrivateKey = yAnz5TF+lXXJte14/tji3zlMNq+hd2rYUIgJBgB3fBmk=": "yAnz5TF",
+        "AGE-SECRET-KEY-1QQPQZ9MJ3XLWQ8U5Z7K2Y6R4T0N3V8X2C5B7M9L1K3J5H7G9F2D4": "QQPQZ9",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855": "e3b0c442",
+        "vault_db_pass: hunter2hunter2": "hunter2",
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP": "JBSWY3",
+    }
+    for line, secret in samples.items():
+        assert secret not in sleeper.ran_tail(line.encode()), line
+    assert "commit 0123456789abcdef0123456789abcdef01234567" in sleeper.ran_tail(
+        b"commit 0123456789abcdef0123456789abcdef01234567")   # a commit id stays: it is what a result names
+    pem = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + b"QUJD\n" * 40 + b"-----END OPENSSH PRIVATE KEY-----\n"
+    assert "QUJD" not in sleeper.ran_tail(pem)   # the BEGIN line is above the 30-line cut: still redacted
+    assert "(B" not in sleeper.ran_tail(b"\x1b(Bplain\x1b7\x1b8 text")
+    big = sleeper.ran_tail(("x" * 1000 + "\n").encode() * 50)
+    assert len(big) <= sleeper.RAN_BODY_MAX and all(len(r) <= sleeper.RAN_LINE_MAX for r in big.split("\n"))
+
+
+def test_run_on_pty_gives_the_command_a_sized_terminal_and_shell_exit_codes(tmp_path: Path) -> None:
+    import subprocess as sp
+    if not shutil.which("script"):
+        pytest.skip("no script(1)")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib.machinery, importlib.util, sys\n"
+        f"loader = importlib.machinery.SourceFileLoader('hs', {str(sleeper.SELF)!r})\n"
+        "spec = importlib.util.spec_from_loader('hs', loader); hs = importlib.util.module_from_spec(spec)\n"
+        "loader.exec_module(hs)\n"
+        "import fcntl, struct, termios\n"
+        "fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 33, 91, 0, 0))\n"
+        "code, raw = hs.run_on_pty(['/bin/sh', '-c', 'test -t 0 && echo tty-ok; stty size; exit 5'])\n"
+        "print('CODE', code, 'TAIL', hs.ran_tail(raw).replace(chr(10), '|'))\n"
+        "code, _raw = hs.run_on_pty(['/bin/sh', '-c', 'kill -INT $$'])\n"
+        "print('SIG', code)\n"
+        "code, _raw = hs.run_on_pty(['/nonexistent/shell', '-c', 'true'])\n"
+        "print('MISSING', code)\n")
+    argv = ["script", "-q", "/dev/null", sys.executable, str(probe)]
+    out = sp.run(argv, capture_output=True, text=True, timeout=30, stdin=sp.DEVNULL).stdout
+    assert "CODE 5 TAIL tty-ok|" in out and "SIG 130" in out and "MISSING 127" in out, out
+    assert "CODE 5 TAIL tty-ok|33 91" in out, out   # the owner's terminal size reaches the command
+
+
+def test_esc_then_a_letter_typed_apart_clears_and_keeps_the_letter() -> None:
+    keys = sleeper.TtyKeys.__new__(sleeper.TtyKeys)
+    keys.carry, keys.paste = "", None
+    assert keys.feed("\x1b") == [] and keys.feed("n") == ["ESC", "n"]
+    assert sleeper.TtyKeys.tokens("\x1b\x1b[A") == ["PREV"]   # Alt+Up: the arrow, no clear
+
+
+def test_panel_tab_at_the_confirm_step_does_not_carry_the_answer_to_the_next_item(
+        fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _ask(monkeypatch, todo="first") == 0
+    assert _ask(monkeypatch, todo="second") == 0
+    _sync_delivery(monkeypatch)
+    assert _panel(fake, monkeypatch, "for the first\r", "\t", "d\r", "y", "d\r", "y") == 0
+    bodies = [p[3] for p in prompts(fake)]
+    assert any("TO-DO: second\nA: done" in b for b in bodies) and not any("for the first" in b for b in bodies)

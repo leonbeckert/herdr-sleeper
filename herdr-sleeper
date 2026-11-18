@@ -162,7 +162,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.61"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.62"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7383,6 +7383,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
         rec.update(re=ask_re, thread=thread_of(ask_re))
     if copy is not None:  # a command the owner pastes somewhere: `c` copies it exactly
         rec["copy"] = copy
+        if getattr(args, "copy_plain", False):
+            rec["copy_plain"] = True
+        if getattr(args, "copy_output", False):
+            rec["copy_output"] = True
     with locked():
         asks = read_asks()
         mine = open_asks(uuid, agent_name, asks, me_pane, me_term)
@@ -7958,7 +7962,9 @@ def panel_lines(v: PanelView, color: bool = True) -> list[str]:
             cmd = wrap_text(paste_text(str(rec["copy"])), W - 3, "   ")
             n_lines = str(rec["copy"]).count("\n") + 1
             segs.append((1, [st(fit(f"Command ({n_lines} line{'s' if n_lines > 1 else ''}): c then Enter copies it "
-                                    "exactly; don't select it"), "1;33")]))
+                                    + ("exactly; don't select it" if rec.get("copy_plain") else
+                                       "with its report-back" + (" and output" if rec.get("copy_output") else "")
+                                       + " (C: bare)")), "1;33")]))
             if len(cmd) <= 6:
                 segs.append((5, [st(ln, "33") for ln in cmd]))
             else:  # too long for the card: a preview here, all of it at the top of the context (m pages)
@@ -8425,16 +8431,264 @@ def kick_delivery(uuid: str, sender: str) -> None:
 SENT, GONE, BUSY = "sent", "gone", "busy"
 
 
-def copy_to_clipboard(out: Any, text: str) -> str:
+def copy_to_clipboard(out: Any, text: str, shown: str | None = None) -> str:
     """Put an ask's command into the owner's clipboard: OSC 52 to the panel's terminal, which Herdr
     hands to the client machine's clipboard (pbcopy on the MacBook), also from a mini's panel.
     Exact bytes, unlike a selection of the wrapped, indented rows the panel shows."""
     import base64
     out.write("\x1b]52;c;" + base64.b64encode(text.encode()).decode() + "\x07")
     out.flush()
-    lines = text.count("\n") + 1
-    return (f"Copied the command ({lines} line{'s' if lines > 1 else ''}, {len(text)} characters) to your "
+    shown = text if shown is None else shown   # the command as the panel shows it (without its wrapper)
+    lines = shown.count("\n") + 1
+    return (f"Copied the command ({lines} line{'s' if lines > 1 else ''}, {len(shown)} characters) to your "
             "clipboard: paste it where the item says.")
+
+
+RAN_SENDER = "owner-ran"   # the sender of a `ran` report: the command's result, never the owner's word
+RAN_TAIL_LINES = 30        # lines of the command's output a report carries (after redaction)
+RAN_TAIL_BYTES = 64000     # bytes of output kept while it runs
+RAN_LINE_MAX = 300         # characters per reported line
+RAN_BODY_MAX = 6000        # characters of reported output in all
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+][0-9A-Za-z]"
+                     r"|\x1b[78=>]|\x1b[@-Z\\-_]")
+# beyond redact(): what a command's own output shows (a key file, a generated secret, a config line)
+RAN_SECRETS = (
+    re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]+"),
+    re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{42,}={1,2}(?![A-Za-z0-9+/=])"),   # padded base64 (WireGuard keys)
+    re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{48,}(?![0-9a-fA-F])"),               # long hex (commit ids are 40)
+    re.compile(r"(?<![A-Za-z0-9])[A-Z2-7]{24,}=*(?![A-Za-z0-9])"),                 # base32 (TOTP seeds)
+)
+RAN_SECRET_ASSIGN = re.compile(r"(?i)(\b[\w.-]*(?:pass(?:word|wd|phrase)?|secret|token|private[ _-]?key|"
+                               r"preshared[ _-]?key|api[_-]?key|seed|credential)[\w.-]*\s*[:=]\s*)(\S.*)")
+
+
+def ran_redact(text: str) -> str:
+    """redact(), and what a command's own output may show besides: a key = value line keeps its key."""
+    text = RAN_SECRET_ASSIGN.sub(lambda m: m.group(1) + REDACTED, redact(text))
+    for pat in RAN_SECRETS:
+        text = pat.sub(REDACTED, text)
+    return text
+
+
+def copy_targets(rec: dict) -> list[str]:
+    """Where a report goes, in order: the asker's session id (stable, any name), then its name."""
+    machine = str(rec.get("machine") or this_machine())
+    out = [f"{machine}/{v}" for v in (rec.get("uuid"), rec.get("asker"))
+           if v and SENDER_RE.fullmatch(str(v)) and sender_ok(f"{machine}/{v}")]
+    return list(dict.fromkeys(out))
+
+
+def copy_text(ask_id: str, rec: dict, plain: bool = False) -> str:
+    """What `c` puts into the clipboard: the command inside `herdr-sleeper ran` (owner 2026-11-18:
+    every command a panel hands over reports back to the session that asked); as is for `C` or
+    --copy-plain. A quoted heredoc: the command keeps its exact text, nothing is expanded twice.
+    Where no herdr-sleeper with `ran` is (a server's root shell, a VM, an older version) the paste
+    runs the command as a plain paste would, says the report is missing, and nothing is lost."""
+    cmd = str(rec.get("copy") or "")
+    targets = copy_targets(rec)
+    if plain or rec.get("copy_plain") or not ASK_ID_RE.fullmatch(ask_id) or not targets:
+        return cmd
+    delim = f"HS_RAN_{ask_id}"
+    while any(line.strip() == delim for line in cmd.splitlines()):
+        delim += "_"
+    ran = " ".join(["herdr-sleeper", "ran", *(["--output"] if rec.get("copy_output") else []), ask_id,
+                    *(shlex.quote(t) for t in targets)])
+    return (f"if herdr-sleeper ran --probe >/dev/null 2>&1; then {ran}; else echo '[no herdr-sleeper here: "
+            "no report; answer the to-do in its panel]' >&2; eval \"$(cat)\" </dev/tty; fi "
+            f"<<'{delim}'\n{cmd.rstrip(chr(10))}\n{delim}")
+
+
+def ran_tail(raw: bytes, lines: int = RAN_TAIL_LINES) -> str:
+    """The last lines a terminal showed: escapes dropped, a line redrawn with \\r kept as its last
+    state, control characters gone, credential-looking values redacted (before the cut, so a key
+    block that starts above it still matches), each line and the whole capped."""
+    text = ANSI_RE.sub("", raw.decode("utf-8", "replace")).replace("\r\n", "\n")
+    rows = [CONTROL_CHARS.sub("", row.rsplit("\r", 1)[-1]).rstrip() for row in text.split("\n")]
+    rows = ran_redact("\n".join(rows)).split("\n")
+    while rows and not rows[-1]:
+        rows.pop()
+    rows = [r if len(r) <= RAN_LINE_MAX else r[:RAN_LINE_MAX - 1] + "…" for r in rows[-lines:]]
+    out = "\n".join(rows)
+    return out if len(out) <= RAN_BODY_MAX else "…" + out[-(RAN_BODY_MAX - 1):]
+
+
+def exit_code_of(status: int) -> int:
+    """A wait status as a shell shows it: the exit code, or 128 + the signal."""
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    while data:
+        try:
+            n = os.write(fd, data)
+        except InterruptedError:
+            continue
+        data = data[n:]
+
+
+def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
+    """Run argv on a pty wired to the owner's terminal (its size, resizes, prompts, getpass, Touch ID
+    as in their shell); return its exit code (128 + N for a signal) and the tail of what it showed.
+    Own loop, not pty.spawn: that misses the window size and hangs on Python 3.9 after the command
+    ends. The terminal mode is restored whatever happens. Without a terminal: plain pipes."""
+    import select
+    import tty
+    tail = bytearray()
+
+    def keep(data: bytes) -> None:
+        tail.extend(data)
+        del tail[:-RAN_TAIL_BYTES]
+
+    if not (os.isatty(0) and os.isatty(1)):
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert proc.stdout is not None
+        out_fd = proc.stdout.fileno()
+        for chunk in iter(lambda: os.read(out_fd, 4096), b""):
+            _write_all(1, chunk)
+            keep(chunk)
+        code = proc.wait()
+        return (128 - code if code < 0 else code), bytes(tail)
+    master, slave = os.openpty()
+    with contextlib.suppress(OSError):
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+    pid = os.fork()
+    if pid == 0:  # the child: its own session on the pty, then the shell; never back into Python's flow
+        try:
+            os.close(master)
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            for fd in (0, 1, 2):
+                os.dup2(slave, fd)
+            if slave > 2:
+                os.close(slave)
+            os.execvp(argv[0], argv)
+        except BaseException as exc:  # noqa: BLE001 - whatever failed, the child ends here
+            with contextlib.suppress(BaseException):
+                os.write(2, f"could not start {argv[0]}: {exc}\r\n".encode())
+            os._exit(127)
+    os.close(slave)
+
+    def winch(*_a: object) -> None:
+        with contextlib.suppress(OSError):
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+
+    old = termios.tcgetattr(0)
+    prev = signal.signal(signal.SIGWINCH, winch)
+    status: int | None = None
+    ended_at = 0.0
+    stdin_open = True
+    try:
+        tty.setraw(0)
+        while True:
+            try:
+                ready, _, _ = select.select([master] + ([0] if stdin_open else []), [], [], 0.1)
+            except InterruptedError:
+                continue
+            if master in ready:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:  # EIO: the pty's last user closed it
+                    data = b""
+                if not data:
+                    break
+                _write_all(1, data)
+                keep(data)
+            if 0 in ready:
+                data = os.read(0, 4096)
+                if data:
+                    with contextlib.suppress(OSError):
+                        _write_all(master, data)
+                else:
+                    stdin_open = False
+            if status is None:
+                done, st = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    status, ended_at = st, time.monotonic()
+            elif not ready and time.monotonic() - ended_at > 0.3:
+                break  # the command ended and its output is drained; a background child keeps the pty
+    finally:
+        termios.tcsetattr(0, termios.TCSAFLUSH, old)
+        signal.signal(signal.SIGWINCH, prev)
+        os.close(master)
+    if status is None:
+        _, status = os.waitpid(pid, 0)
+    return exit_code_of(status), bytes(tail)
+
+
+def cmd_ran(args: argparse.Namespace) -> int:
+    """Run the command a panel copied (stdin, a heredoc) in the owner's shell, then report its exit
+    status (and its last lines when it failed or the ask asked for them) to the session that asked.
+    Once the command is read it always runs: a report that can't be sent never costs the command.
+    Exits with the command's code."""
+    if args.probe:
+        return 0  # the copied form asks first: an older herdr-sleeper without `ran` falls back
+    if sys.stdin.isatty():
+        print("ran: the command comes on stdin (the heredoc the panel's c copies)", file=sys.stderr)
+        return 2
+    script = sys.stdin.read(ASK_COPY_MAX + 2)
+    if len(script) > ASK_COPY_MAX + 1:  # never run part of a command
+        print(f"ran: the command is longer than {ASK_COPY_MAX} characters; nothing was run", file=sys.stderr)
+        return 2
+    if not script.strip():
+        print("ran: no command on stdin; nothing was run", file=sys.stderr)
+        return 2
+    targets = [t for t in args.targets if sender_ok(t)]
+    ok_id = bool(args.ask_id and ASK_ID_RE.fullmatch(args.ask_id))
+    with contextlib.suppress(OSError):  # the heredoc is read: the command gets the terminal back
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        os.dup2(tty_fd, 0)
+        os.close(tty_fd)
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    cwd = os.getcwd()
+    started = time.monotonic()
+    try:
+        code, raw = run_on_pty([shell, "-c", script])
+    except OSError as exc:
+        code, raw = 127, f"could not run {shell}: {exc}".encode()
+    took = int(time.monotonic() - started)
+    took_s = f"{took // 60} min {took % 60} s" if took >= 60 else f"{took} s"
+    if not ok_id or not targets:
+        print(f"\n[herdr-sleeper ran: exit {code}; no session to report to; answer the to-do in its panel]",
+              file=sys.stderr)
+        return code
+    try:
+        machine = this_machine()
+    except ConfigError:
+        machine = os.uname().nodename.split(".")[0]
+    sig = ""
+    if code > 128:
+        with contextlib.suppress(ValueError):
+            sig = f" ({signal.Signals(code - 128).name})"
+    verdict = (f"It worked: if that was all of the to-do, close it (`herdr-sleeper ask --done {args.ask_id}`)."
+               if code == 0 else
+               f"It failed: withdraw the to-do (`herdr-sleeper ask --withdraw {args.ask_id}`) and ask a new one "
+               "with the fix if the owner still has a step.")
+    body = (f"The command of your ask {args.ask_id} ran on {machine} in {cwd}, pasted from its panel: exit "
+            f"{code}{sig} after {took_s}. {verdict}")
+    if code != 0 or args.output:
+        tail = ran_tail(raw)
+        n = tail.count("\n") + 1 if tail else 0
+        body += (f"\nIts last {n} line{'s' if n != 1 else ''} (credential-looking values redacted):\n{tail}"
+                 if tail else "\nIt printed nothing.")
+    else:
+        body += "\nIts output stays with the owner (the ask did not ask for it: `ask --copy-output`)."
+    print(f"\n[herdr-sleeper ran: exit {code}; reporting to {clean_text(targets[0])} …]", flush=True)
+    problem = ""
+    try:
+        for target in targets:
+            sent = subprocess.run([sys.executable, str(SELF), "deliver", target, "--from", RAN_SENDER,
+                                   "--re", args.ask_id], input=body, text=True, capture_output=True, check=False)
+            if sent.returncode in (0, 3):
+                print("[the result went to " + clean_text(target) + (
+                    "]" if sent.returncode == 0 else ": queued, typed in once the session is ready]"))
+                return code
+            problem = one_line(sent.stderr or sent.stdout, 200)
+    except KeyboardInterrupt:
+        problem = "interrupted"
+    print(f"[could not report it ({problem}); answer the to-do in its panel yourself]", file=sys.stderr)
+    return code
 
 
 def send_answer(ask_id: str, state: str, body: str, keep_open: bool,
@@ -8621,8 +8875,10 @@ class TtyKeys:
 
     def feed(self, text: str) -> list[str]:
         """Keys for one read's text, with paste markers and a paste split across reads handled."""
-        text, self.carry = self.carry + text, ""
         out: list[str] = []
+        if self.carry == "\x1b" and self.paste is None and text[:1] and text[:1] not in "[O\x1b\x7f\x08":
+            out, self.carry = ["ESC"], ""  # an Esc held back alone, then a key in a read of its own: typed apart
+        text, self.carry = self.carry + text, ""
         while text:
             if self.paste is not None:
                 end = text.find(PASTE_END)
@@ -8709,6 +8965,9 @@ class TtyKeys:
                  "\t": "NEXT", "\x0c": "REDRAW", "\x17": "WORD_BS"}
         while i < len(text):
             ch = text[i]
+            if ch == "\x1b" and text[i + 1:i + 3] in ("\x1b[", "\x1bO"):
+                i += 1                  # Alt+arrow (Esc, then the arrow's sequence): the arrow, no clear
+                continue
             if ch == "\x1b" and text[i + 1:i + 2] in ("\x7f", "\x08"):
                 out.append("WORD_BS")   # Option+Backspace (Esc then Backspace): the last word, not the input
                 i += 2
@@ -8930,7 +9189,7 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
             if key == "KILL":
                 buf, note = "", "Not sent; cleared."
                 continue
-            buf = str(go.get("typed") or "")
+            buf = str(go.get("typed") or "") if key not in ("NEXT", "PREV") else ""
             if key in ("ESC", "BS", "ENTER"):
                 note = "Not sent; edit your answer, then Enter."
                 continue
@@ -8974,7 +9233,11 @@ def run_ask_panel(panel_id: str | None, legacy_id: str | None, keys: object) -> 
             page, note = page + 1, ""
             continue
         if text.lower() == "c" and rec.get("copy"):
-            note = copy_to_clipboard(out, str(rec["copy"]))
+            wrapped = copy_text(str(cur), rec, plain=text == "C")
+            note = copy_to_clipboard(out, wrapped, str(rec["copy"]))
+            if wrapped != str(rec["copy"]):
+                note += (f" When it ends, its exit status{' and last lines' if rec.get('copy_output') else ''} go "
+                         f"back to {clean_text(rec.get('asker'))} by itself (C copies it bare).")
             continue
         if text.lower() == "z":
             with contextlib.suppress(SleeperError):
@@ -13340,6 +13603,13 @@ def main(argv: list[str] | None = None) -> int:
                      "`c` copies it exactly into the owner's clipboard; never put it only in the context, a copied "
                      "wrapped row breaks it")
     akp.add_argument("--copy-file", help="like --copy, read from a file (a multi-line script)")
+    akp.add_argument("--copy-plain", action="store_true",
+                     help="copy the command as is, for a place without herdr-sleeper (a VM, a router console); "
+                          "by default `c` copies it inside `herdr-sleeper ran`, which reports its exit status and "
+                          "last lines back to you")
+    akp.add_argument("--copy-output", action="store_true",
+                     help="the report carries the command's last lines also when it worked (the panel tells the "
+                          "owner); by default only a failure's lines come back, a success says exit 0")
     akp.add_argument("--recommend", type=int, help="the option you recommend, by number (1 = first)")
     akp.add_argument("--re", help="the relayed message this ask is about (the ask tab shows it)")
     akp.add_argument("--withdraw", metavar="ID", help="close your own open ask")
@@ -13360,6 +13630,13 @@ def main(argv: list[str] | None = None) -> int:
                    ).set_defaults(fn=cmd_ask_inbox)
     sub.add_parser("ask-inbox-open", help="open the ask inbox as a popup (the plugin action)"
                    ).set_defaults(fn=cmd_ask_inbox_open)
+    rnp = sub.add_parser("ran", help="run the command an ask panel copied (stdin) and report its result to the "
+                                     "session that asked (the panel's c copies this form)")
+    rnp.add_argument("--probe", action="store_true", help="exit 0: this herdr-sleeper has `ran`")
+    rnp.add_argument("--output", action="store_true", help="report the last lines also when it worked")
+    rnp.add_argument("ask_id", nargs="?")
+    rnp.add_argument("targets", nargs="*", help="MACHINE/SESSION, in order: where the result goes")
+    rnp.set_defaults(fn=cmd_ran)
     amp = sub.add_parser("ask-mirror", help="one ask's phone question through moshi-hook (internal, the watcher)")
     amp.add_argument("ask_id")
     amp.add_argument("state_dir")

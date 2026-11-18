@@ -420,7 +420,7 @@ echo "canary green 40 min; rollback is one play" | herdr-sleeper ask \
     --question "Deploy the gateway now or tonight?" --option now --option tonight --recommend 2
 herdr-sleeper ask --todo "Run ./bin/vault-grant 4h on mini2"   # something only the owner can do
 herdr-sleeper ask --todo "Paste the guard into the VM's root shell" --copy 'find /etc/cron.d …'
-                                                                # c copies the command exactly (--copy-file for a script)
+                                                                # c copies it with its report-back (--copy-file for a script)
 herdr-sleeper ask --list [--all] [--everywhere] [--json]       # --everywhere: every saved machine
 herdr-sleeper ask --inbox                                       # the same; exit 3 names an unreachable machine
 herdr-sleeper ask --withdraw ID                                 # no longer needed
@@ -464,7 +464,28 @@ herdr-sleeper ask --done ID                                     # a to-do the se
   elsewhere goes in `--copy` (`--copy-file`): the card shows it (a long one in
   full under `m`) and `c` then Enter copies exactly it through OSC 52, which
   Herdr hands to the owner's clipboard. `--copy` refuses escapes, control,
-  invisible and direction characters, so what is shown is what is copied. A
+  invisible and direction characters, so what is shown is what is copied.
+- **The result comes back** (v0.1.62, owner 2026-11-18: every command a panel
+  hands over feeds back into the session that asked): `c` copies the command
+  in a quoted heredoc to `herdr-sleeper ran ASK MACHINE/SESSION-ID MACHINE/NAME`
+  (`C` copies it bare). `ran` runs it in the owner's `$SHELL` on its own pty
+  wired to their terminal: its size and resizes, prompts, hidden password
+  reads and Touch ID work as in a plain paste; a `cd`, an `export` or an alias
+  from `.zshrc` stays outside it. Once read, the command always runs: a report
+  that can't be sent never costs it. `ran` exits with its code (128 + N for a
+  signal) and delivers to the asker (by session id, then by name), from
+  `owner-ran` and `--re ASK`: the exit status, the time it took, the machine
+  and directory. A failure adds its last 30 lines (escapes dropped, each line
+  and the whole capped, credential-looking values redacted: keys, key = value
+  lines, long hex, padded base64, base32, private-key blocks); a success sends
+  its output only when the ask was filed with `--copy-output`, which the panel
+  shows. Where no herdr-sleeper with `ran` is (`ran --probe` fails: a server's
+  root shell, a VM, an older version) the same paste says there is no report
+  and runs the command as is (`eval` with the terminal as its stdin).
+  `--copy-plain` makes `c` copy the bare command too, for a place that is no
+  POSIX shell (psql, a router or web console). An `ap` command that carries
+  `AP_REPORT_TO` reports twice: `ap`'s detail and `ran`'s exit status.
+- **Pasting into the panel**: a
   paste into the panel is one block (bracketed paste; a terminal without it: a
   read with a line break and more text, and the reads right after it): its line
   breaks are text, and only a `y` or Enter typed on its own sends. A paste whose
