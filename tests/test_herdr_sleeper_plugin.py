@@ -11446,8 +11446,10 @@ def test_copy_falls_back_when_herdr_sleeper_has_no_ran(tmp_path: Path) -> None:
     for shell in ("/bin/sh", "/bin/bash", "/bin/zsh"):
         if not Path(shell).exists():
             continue
+        # HOME/ZDOTDIR: zsh reads ~/.zshenv even for -c, and a real one puts the installed
+        # herdr-sleeper (with `ran`) back on PATH ahead of the stub
         out = sp.run([shell, "-c", text], capture_output=True, text=True,
-                     env={"PATH": f"{tmp_path}:/bin:/usr/bin"})
+                     env={"PATH": f"{tmp_path}:/bin:/usr/bin", "HOME": str(tmp_path), "ZDOTDIR": str(tmp_path)})
         assert out.stdout == "ran-5\n" and "no herdr-sleeper here" in out.stderr, shell
 
 
