@@ -163,7 +163,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.67"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.68"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -7364,8 +7364,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
         elif ANSI_SEQ.search(copy) or CONTROL_CHARS.search(copy.replace("\t", "")) or COPY_HIDDEN.search(copy):
             problem = ("--copy may hold no escape, control, invisible or direction characters (line breaks and "
                        "tabs are fine): the owner must read exactly what `c` copies")
-        elif (hit_secret := COPY_SECRET_PROMPT_RE.search(copy)) and not COPY_SECRET_NAMED_RE.search(copy):
-            problem = (f"--copy will prompt the owner for a secret ({hit_secret.group(0).split()[0]}…) but names "
+        elif (hit_secret := copy_secret_prompt(copy)) and not COPY_SECRET_NAMED_RE.search(copy):
+            problem = (f"--copy will prompt the owner for a secret ({hit_secret}…) but names "
                        "none: print one line right before the prompt saying which secret, whose and where, e.g. "
                        "echo '>>> BECOME password = sudo password of user klinikon on the Worms VM' "
                        "(owner 2026-11-18)")
@@ -8517,7 +8517,8 @@ def copy_text(ask_id: str, rec: dict, plain: bool = False) -> str:
 def ran_tail(raw: bytes, lines: int = RAN_TAIL_LINES) -> str:
     """The last lines a terminal showed: escapes dropped, a line redrawn with \\r kept as its last
     state, control characters gone, credential-looking values redacted (before the cut, so a key
-    block that starts above it still matches), each line and the whole capped."""
+    block that starts above it still matches), each line and the whole capped. Not called when the
+    owner typed into the command (cmd_ran): then no output leaves at all."""
     text = ANSI_RE.sub("", raw.decode("utf-8", "replace")).replace("\r\n", "\n")
     rows = [CONTROL_CHARS.sub("", row.rsplit("\r", 1)[-1]).rstrip() for row in text.split("\n")]
     rows = ran_redact("\n".join(rows)).split("\n")
@@ -8544,11 +8545,15 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[n:]
 
 
-def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
+def run_on_pty(argv: list[str], keys: bytearray | None = None) -> tuple[int, bytes]:
     """Run argv on a pty wired to the owner's terminal (its size, resizes, prompts, getpass, Touch ID
     as in their shell); return its exit code (128 + N for a signal) and the tail of what it showed.
     Own loop, not pty.spawn: that misses the window size and hangs on Python 3.9 after the command
-    ends. The terminal mode is restored whatever happens. Without a terminal: plain pipes."""
+    ends. The terminal mode is restored whatever happens. Without a terminal: plain pipes.
+    The pty starts without echo: a key typed before a program sets its own mode (a password typed
+    while ssh still connects) stays off the screen (ask d883a70e, 2026-11-19). Programs that want
+    echo set it (ssh -t's remote shell, editors, readline); a plain `read` shows nothing, the keys
+    still arrive. `keys` becomes non-empty once the owner typed more than Enter."""
     import select
     import tty
     tail = bytearray()
@@ -8558,6 +8563,8 @@ def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
         del tail[:-RAN_TAIL_BYTES]
 
     if not (os.isatty(0) and os.isatty(1)):
+        if keys is not None and os.isatty(0):  # the owner can type but the keys go past us: assume so
+            keys[:] = b"typed"                 # (Codex 01a1f38e: stdout redirected, stdin a terminal)
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert proc.stdout is not None
         out_fd = proc.stdout.fileno()
@@ -8569,6 +8576,10 @@ def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
     master, slave = os.openpty()
     with contextlib.suppress(OSError):
         fcntl.ioctl(slave, termios.TIOCSWINSZ, fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+    with contextlib.suppress(termios.error):
+        mode = termios.tcgetattr(slave)
+        mode[3] &= ~(termios.ECHO | termios.ECHONL)
+        termios.tcsetattr(slave, termios.TCSANOW, mode)
     pid = os.fork()
     if pid == 0:  # the child: its own session on the pty, then the shell; never back into Python's flow
         try:
@@ -8614,6 +8625,8 @@ def run_on_pty(argv: list[str]) -> tuple[int, bytes]:
             if 0 in ready:
                 data = os.read(0, 4096)
                 if data:
+                    if keys is not None and data.strip(b"\r\n"):
+                        keys[:] = b"typed"  # only whether: what was typed is never kept
                     with contextlib.suppress(OSError):
                         _write_all(master, data)
                 else:
@@ -8741,8 +8754,9 @@ def cmd_ran(args: argparse.Namespace) -> int:
         where = " (the shell's folder no longer existed)"
         print(f"[herdr-sleeper ran: this shell's folder was deleted; running in {cwd}]", file=sys.stderr)
     started = time.monotonic()
+    keys = bytearray()
     try:
-        code, raw = run_on_pty([shell, "-c", script])
+        code, raw = run_on_pty([shell, "-c", script], keys)
     except OSError as exc:
         code, raw = 127, f"could not run {shell}: {exc}".encode()
     took = int(time.monotonic() - started)
@@ -8775,10 +8789,14 @@ def cmd_ran(args: argparse.Namespace) -> int:
     body = (f"The command of your ask {args.ask_id} ran on {machine} in {cwd}{where}, pasted from its panel: exit "
             f"{code}{sig} after {took_s}. {verdict}")
     if code != 0 or args.output:
-        tail = ran_tail(raw)
-        n = tail.count("\n") + 1 if tail else 0
-        body += (f"\nIts last {n} line{'s' if n != 1 else ''} (credential-looking values redacted):\n{tail}"
-                 if tail else "\nIt printed nothing.")
+        if keys:  # what the owner typed may be in it (echoed, or erased and redrawn): nothing leaves
+            body += ("\nIts output is not reported: the owner typed into the command, and the screen may show "
+                     "what they typed (a password, say). Ask the owner for the lines you need.")
+        else:
+            tail = ran_tail(raw)
+            n = tail.count("\n") + 1 if tail else 0
+            body += (f"\nIts last {n} line{'s' if n != 1 else ''} (credential-looking values redacted):\n{tail}"
+                     if tail else "\nIt printed nothing.")
     else:
         body += "\nIts output stays with the owner (the ask did not ask for it: `ask --copy-output`)."
     print(f"\n[herdr-sleeper ran: exit {code}; reporting to {clean_text(targets[0])} …]", flush=True)
@@ -8925,13 +8943,70 @@ ASK_PASTE_MAX = 8000   # characters one answer may hold (a pasted block); typed 
 ASK_COPY_MAX = 8000    # characters of an ask's --copy command
 # A copied command that will prompt the owner for a secret (owner 2026-11-18, after typing a wrong
 # password into a bare "BECOME password:"): it must print a `>>>` line naming which one before it.
-# Tools that name their prompts themselves (bin/ap, vault-fill, a `read` with a prompt) don't match.
+# Tools that name their prompts themselves (bin/ap, vault-fill, a `read` with a prompt, `sudo -p '…'`)
+# don't match.
+COPY_SUDO_RE = re.compile(r"(?:^|(?<=[\s'\"`;&|(]))sudo(?:\.ws|-rs)?(?![\w.-])")
+SUDO_ARG_OPTS = frozenset("ugCDhRTUp")   # sudo options that take the next word as their value
 COPY_SECRET_PROMPT_RE = re.compile(
-    r"(?<![\w./-])sudo(?![\w-])(?!(?:\s+-[A-Za-z]+)*?\s+-[A-Za-z]*n(?![\w-]))"
-    r"|(?<![\w-])ansible(?:-playbook|-pull|-console)?(?![\w-])[^\n;&|]*?\s"
+    r"(?<![\w-])ansible(?:-playbook|-pull|-console)?(?![\w-])[^\n;&|]*?\s"
     r"(?:-K|--ask-become-pass(?:word)?|-k|--ask-pass|-J|--ask-vault-pass(?:word)?|--vault-id\s+\S*@prompt)(?![\w-])"
     r"|(?<![\w./-])(?:gpg2?|passwd|ssh-keygen)(?![\w-])")
 COPY_SECRET_NAMED_RE = re.compile(r">>>")
+
+
+def sudo_prompts_unnamed(after: str) -> bool:
+    """Whether a sudo whose options follow in `after` will ask for a password with its default
+    prompt: not with -n (never asks) or -p/--prompt (its prompt names the secret). Only sudo's own
+    options count, read word by word up to the command (no regex: Codex 01a1f38e found exponential
+    backtracking), so `sudo sh -c 'read -p …'` still counts as unnamed."""
+    words: list[str] = []
+    lexer = shlex.shlex(after, posix=True)   # quoted values stay one word (Codex 01a1f38e:
+    lexer.whitespace_split = True             # `sudo -D "/srv/x -n y" id` is no -n)
+    lexer.commenters = ""
+    try:
+        for word in lexer:
+            words.append(word)
+            if len(words) >= 400:
+                break
+    except ValueError:   # the quote that closes around sudo (ssh -t host "sudo …"): sudo's words end there
+        pass
+    i = 0
+    while i < min(len(words), 400):
+        w = words[i]
+        if w == "--" or not w.startswith("-") or w == "-":
+            break
+        if w.startswith("--"):
+            if w in ("--non-interactive",):
+                return False
+            if w == "--prompt" or w.startswith("--prompt="):
+                return False
+            i += 2 if "=" not in w and w in ("--user", "--group", "--chdir", "--host", "--chroot",
+                                             "--close-from", "--command-timeout", "--other-user") else 1
+            continue
+        letters = w[1:]
+        for k, ch in enumerate(letters):
+            if ch == "n":
+                return False
+            if ch == "p":
+                return False
+            if ch in SUDO_ARG_OPTS:
+                if k == len(letters) - 1:
+                    i += 1   # its value is the next word
+                break        # or the rest of this word
+        i += 1
+    return True
+
+
+def copy_secret_prompt(copy: str) -> str | None:
+    """The first word of a copied command that will ask the owner for a secret with a prompt that
+    doesn't say which, or None."""
+    for line in copy.splitlines():
+        for m in COPY_SUDO_RE.finditer(line):
+            rest = re.split(r"[;&|]", line[m.end():], maxsplit=1)[0]
+            if sudo_prompts_unnamed(rest):
+                return m.group(0)
+    hit = COPY_SECRET_PROMPT_RE.search(copy)
+    return hit.group(0).split()[0] if hit else None
 PASTE_IDLE_SECONDS = 0.3   # a paste (or a lone Esc) that goes quiet this long is complete
 BURST_GAP_SECONDS = 0.05   # a read this soon after a burst belongs to it: pasted, not typed
 # What --copy may not hold besides escapes and control characters: invisible or reordering

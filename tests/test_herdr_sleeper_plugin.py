@@ -6465,8 +6465,13 @@ def test_ask_copy_that_prompts_for_a_secret_must_name_it(
         assert "names none" in capsys.readouterr().err
     named = ("echo '>>> BECOME password = sudo password of user klinikon on the Worms VM'\n"
              "ansible-playbook -i inv site.yml -K")
+    for bare in ('ssh -t worms "sudo.ws /opt/x.sh"', "sudo sh -c 'read -p answer v'"):   # -p of read, not sudo
+        assert _ask(monkeypatch, todo="run it", copy=bare) == 2, bare
+        assert "names none" in capsys.readouterr().err
     for fine in (named, "./bin/ap playbooks/x.yml -K", "ssh ops@h 'sudo -n true'", "vault-fill req.yml",
-                 "echo pseudo-sudo"):
+                 "echo pseudo-sudo", 'ssh -t worms "sudo.ws -p \'[sudo] password of klinikon on Worms: \' /opt/x.sh"',
+                 "sudo --prompt='password of leon on the MacBook: ' true",
+                 "sudo -u klinikon -p 'password of klinikon on Worms: ' /opt/x.sh"):
         assert _ask(monkeypatch, todo="run it", copy=fine) == 0, fine
 
 
@@ -11449,7 +11454,7 @@ def test_ran_tail_drops_escapes_keeps_redraws_last_state_and_redacts() -> None:
 
 def _ran(monkeypatch: pytest.MonkeyPatch, script: str, targets: list[str], deliver_rc: int = 3,
          output: bool = False, ask_id: str | None = "abcd1234",
-         fresh: bool = True) -> tuple[int, list[tuple[list[str], str]]]:
+         fresh: bool = True, typed: bool = False) -> tuple[int, list[tuple[list[str], str]]]:
     """cmd_ran with the script on stdin, the command run without a pty, deliver stubbed."""
     import io
     import subprocess as sp
@@ -11471,8 +11476,10 @@ def _ran(monkeypatch: pytest.MonkeyPatch, script: str, targets: list[str], deliv
         return real_open(path, *a, **k)
 
     monkeypatch.setattr(sleeper.os, "open", no_tty_open)
-    def once(argv: list[str]) -> tuple[int, bytes]:
+    def once(argv: list[str], keys: bytearray | None = None) -> tuple[int, bytes]:
         done = real_run(argv, capture_output=True, check=False)
+        if typed and keys is not None:
+            keys[:] = b"typed"
         return done.returncode % 256, done.stdout
 
     monkeypatch.setattr(sleeper, "run_on_pty", once)
@@ -11679,6 +11686,84 @@ def test_run_on_pty_gives_the_command_a_sized_terminal_and_shell_exit_codes(tmp_
     out = sp.run(argv, capture_output=True, text=True, timeout=30, stdin=sp.DEVNULL).stdout
     assert "CODE 5 TAIL tty-ok|" in out and "SIG 130" in out and "MISSING 127" in out, out
     assert "CODE 5 TAIL tty-ok|33 91" in out, out   # the owner's terminal size reaches the command
+
+
+def test_ran_reports_no_output_once_the_owner_typed_into_the_command(
+        state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ask d883a70e, 2026-11-19: a password typed before its prompt came back as echo and went to
+    the asking session in the failure report. Scrubbing the typed lines missed erased input (^U)
+    and overflow (Codex 01a1f38e), so a run the owner typed into reports no output at all."""
+    code, sent = _ran(monkeypatch, "echo s3cr3tpw; exit 130\n", ["mini2/x"], typed=True)
+    assert code == 130
+    body = sent[0][1]
+    assert "s3cr3tpw" not in body and "not reported: the owner typed into the command" in body
+    _code, sent = _ran(monkeypatch, "echo wanted; exit 0\n", ["mini2/x"], output=True, typed=True)
+    assert "wanted" not in sent[0][1]
+    _code, sent = _ran(monkeypatch, "echo shown; exit 3\n", ["mini2/x"])   # nothing typed: as before
+    assert sent[0][1].rstrip().endswith("shown")
+
+
+def test_run_on_pty_without_a_watched_terminal_counts_as_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdin a terminal, stdout redirected: the plain-pipe path can't see the owner's keys, so a run
+    counts as typed and reports no output (Codex 01a1f38e)."""
+    monkeypatch.setattr(sleeper.os, "isatty", lambda fd: fd == 0)
+    keys = bytearray()
+    code, _raw = sleeper.run_on_pty(["/bin/sh", "-c", "exit 0"], keys)
+    assert code == 0 and keys
+    monkeypatch.setattr(sleeper.os, "isatty", lambda fd: False)   # no terminal at all: nobody types
+    keys = bytearray()
+    sleeper.run_on_pty(["/bin/sh", "-c", "exit 0"], keys)
+    assert not keys
+
+
+def test_sudo_prompt_check_reads_only_sudo_options_and_stays_linear() -> None:
+    assert sleeper.copy_secret_prompt("sudo -u -p true") == "sudo"         # -p is -u's value here
+    assert sleeper.copy_secret_prompt("sudo -Sp 'x: ' true") is None
+    assert sleeper.copy_secret_prompt("sudo -iu root") == "sudo"
+    assert sleeper.copy_secret_prompt('sudo -D "/srv/release -n archived" id') == "sudo"   # -n inside a value
+    assert sleeper.copy_secret_prompt("ssh -t worms \"sudo -p 'pw of klinikon on Worms: ' /opt/x.sh\"") is None
+    started = time.monotonic()
+    sleeper.copy_secret_prompt("sudo" + " -u" * 4000 + " true")
+    assert time.monotonic() - started < 0.5
+
+
+def test_run_on_pty_does_not_echo_keys_typed_before_the_command_reads_them(tmp_path: Path) -> None:
+    import pty
+    import select as sel
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import importlib.machinery, importlib.util\n"
+        f"loader = importlib.machinery.SourceFileLoader('hs', {str(sleeper.SELF)!r})\n"
+        "spec = importlib.util.spec_from_loader('hs', loader); hs = importlib.util.module_from_spec(spec)\n"
+        "loader.exec_module(hs)\n"
+        "keys = bytearray()\n"
+        "code, raw = hs.run_on_pty(['/bin/sh', '-c', 'echo STARTED; sleep 1; read -r v; echo GOT ${#v}'], keys)\n"
+        "print('TYPED', bool(keys), 'TAIL', hs.ran_tail(raw).replace(chr(10), '|'))\n")
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, str(probe)])
+    out = b""
+    typed = False
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if not typed and b"STARTED" in out:     # ran's relay is up; the command still sleeps
+            os.write(fd, b"earlysecret\r")
+            typed = True
+        ready, _, _ = sel.select([fd], [], [], 0.2)
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+    if not os.waitpid(pid, os.WNOHANG)[0]:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    text = out.decode(errors="replace")
+    assert typed and "GOT 11" in text and "TYPED True" in text, text                 # the command got the keys
+    assert "earlysecret" not in text, text        # never on the screen, never in the report
 
 
 def test_esc_then_a_letter_typed_apart_clears_and_keeps_the_letter() -> None:
