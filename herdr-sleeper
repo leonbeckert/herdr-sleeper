@@ -10009,7 +10009,7 @@ def remote_stdout(text: str) -> str:
     """Another machine's stdout made safe: JSON is decoded, cleaned and encoded again, other text stripped."""
     try:
         value = json.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:  # not JSON: plain text. Nested too deeply (RecursionError): refused by the caller
         return remote_text(text)
     return json.dumps(remote_json_clean(value), ensure_ascii=False) + ("\n" if text.endswith("\n") else "")
 
