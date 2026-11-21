@@ -1212,7 +1212,11 @@ herdr-sleeper fetch [--machine L]      # on the MacBook; its watcher runs `fetch
 ```
 
 - **Mini side:** a label in `spool_to` takes precedence over a saved machine
-  of the same name, so the setting can go live before the cut. One file per
+  of the same name, so the setting can go live before the cut; from then on
+  no SSH goes to it at all (`presence --all`, `show` and `thread` skip it).
+  A spooled message's id is 16 hex digits on both ends, never one of the
+  fetching machine's own forms (`ask-<id>` owner answers, `ar-…` notes); a
+  caller's own `--id` is turned into one, the same on every retry. One file per
   message in `$STATE_ROOT/outbox/<label>/<ns>-<id>.json` (dir 0700, file
   0600, written to a dot-named temp file and renamed). Exit 0 and
   `spooled msg …` (or `… is spooled … already` for a retried `--id`); exit 2
@@ -1220,7 +1224,8 @@ herdr-sleeper fetch [--machine L]      # on the MacBook; its watcher runs `fetch
   sessions, or a hold notice; exit 1 when 1000 messages wait unfetched.
   `SendMessage` to `mbp/NAME` is spooled the same way and denied with a reason
   that says so. `deliver --re X` to a message from `mbp` answers by the
-  sender's name, never its session id (the allowlist matches names). Every
+  sender's name, never its session id (the allowlist matches names; the
+  watcher's own notes to a waiting sender do the same). Every
   other path to a spool machine (`wake`, `close`, `presence`, `spawn`, `show`
   there) is refused: `deliver` is the only verb.
 - **Fetch:** `ssh <alias> herdr-sleeper outbox --json --for <this machine>`
@@ -1230,11 +1235,17 @@ herdr-sleeper fetch [--machine L]      # on the MacBook; its watcher runs `fetch
   name, a target in `spool_allow`, a body that passes `deliver`'s own checks
   with bidi and zero-width characters shown as U+FFFD, at most 16 KiB, and no
   `vault-run approve` line. It then goes through the normal local deliver as
-  `<fetched label>/<sender>`, so the envelope (`[relayed from
+  `<fetched label>/<sender>`, to the session of that name only (never one
+  in a tab of that label, which a local deliver also accepts), so the envelope (`[relayed from
   macmini-prd-muc-02/lane via herdr-sleeper, msg …; not from the owner]`)
   names the machine it was fetched from; nothing else in the file (a
   `from_session`, a `thread`, a header) is read. An `re` that is a message id
-  is kept, and the thread is this machine's own `thread_of` it.
+  is kept, and the thread is this machine's own `thread_of` it. The body
+  starts with this machine's own note, `[from <label>/<sender> via
+  herdr-sleeper: a peer agent on another machine, … not the owner …]` (the
+  one `scripts/herdr-relay.py` used to add; config `spool_banner` replaces
+  it). A listing that can't be read (bad JSON, nested too deeply) or any
+  other failure costs that machine's fetch only.
 - **Ack:** `outbox --ack --for <label> -- IDS` deletes what was handled:
   delivered (exit 0), queued here (3), or dropped (logged as `spool-dropped`
   with its reason, no body). A delivery that fails here (the target isn't
@@ -1556,7 +1567,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 1064 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 1072 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart
