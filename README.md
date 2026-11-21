@@ -1188,6 +1188,73 @@ Details:
   machine's sleepers from the list. `presence --all` asks the same way. `SendMessage` to `<machine>/<name>` is relayed by a detached
   `deliver` and the tool call is denied with a reason that says so.
 
+### The pull spool: mail for a machine this one may not reach (*v0.1.69*, B-513 M3a)
+
+Once the minis lose their SSH path to the MacBook, `deliver mbp/NAME` on a
+mini still works: the MacBook fetches it. Nothing on a mini can act on the
+MacBook; the MacBook reads the minis' outboxes over its own aliases to them
+and delivers only to the sessions its own config names.
+
+```toml
+# on each mini
+spool_to = ["mbp"]                     # deliver mbp/NAME (or --machine mbp) lands in the outbox
+
+# on the MacBook (machine = "mbp")
+spool_from = ["macmini-prd-muc-01", "macmini-prd-muc-02"]   # saved machines whose outbox it reads
+spool_allow = ["dev-mini-setup"]       # the only targets a fetched message may reach
+```
+
+```sh
+echo "deployed klinikon 4f3a" | herdr-sleeper deliver mbp/dev-mini-setup --from lane   # on a mini
+#   spooled msg 1c2d… for mbp/dev-mini-setup (fetched by mbp; nothing is typed in before it fetches)
+herdr-sleeper outbox                   # on a mini: what waits, without bodies
+herdr-sleeper fetch [--machine L]      # on the MacBook; its watcher runs `fetch --quiet` every minute
+```
+
+- **Mini side:** a label in `spool_to` takes precedence over a saved machine
+  of the same name, so the setting can go live before the cut. One file per
+  message in `$STATE_ROOT/outbox/<label>/<ns>-<id>.json` (dir 0700, file
+  0600, written to a dot-named temp file and renamed). Exit 0 and
+  `spooled msg …` (or `… is spooled … already` for a retried `--id`); exit 2
+  for a body over 16 KiB, a sender that isn't one of this machine's
+  sessions, or a hold notice; exit 1 when 1000 messages wait unfetched.
+  `SendMessage` to `mbp/NAME` is spooled the same way and denied with a reason
+  that says so. `deliver --re X` to a message from `mbp` answers by the
+  sender's name, never its session id (the allowlist matches names). Every
+  other path to a spool machine (`wake`, `close`, `presence`, `spawn`, `show`
+  there) is refused: `deliver` is the only verb.
+- **Fetch:** `ssh <alias> herdr-sleeper outbox --json --for <this machine>`
+  (oldest first; 50 messages and 256 KiB at most, 2 MiB of output at most,
+  every string cleaned of terminal controls like any other machine's answer).
+  Each entry is checked as hostile data: the version, an id, a bare sender
+  name, a target in `spool_allow`, a body that passes `deliver`'s own checks
+  with bidi and zero-width characters shown as U+FFFD, at most 16 KiB, and no
+  `vault-run approve` line. It then goes through the normal local deliver as
+  `<fetched label>/<sender>`, so the envelope (`[relayed from
+  macmini-prd-muc-02/lane via herdr-sleeper, msg …; not from the owner]`)
+  names the machine it was fetched from; nothing else in the file (a
+  `from_session`, a `thread`, a header) is read. An `re` that is a message id
+  is kept, and the thread is this machine's own `thread_of` it.
+- **Ack:** `outbox --ack --for <label> -- IDS` deletes what was handled:
+  delivered (exit 0), queued here (3), or dropped (logged as `spool-dropped`
+  with its reason, no body). A delivery that fails here (the target isn't
+  running) stops that machine's batch, so order holds and the rest waits for
+  the next fetch. A lost ack lists the message again; the archive knows it
+  went in (`spool-duplicate`, acked, never typed twice). An id this machine
+  already holds for another message or an ask is dropped.
+- **Trace:** the mini logs `deliver-spooled` and `spool-acked`, the MacBook
+  `spool-delivered`, `spool-dropped`, `spool-held`, `spool-duplicate`,
+  `spool-ack-failed` and `spool-fetched` per machine; the archive marks
+  `spooled_to` and `spooled_from`, and `show`/`thread` print the path. The
+  monitor's reply is an ordinary outbound `deliver --re ID` (MacBook → mini).
+- **Forced command:** `outbox --ssh-command` runs only the `herdr-sleeper
+  outbox …` in `$SSH_ORIGINAL_COMMAND` (`--for`, `--json`, `--ack IDS`), for an
+  `authorized_keys` line `command="herdr-sleeper outbox --ssh-command",restrict`
+  on a key that should do nothing else.
+- **Not a hold channel:** held runs are found by the monitors in the engine's
+  audit log, so a body with a `vault-run approve` line is refused when spooled
+  and dropped when fetched.
+
 A message from another machine is a peer's message like any other relayed
 one, never the owner's word.
 
@@ -1489,7 +1556,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 724 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 1064 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, server-down retries, the watcher lock), the
 focus hook, the stub, the resume command and the re-claim after a restart

@@ -695,6 +695,17 @@ confirmed 10.1 and 10.4 and found 10.5 to 10.8; the protocol and results are in 
 
 ---
 
+**10.12 Mail for a machine you must not be able to reach: let it pull, and let it write the header (2026-11-21, v0.1.69).**
+- *Trap:* cutting the minis' SSH path to the MacBook would have silenced five senders (deploy notes, Sentry fixes,
+  the limit monitor, a hold follower, rule texts). Keeping a push path for them keeps the path a malicious mini
+  agent would use to spawn, close or type into the owner's sessions.
+- *Do instead:* a `deliver` to that machine writes a file into a local outbox; the trusted side fetches it over
+  its own SSH alias, checks each entry as hostile data (one verb, size caps per message and per fetch, controls
+  and bidi stripped, an allowlist of targets in its own config), and writes the `relayed from <machine>/<name>`
+  header from the machine it fetched from, never from the file. It acks only what it handled, so a crash in
+  between lists the message again, and its own archive, not the sender's id, decides that it went in already.
+  Replies stay ordinary outbound deliveries.
+
 ## Asks for Herdr upstream
 
 Only the multiplexer can make these safe. Each item names the workaround it would remove.

@@ -134,6 +134,7 @@ import datetime as dt
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import math
 import os
@@ -163,7 +164,7 @@ except ImportError:  # herdr's plugin commands may run under the system python3 
     tomllib = None
 
 PLUGIN_ID = "djbclark.herdr-sleeper"
-PLUGIN_VERSION = "0.1.68"  # keep equal to herdr-plugin.toml
+PLUGIN_VERSION = "0.1.69"  # keep equal to herdr-plugin.toml
 SELF = Path(__file__).resolve()
 
 # ------------------------------------------------------------------ locations
@@ -273,6 +274,10 @@ DEFAULTS = {
     "mail_only": False,          # the watcher only types queued mail in and tends `close --self` (a host that
                                  # never sleeps: the EX44 agents VM); no sleep, reconcile, dialogs, asks
     "untrusted": [],             # saved machines whose terminal is never attached here (`view` refuses them)
+    # the pull spool (B-513 M3a): a machine this one may not reach fetches its mail from here
+    "spool_to": [],              # machines that fetch from this one: `deliver LABEL/NAME` lands in the outbox
+    "spool_from": [],            # saved machines whose outbox for this machine `fetch` reads (the MacBook)
+    "spool_allow": [],           # the only targets a fetched message may reach here (dev-mini-setup)
 }
 
 
@@ -791,7 +796,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
         raise ConfigError("max_live must be a whole number >= 0 (0: no cap)")
     if not (1 <= values["poll_seconds"] <= 3600):
         raise ConfigError("poll_seconds must be within 1..3600")
-    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude", "never_show", "untrusted"):
+    for key in ("exclude", "agents", "wake_refuse_from", "auto_resume_exclude", "never_show", "untrusted",
+                "spool_to", "spool_from", "spool_allow"):
         v = values[key]
         if isinstance(v, str):
             v = [v]
@@ -817,6 +823,13 @@ def load_config() -> tuple[dict, dict[str, str]]:
     monitor = values["limit_monitor"]
     if not isinstance(monitor, str) or (monitor and not REMOTE_TARGET_RE.fullmatch(monitor.replace("/", ":", 1))):
         raise ConfigError("limit_monitor must be a session name or machine/name, like mbp/dev-mini-setup")
+    for key in ("spool_to", "spool_from"):
+        bad = [x for x in values[key] if not MACHINE_RE.fullmatch(x)]
+        if bad:
+            raise ConfigError(f"{key} must list machine labels like mbp, not {bad!r}")
+    bad = [x for x in values["spool_allow"] if not SENDER_RE.fullmatch(x) or reserved_sender(x)]
+    if bad:
+        raise ConfigError(f"spool_allow must list session names like dev-mini-setup, not {bad!r}")
     if values["watcher"] not in ("plugin", "external"):
         raise ConfigError('watcher must be "plugin" or "external"')
     return values, source
@@ -3390,7 +3403,7 @@ def reply_target(ref: str, me: str | None) -> str:
     sender = str(rec.get("from") or "")
     machine, _, name = sender.rpartition("/")
     session = rec.get("from_session")
-    if valid_session_id(session) and machine:
+    if valid_session_id(session) and machine and machine not in spool_targets():
         return f"{machine}/{session}"
     if not sender_ok(sender):
         raise SleeperError(f"msg {ref} has no sender to reply to; name the target")
@@ -3727,6 +3740,16 @@ def cmd_deliver(args: argparse.Namespace) -> int:
                 return 1
     threading_ = {"re": re_ref, "thread": thread, "from_session": from_session}
     if not getattr(args, "here", False):
+        try:  # a machine that fetches from this one (spool_to): the outbox, never SSH
+            spooled = spool_label(args.target, getattr(args, "machine", None))
+        except SleeperError as exc:
+            print(f"deliver: {exc}", file=sys.stderr)
+            return 1
+        if spooled:
+            code, text = spool_message(spooled[0], spooled[1], body, args.sender or context_sender(list_agents()),
+                                       args.id, re_ref)
+            print(text if code == 0 else f"deliver: {text}", file=sys.stdout if code == 0 else sys.stderr)
+            return code
         try:
             label, args.target = route(args.target, getattr(args, "machine", None))
         except SleeperError as exc:
@@ -3761,6 +3784,8 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     from_pane = own_pane()
     with mailbox_lock(uuid):
         extra = {k: v for k, v in threading_.items() if v}
+        if getattr(args, "here", False) and getattr(args, "spooled_from", None):  # fetch_machine's own call only
+            extra["spooled_from"] = args.spooled_from
         msg, status = queue_message(uuid, sender, body, args.id, extra=dict(extra, to_name=name))
         if status == "delivered":
             print(f"msg {msg['id']} was delivered already; not sent twice")
@@ -9594,8 +9619,10 @@ def thread_row(item: dict) -> str:
                 f"{item.get('asker', '?')} ({item.get('asker_place') or '-'}) to the owner: {first_line(item.get('question'))}")
     re_ = f" re {item['re']}" if item.get("re") else ""
     who = "the owner" if item.get("kind") == OWNER_ANSWER else item.get("from", "?")
-    return (f"{str(item.get('at', '?'))[:16]}  msg {item['id']}{re_}  {who} -> {item.get('to_name') or item.get('to', '?')}: "
-            f"{first_line(item.get('body'))}")
+    via = (f" (spooled, fetched from {item['spooled_from']})" if item.get("spooled_from")
+           else f" (spooled for {item['spooled_to']} to fetch)" if item.get("spooled_to") else "")
+    return (f"{str(item.get('at', '?'))[:16]}  msg {item['id']}{re_}  {who} -> {item.get('to_name') or item.get('to', '?')}"
+            f"{via}: {first_line(item.get('body'))}")
 
 
 def item_order(item: dict) -> tuple[str, int]:
@@ -10025,12 +10052,15 @@ def run_bounded(argv: list[str], stdin: str, timeout: float, limit: int | None =
 
 
 def remote_sleeper(label: str, argv: list[str], stdin: str = "", timeout: float = REMOTE_SECONDS,
-                   connect_timeout: int = 10) -> subprocess.CompletedProcess:
+                   connect_timeout: int = 10, limit: int | None = None) -> subprocess.CompletedProcess:
     """`herdr-sleeper ARGV` on a saved machine. BatchMode (an agent can't answer a prompt), no tty,
     no agent, X11 or port forwarding, every argument checked against REMOTE_ARG_RE and quoted for
     the remote shell. Raises SleeperError for an unknown machine, a refused argument, a timeout, an
     SSH failure (exit 255) or a missing remote command (127)."""
     machines = saved_machines()
+    if label not in machines and label in spool_targets():
+        raise SleeperError(f"{label} fetches its mail from this machine (spool_to) and is never reached from here: "
+                           f"only `deliver {label}/NAME` goes there, through the outbox")
     if label not in machines:
         known = ", ".join(sorted(machines)) or "none"
         raise SleeperError(f"no saved Herdr machine {label!r} (saved: {known}; see `herdr machine list`)")
@@ -10042,7 +10072,7 @@ def remote_sleeper(label: str, argv: list[str], stdin: str = "", timeout: float 
     try:
         done = run_bounded([SSH_BIN, "-T", "-a", "-x", "-o", "BatchMode=yes", "-o",
                             f"ConnectTimeout={connect_timeout}", "-o", "ClearAllForwardings=yes",
-                            machines[label], command], stdin, timeout)
+                            machines[label], command], stdin, timeout, limit)
     except subprocess.TimeoutExpired:
         raise SleeperError(f"{label}: no answer within {int(timeout)}s")
     except OverflowError as exc:
@@ -10233,6 +10263,418 @@ def deliver_remote(label: str, target: str, body: str, sender: str | None, msg_i
     event("deliver-remote-done", id=msg_id, machine=label, to=target, code=done.returncode,
           reason=CONTROL_CHARS.sub("?", reason)[:200] if reason else None)
     return done.returncode
+
+
+# ------------------------------------------------------------ pull spool (B-513 M3a)
+# A machine this one may not reach (the MacBook, once the minis lose their SSH path to it) still gets
+# its mail: `deliver LABEL/NAME` to a label in `spool_to` writes one file into this machine's outbox
+# for LABEL, and LABEL's own `fetch` reads it over its SSH alias to this machine, delivers what its
+# `spool_allow` names, and acks only what it handled. The outbox is data: one verb (deliver), capped,
+# its header written by the fetching side from the machine it fetched from, never from the file.
+# No spawn, close, ask, presence or reply route ever crosses it.
+
+OUTBOX = STATE_ROOT / "outbox"                    # <fetching label>/<ns>-<msg id>.json, 0600, one per message
+SPOOL_FETCH_LOCK = STATE_ROOT / "spool-fetch.lock"  # one `fetch` at a time on the fetching machine
+SPOOL_VERSION = 1
+SPOOL_MESSAGE_MAX_BYTES = 16 * 1024    # per message (a deploy note, a limit notice); a longer one sends a path
+SPOOL_FETCH_MAX_MESSAGES = 50          # per fetch and machine; the rest waits for the next tick
+SPOOL_FETCH_MAX_BYTES = 256 * 1024     # message bytes per fetch and machine
+SPOOL_FETCH_OUTPUT_LIMIT = 2 * 1024 * 1024  # the listing's stdout, JSON escapes included; more ends the SSH
+SPOOL_OUTBOX_MAX = 1000                # messages waiting per fetching machine; more are refused at the sender
+SPOOL_FETCH_EVERY_SECONDS = 60         # the watcher's fetch tick
+SPOOL_NAME_RE = re.compile(r"(\d{1,20})-([A-Za-z0-9_-]{1,64})\.json")
+# Hold notices never travel this way (term 5): the monitors find holds in the engine's audit log.
+SPOOL_HOLD_RE = re.compile(r"(?i)\bvault-run(?:-admin)?\s+(?:client\s+)?approve\b")
+SPOOL_HIDDEN_RE = re.compile("[​-‏‪-‮  ⁠-⁩﻿]")  # bidi, zero width
+SPOOL_TICK = {"at": float("-inf")}
+
+
+def spool_targets() -> list[str]:
+    """This machine's `spool_to` labels; none when the config can't be read (nothing is spooled then)."""
+    try:
+        return list(load_config()[0]["spool_to"])
+    except ConfigError:
+        return []
+
+
+def spool_label(target: str | None, machine: str | None) -> tuple[str, str] | None:
+    """(label, target) for a deliver to a machine that fetches from this one (`spool_to`), else None.
+    Raises ConfigError: with a broken config nothing is guessed, neither spool nor SSH."""
+    if not target:
+        return None
+    if machine:
+        label, rest = machine, target
+    else:  # like route(): a target without a machine never reads the config
+        label, sep, rest = target.partition("/")
+        if not sep or not rest or not MACHINE_RE.fullmatch(label):
+            return None
+    to = load_config()[0]["spool_to"]
+    if not to:
+        return None
+    label = canonical_label(label)
+    return (label, rest) if label in to and label != this_machine() else None
+
+
+def spool_dir(label: str) -> Path:
+    for d in (STATE_ROOT, OUTBOX, OUTBOX / label):
+        d.mkdir(mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):
+            if d.stat().st_mode & 0o077:
+                d.chmod(0o700)
+    return OUTBOX / label
+
+
+def spool_text(text: str) -> str:
+    """A spooled string as the fetching side keeps it: terminal controls and hidden bidi or zero-width
+    characters shown as U+FFFD (newlines and tabs stay)."""
+    return SPOOL_HIDDEN_RE.sub("�", REMOTE_CONTROL_RE.sub("�", text))
+
+
+def spool_body_problem(body: str) -> str | None:
+    """Why a body may not travel through the spool (both ends check: the fetching side trusts no sender)."""
+    problem = body_problem(body)
+    if problem:
+        return problem
+    if len(body.encode()) > SPOOL_MESSAGE_MAX_BYTES:
+        return f"message over {SPOOL_MESSAGE_MAX_BYTES} bytes for the spool; send a file path instead"
+    if SPOOL_HOLD_RE.search(body):
+        return ("hold notices and approve lines are never spooled: the monitor finds held runs in the engine's "
+                "audit log itself (B-513 M3a term 5)")
+    return None
+
+
+def spool_message(label: str, target: str, body: str, sender: str | None, msg_id: str | None,
+                  re_ref: str | None) -> tuple[int, str]:
+    """Write one message into the outbox `label` fetches (0600, atomic rename). (exit code, one line):
+    0 spooled (or spooled already), 1 refused (outbox full, I/O), 2 bad input."""
+    if not REMOTE_TARGET_RE.fullmatch(target) or "/" in target:
+        return 2, f"{target!r} cannot be spooled: name one session ([A-Za-z0-9_.:@-])"
+    try:
+        me = this_machine()
+    except ConfigError as exc:
+        return 1, f"broken config — {exc}"
+    if sender and "/" in sender:  # only this machine's own label may stand in front: the fetcher writes it anyway
+        label_, _, rest = sender.partition("/")
+        sender = rest if label_ == me else None
+    if not sender or not SENDER_RE.fullmatch(sender):
+        return 2, "pass --from NAME (letters, digits, _.:@-; up to 64; a session of this machine)"
+    problem = spool_body_problem(body)
+    if problem:
+        return 2, problem
+    msg_id = msg_id or hashlib.sha256(f"{sender}\0{label}/{target}\0{time.time_ns()}\0{body}".encode()).hexdigest()[:16]
+    rec = {"v": SPOOL_VERSION, "id": msg_id, "from": sender, "to": target,
+           "at": dt.datetime.now().isoformat(timespec="seconds"), "body": body, **({"re": re_ref} if re_ref else {})}
+    try:
+        box = spool_dir(label)
+        with flocked(box / ".lock"):
+            waiting = [n for n in os.listdir(box) if SPOOL_NAME_RE.fullmatch(n)]
+            if any(SPOOL_NAME_RE.fullmatch(n).group(2) == msg_id for n in waiting):
+                return 0, f"msg {msg_id} is spooled for {label}/{target} already; not spooled twice"
+            if len(waiting) >= SPOOL_OUTBOX_MAX:
+                event("deliver-spool-full", id=msg_id, sender=sender, machine=label, to=target, waiting=len(waiting))
+                return 1, (f"the outbox for {label} holds {len(waiting)} messages and {label} has not fetched them; "
+                           "nothing spooled (tell the unblocker)")
+            fd, tmp = tempfile.mkstemp(prefix=".spool.", suffix=".tmp", dir=box)  # 0600, a dot name: never listed
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    full_sync(fh.fileno())
+                os.replace(tmp, box / f"{time.time_ns()}-{msg_id}.json")
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+    except OSError as exc:
+        return 1, f"cannot write the outbox for {label}: {exc}"
+    event("deliver-spooled", id=msg_id, sender=sender, machine=label, to=target, bytes=len(body.encode()))
+    archive_message({"id": msg_id, "from": sender, "to": f"{label}/{target}", "to_name": f"{label}/{target}",
+                     "at": rec["at"], "body": body, "sent": True, "spooled_to": label,
+                     **({"re": re_ref, "thread": thread_of(re_ref)} if re_ref else {})})
+    return 0, f"spooled msg {msg_id} for {label}/{target} (fetched by {label}; nothing is typed in before it fetches)"
+
+
+def outbox_entries(label: str) -> list[tuple[Path, dict]]:
+    """The outbox for `label`, oldest first; files that are not a spooled message are skipped."""
+    box = OUTBOX / label
+    out: list[tuple[int, Path, dict]] = []
+    with contextlib.suppress(FileNotFoundError):
+        for name in os.listdir(box):
+            m = SPOOL_NAME_RE.fullmatch(name)
+            if not m:
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                rec = json.loads((box / name).read_text())
+                if isinstance(rec, dict) and rec.get("id") == m.group(2):
+                    out.append((int(m.group(1)), box / name, rec))
+    return [(p, r) for _ns, p, r in sorted(out, key=lambda t: (t[0], t[1].name))]
+
+
+def add_outbox_arguments(op: argparse.ArgumentParser) -> None:
+    op.add_argument("--for", dest="for_", metavar="MACHINE", help="the fetching machine's outbox (default: all)")
+    op.add_argument("--json", action="store_true", help="the fetch listing: oldest first, capped, with bodies")
+    op.add_argument("--ack", action="store_true", help="remove the messages IDS from the outbox (the fetch's ack)")
+    op.add_argument("--ssh-command", action="store_true",
+                    help="run the outbox command in $SSH_ORIGINAL_COMMAND (an authorized_keys command=)")
+    op.add_argument("ids", nargs="*", help="with --ack: the message ids the fetching machine handled")
+
+
+def forced_outbox_args(raw: str | None) -> argparse.Namespace:
+    """The arguments of `herdr-sleeper outbox …` in an SSH forced command's original command, and nothing
+    else: any other verb, a second --ssh-command or shell syntax is refused (SleeperError)."""
+    try:
+        words = shlex.split(raw or "")
+    except ValueError as exc:
+        raise SleeperError(f"refused: {exc}")
+    if len(words) < 2 or Path(words[0]).name != "herdr-sleeper" or words[1] != "outbox" or "--ssh-command" in words:
+        raise SleeperError("refused: this key runs `herdr-sleeper outbox` only")
+    bad = next((w for w in words[2:] if not REMOTE_ARG_RE.fullmatch(w)), None)
+    if bad is not None:
+        raise SleeperError(f"refused: {bad!r}")
+    op = argparse.ArgumentParser(prog="herdr-sleeper outbox", add_help=False)
+    add_outbox_arguments(op)
+    try:
+        return op.parse_args(words[2:])
+    except SystemExit:
+        raise SleeperError("refused: arguments outside `outbox [--for M] [--json] [--ack IDS]`")
+
+
+def cmd_outbox(args: argparse.Namespace) -> int:
+    """This machine's outbox for the machines that fetch from it: a listing (`--json` is the fetch's,
+    with bodies, oldest first, capped), or `--ack IDS`, which removes what the fetching side handled."""
+    if getattr(args, "ssh_command", False):
+        try:
+            args = forced_outbox_args(os.environ.get("SSH_ORIGINAL_COMMAND"))
+        except SleeperError as exc:
+            print(f"outbox: {exc}", file=sys.stderr)
+            return 2
+    label = getattr(args, "for_", None)
+    if label is not None and not MACHINE_RE.fullmatch(label):
+        print("outbox: --for takes a machine label", file=sys.stderr)
+        return 2
+    ids = list(getattr(args, "ids", None) or [])
+    if args.ack:
+        if not label or not ids or not all(MSG_ID_RE.fullmatch(i) for i in ids):
+            print("outbox: --ack needs --for MACHINE and the message ids", file=sys.stderr)
+            return 2
+        acked: list[str] = []
+        box = OUTBOX / label
+        if box.is_dir():
+            with flocked(spool_dir(label) / ".lock"):
+                for path, rec in outbox_entries(label):
+                    if rec["id"] in ids:
+                        with contextlib.suppress(FileNotFoundError):
+                            path.unlink()
+                            acked.append(rec["id"])
+        event("spool-acked", machine=label, ids=acked, missing=[i for i in ids if i not in acked])
+        print(json.dumps({"acked": acked, "missing": [i for i in ids if i not in acked]}))
+        return 0
+    if ids:
+        print("outbox: message ids go with --ack", file=sys.stderr)
+        return 2
+    if args.json:
+        if not label:
+            print("outbox: --json needs --for MACHINE (the fetching machine)", file=sys.stderr)
+            return 2
+        rows: list[dict] = []
+        size = 0
+        entries = outbox_entries(label)
+        for _path, rec in entries[:SPOOL_FETCH_MAX_MESSAGES]:
+            size += len(str(rec.get("body", "")).encode())
+            if rows and size > SPOOL_FETCH_MAX_BYTES:
+                break
+            rows.append({k: rec[k] for k in ("v", "id", "from", "to", "at", "body", "re") if k in rec})
+        print(json.dumps({"v": SPOOL_VERSION, "messages": rows, "more": len(entries) - len(rows)}, ensure_ascii=False))
+        return 0
+    labels = [label] if label else sorted(n for n in (os.listdir(OUTBOX) if OUTBOX.is_dir() else [])
+                                         if MACHINE_RE.fullmatch(n))
+    shown = 0
+    for lb in labels:
+        for _path, rec in outbox_entries(lb):
+            shown += 1
+            print(f"{str(rec.get('at', '?'))[:19]}  msg {rec['id']}  {rec.get('from', '?')} -> {lb}/{rec.get('to', '?')}"
+                  f"  {len(str(rec.get('body', '')).encode())} bytes")
+    if not shown:
+        print("outbox empty" + (f" for {label}" if label else ""))
+    return 0
+
+
+def spool_entry(row: object, allow: list[str]) -> tuple[dict | None, str | None]:
+    """A fetched outbox row checked as hostile data: (the fields this machine uses, None), or (None, why it
+    is dropped). Strings arrive cleaned of terminal controls (remote_json_clean)."""
+    if not isinstance(row, dict):
+        return None, "not an object"
+    msg_id, sender, to, body, re_ref = (row.get(k) for k in ("id", "from", "to", "body", "re"))
+    if not isinstance(msg_id, str) or not MSG_ID_RE.fullmatch(msg_id):
+        return None, "no valid id"
+    if row.get("v") != SPOOL_VERSION:
+        return None, f"unknown spool version {str(row.get('v'))[:16]!r}"
+    if not isinstance(sender, str) or not SENDER_RE.fullmatch(sender):
+        return None, "sender is not one session name of that machine"
+    if not isinstance(to, str) or to not in allow:
+        return None, "target not in spool_allow"
+    if re_ref is not None and (not isinstance(re_ref, str) or not MSG_ID_RE.fullmatch(re_ref)):
+        return None, "re is not a message id"
+    if not isinstance(body, str):
+        return None, "no body"
+    body = spool_text(body)
+    problem = spool_body_problem(body)
+    if problem:
+        return None, problem
+    return {"id": msg_id, "from": sender, "to": to, "body": body, "re": re_ref}, None
+
+
+def spool_deliver_here(label: str, entry: dict) -> tuple[int, str]:
+    """The normal local deliver, in this process, for one fetched message: its sender is the machine
+    it was fetched from plus the name in the file, so the envelope says where it came from."""
+    ns = argparse.Namespace(target=entry["to"], sender=f"{label}/{entry['from']}", id=entry["id"], re=entry["re"],
+                            thread=thread_of(entry["re"]) if entry["re"] else None, from_session=None, here=True,
+                            machine=None, spooled_from=label)
+    out, err = io.StringIO(), io.StringIO()
+    saved = sys.stdin
+    try:
+        sys.stdin = io.StringIO(entry["body"])
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cmd_deliver(ns)
+    except Exception as exc:  # one message's failure is that message's, never the fetch's
+        code = 1
+        err.write(f"{type(exc).__name__}: {exc}")
+    finally:
+        sys.stdin = saved
+    line = next((ln.strip() for ln in (out.getvalue() + "\n" + err.getvalue()).splitlines() if ln.strip()), "")
+    return code, CONTROL_CHARS.sub("?", line)[:200]
+
+
+def fetch_machine(label: str, me: str, allow: list[str]) -> dict:
+    """One machine's outbox for this one: list, check, deliver here in order, ack what was handled.
+    Delivered (0) and queued here (3) count as handled, and so does a drop (the reason is logged); a
+    delivery that failed here stops the batch, so it and every later message wait for the next fetch.
+    Raises SleeperError when the machine can't be read."""
+    done = remote_sleeper(label, ["outbox", "--json", "--for", me], limit=SPOOL_FETCH_OUTPUT_LIMIT)
+    try:
+        listing = json.loads(done.stdout) if done.returncode == 0 else None
+    except ValueError:
+        listing = None
+    rows = listing.get("messages") if isinstance(listing, dict) else None
+    if not isinstance(rows, list):
+        raise SleeperError(f"{label}: outbox listing failed ({(done.stderr.strip().splitlines() or ['no output'])[-1]})")
+    more = listing.get("more")
+    tally = {"delivered": 0, "queued": 0, "dropped": 0,
+             "waiting": more if isinstance(more, int) and not isinstance(more, bool) and 0 <= more <= 10**6 else 0}
+    acks: list[str] = []
+    size = 0
+    for i, row in enumerate(rows):
+        if i >= SPOOL_FETCH_MAX_MESSAGES:
+            tally["waiting"] += len(rows) - i
+            break
+        size += len(str(row.get("body", "")).encode()) if isinstance(row, dict) else 0
+        if i and size > SPOOL_FETCH_MAX_BYTES:
+            tally["waiting"] += len(rows) - i
+            break
+        entry, why = spool_entry(row, allow)
+        if entry is not None:
+            old = archived(entry["id"])
+            if old is not None and old.get("spooled_from") == label and old.get("from") == f"{label}/{entry['from']}":
+                # archived only once its mailbox file was written: it went in before, and the ack was lost
+                tally["duplicate"] = tally.get("duplicate", 0) + 1
+                acks.append(entry["id"])
+                event("spool-duplicate", machine=label, id=entry["id"], sender=f"{label}/{entry['from']}",
+                      to=entry["to"])
+                continue
+            if old is not None:
+                entry, why = None, "id taken by another message here"
+            elif entry["id"] in read_asks():
+                entry, why = None, "id taken by an ask here"
+        if entry is None:
+            tally["dropped"] += 1
+            seen = row if isinstance(row, dict) else {}
+            rid = seen.get("id") if isinstance(seen.get("id"), str) and MSG_ID_RE.fullmatch(seen["id"]) else None
+            event("spool-dropped", machine=label, id=rid, sender=str(seen.get("from"))[:64],
+                  to=str(seen.get("to"))[:64], reason=why)
+            if rid:  # a drop is final: acked, so a refused message is not fetched and logged again each minute
+                acks.append(rid)
+            continue
+        code, line = spool_deliver_here(label, entry)
+        if code in (0, 3):
+            tally["delivered" if code == 0 else "queued"] += 1
+            acks.append(entry["id"])
+            event("spool-delivered", machine=label, id=entry["id"], sender=f"{label}/{entry['from']}",
+                  to=entry["to"], code=code, reason=line)
+        elif code == 2:  # refused as input by the local deliver: it never goes in
+            tally["dropped"] += 1
+            acks.append(entry["id"])
+            event("spool-dropped", machine=label, id=entry["id"], sender=entry["from"], to=entry["to"], reason=line)
+        else:
+            tally["waiting"] += len(rows) - i
+            event("spool-held", machine=label, id=entry["id"], sender=f"{label}/{entry['from']}", to=entry["to"],
+                  code=code, reason=line)
+            break
+    if acks:
+        try:
+            ack = remote_sleeper(label, ["outbox", "--ack", "--for", me, "--", *acks])
+            if ack.returncode != 0:
+                raise SleeperError((ack.stderr.strip().splitlines() or ["no detail"])[-1])
+        except SleeperError as exc:  # the next fetch lists them again; the ids keep them from going in twice
+            event("spool-ack-failed", machine=label, ids=acks, error=str(exc)[:200])
+            tally["ack_failed"] = len(acks)
+    event("spool-fetched", machine=label, listed=len(rows), **tally)
+    return tally
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """Fetch the mail the machines in `spool_from` hold for this one and deliver what `spool_allow`
+    names. Exit 0 every machine read (or another fetch is running), 1 a machine failed or the config."""
+    quiet = getattr(args, "quiet", False)
+    try:
+        config, _src = load_config()
+        me = this_machine()
+    except ConfigError as exc:
+        print(f"fetch: broken config — {exc}", file=sys.stderr)
+        return 1
+    labels = list(config["spool_from"])
+    one = getattr(args, "machine", None)
+    if one:
+        one = canonical_label(one)
+        if one not in labels:
+            print(f"fetch: {one} is not in spool_from ({', '.join(labels) or 'empty'})", file=sys.stderr)
+            return 2
+        labels = [one]
+    if not labels:
+        if not quiet:
+            print("fetch: spool_from is empty; nothing to fetch")
+        return 0
+    if not config["spool_allow"]:
+        print("fetch: spool_allow is empty, so nothing could be delivered; nothing fetched", file=sys.stderr)
+        return 1
+    with flocked(SPOOL_FETCH_LOCK, wait=False) as got:
+        if not got:
+            if not quiet:
+                print("fetch: another fetch is running")
+            return 0
+        code = 0
+        for label in labels:
+            try:
+                t = fetch_machine(label, me, list(config["spool_allow"]))
+            except SleeperError as exc:
+                event("spool-fetch-failed", machine=label, error=str(exc)[:200])
+                print(f"fetch: {exc}", file=sys.stderr)
+                code = 1
+                continue
+            if not quiet:
+                print(f"{label}: {t['delivered']} delivered, {t['queued']} queued here, {t['dropped']} dropped, "
+                      f"{t['waiting']} waiting" + (f"; ack failed for {t['ack_failed']}" if t.get("ack_failed") else ""))
+    return code
+
+
+def tend_spool_fetch(config: dict) -> None:
+    """Watcher: start a detached `fetch` every SPOOL_FETCH_EVERY_SECONDS when spool_from is set
+    (its own lock skips a tick while the last fetch still runs)."""
+    if not config.get("spool_from") or time.monotonic() - SPOOL_TICK["at"] < SPOOL_FETCH_EVERY_SECONDS:
+        return
+    SPOOL_TICK["at"] = time.monotonic()
+    subprocess.Popen([sys.executable, str(SELF), "fetch", "--quiet"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 
 # ------------------------------------------------------------ claude hook
@@ -10781,6 +11223,15 @@ def cmd_claude_hook(_args: argparse.Namespace) -> int:
             to = REF_SUFFIX.sub("", str(tool_input.get("to") or "")).strip()
             body = str(tool_input.get("message") or "")
             if not to or not body.strip():
+                return 0
+            spooled = None
+            with contextlib.suppress(SleeperError):
+                spooled = spool_label(to, None)
+            if spooled:  # a machine that fetches from this one: the outbox, never SSH
+                code, text = spool_message(spooled[0], spooled[1], body, hook_sender(payload), None, None)
+                deny(f"{to} fetches its mail from this machine. " + (
+                    f"herdr-sleeper {text}. Do not resend; a reply comes back as a relayed message." if code == 0
+                    else f"This message was not spooled: {text}."))
                 return 0
             label, target = route(to, None)
             if label:
@@ -13086,6 +13537,10 @@ def watch_tick(clocks: dict[str, dict], config: dict) -> None:
     which runs even when sleep_tick failed (a broken sleep or reconcile must not hold mail back;
     mail_refusal re-reads fresh state; an auto-resume note queued in sleep_tick goes in here), then
     pending `close --self` wishes (after the flush: mail typed in cancels them)."""
+    try:  # the pull spool's fetch: detached, so a slow SSH never holds up the tick
+        tend_spool_fetch(config)
+    except Exception as exc:
+        say(f"spool fetch: {type(exc).__name__}: {exc}")
     agents = list_agents()
     if config["mail_only"]:  # a host that never sleeps: mail and the sessions' own close wishes, nothing else
         flush_mail_safely(agents)
@@ -13813,6 +14268,15 @@ def main(argv: list[str] | None = None) -> int:
     dp.add_argument("--here", action="store_true", help=argparse.SUPPRESS)  # sent by another machine: no second hop
     dp.add_argument("--machine", help="a Herdr saved machine the target runs on (or name it MACHINE/NAME)")
     dp.set_defaults(fn=cmd_deliver)
+    obp = sub.add_parser("outbox", help="the mail machines that fetch from this one have not fetched yet "
+                         "(spool_to); --json and --ack are the fetching side's")
+    add_outbox_arguments(obp)
+    obp.set_defaults(fn=cmd_outbox)
+    ftp = sub.add_parser("fetch", help="fetch and deliver the mail the machines in spool_from hold for this one "
+                         "(only to spool_allow)")
+    ftp.add_argument("--machine", help="one machine of spool_from")
+    ftp.add_argument("--quiet", action="store_true", help="no summary (the watcher's tick)")
+    ftp.set_defaults(fn=cmd_fetch)
     dpp = sub.add_parser("deliver-pending", help="wake a sleeper and type its queued mail (internal)")
     dpp.add_argument("uuid")
     dpp.add_argument("--from", dest="sender", default="herdr-sleeper")
